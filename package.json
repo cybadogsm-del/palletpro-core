@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "nano": "^11.0.5"
+  }
+}
