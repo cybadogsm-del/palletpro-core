@@ -1781,6 +1781,302 @@ def set_default_receiving_partner_address(partner_address_id):
 
 
 
+
+
+@app.get("/partner-addresses/<partner_address_id>/audit")
+def get_partner_address_audit(partner_address_id):
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    addr = conn.execute(
+        """
+        SELECT
+            pa.partner_address_id,
+            pa.partner_id,
+            pa.organisation_id,
+            p.name AS partner_name,
+            pa.label,
+            pa.category,
+            pa.custom_category_label,
+            pa.is_active,
+            pa.is_primary,
+            pa.is_default_dispatch_site,
+            pa.is_default_receiving_site,
+            pa.address_line_1,
+            pa.address_line_2,
+            pa.suburb,
+            pa.state,
+            pa.postcode,
+            pa.country,
+            pa.gate_number,
+            pa.door_number,
+            pa.entry_instructions,
+            pa.truck_access_notes,
+            pa.latitude,
+            pa.longitude,
+            pa.created_at,
+            pa.updated_at
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchone()
+
+    if not addr:
+        conn.close()
+        return jsonify({"error": "Partner address not found"}), 404
+
+    audit_rows = conn.execute(
+        """
+        SELECT *
+        FROM audit_events
+        WHERE entity_type = 'PartnerAddress'
+          AND entity_id = ?
+        ORDER BY created_at DESC
+        """,
+        (partner_address_id,)
+    ).fetchall()
+
+    location_rows = conn.execute(
+        """
+        SELECT *
+        FROM location_update_requests
+        WHERE entity_type = 'PartnerAddress'
+          AND entity_id = ?
+        ORDER BY created_at DESC
+        """,
+        (partner_address_id,)
+    ).fetchall()
+
+    conn.close()
+
+    address = dict(addr)
+    address["is_active"] = bool(address["is_active"])
+    address["is_primary"] = bool(address["is_primary"])
+    address["is_default_dispatch_site"] = bool(address["is_default_dispatch_site"])
+    address["is_default_receiving_site"] = bool(address["is_default_receiving_site"])
+
+    nav_contract = build_partner_address_navigation_contract(address)
+    address["navigation"] = nav_contract["navigation"]
+    address["navigation_apps"] = nav_contract["navigation_apps"]
+
+    audit_events = [dict(r) for r in audit_rows]
+    location_update_requests = [dict(r) for r in location_rows]
+
+    return jsonify({
+        "partner_address_id": address["partner_address_id"],
+        "partner_id": address["partner_id"],
+        "organisation_id": address["organisation_id"],
+        "partner_name": address["partner_name"],
+        "label": address["label"],
+        "address": address,
+        "audit_event_count": len(audit_events),
+        "location_update_request_count": len(location_update_requests),
+        "audit_events": audit_events,
+        "location_update_requests": location_update_requests,
+    }), 200
+
+
+@app.get("/partner-addresses/<partner_address_id>/history")
+def get_partner_address_history(partner_address_id):
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    addr = conn.execute(
+        """
+        SELECT
+            pa.partner_address_id,
+            pa.partner_id,
+            pa.organisation_id,
+            p.name AS partner_name,
+            pa.label,
+            pa.category
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchone()
+
+    if not addr:
+        conn.close()
+        return jsonify({"error": "Partner address not found"}), 404
+
+    audit_rows = conn.execute(
+        """
+        SELECT *
+        FROM audit_events
+        WHERE entity_type = 'PartnerAddress'
+          AND entity_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchall()
+
+    location_rows = conn.execute(
+        """
+        SELECT *
+        FROM location_update_requests
+        WHERE entity_type = 'PartnerAddress'
+          AND entity_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchall()
+
+    conn.close()
+
+    history = []
+
+    for row in audit_rows:
+        d = dict(row)
+        history.append({
+            "history_type": "AUDIT_EVENT",
+            "sort_at": d.get("created_at"),
+            "partner_address_id": partner_address_id,
+            "partner_address_label": addr["label"],
+            "partner_id": addr["partner_id"],
+            "partner_name": addr["partner_name"],
+            "payload": d,
+        })
+
+    for row in location_rows:
+        d = dict(row)
+        history.append({
+            "history_type": "LOCATION_UPDATE_REQUEST",
+            "sort_at": d.get("reviewed_at") or d.get("updated_at") or d.get("created_at"),
+            "partner_address_id": partner_address_id,
+            "partner_address_label": addr["label"],
+            "partner_id": addr["partner_id"],
+            "partner_name": addr["partner_name"],
+            "payload": d,
+        })
+
+    history.sort(key=lambda x: x.get("sort_at") or "", reverse=True)
+
+    return jsonify({
+        "partner_address_id": addr["partner_address_id"],
+        "partner_id": addr["partner_id"],
+        "organisation_id": addr["organisation_id"],
+        "partner_name": addr["partner_name"],
+        "label": addr["label"],
+        "category": addr["category"],
+        "history_count": len(history),
+        "history": history,
+    }), 200
+
+
+@app.get("/partners/<partner_id>/address-history")
+def get_partner_address_history_for_partner(partner_id):
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    partner = conn.execute(
+        "SELECT partner_id, organisation_id, name FROM partners WHERE partner_id = ?",
+        (partner_id,)
+    ).fetchone()
+
+    if not partner:
+        conn.close()
+        return jsonify({"error": "Partner not found"}), 404
+
+    address_rows = conn.execute(
+        """
+        SELECT
+            partner_address_id,
+            label,
+            category,
+            is_active,
+            is_primary,
+            is_default_dispatch_site,
+            is_default_receiving_site
+        FROM partner_addresses
+        WHERE partner_id = ?
+        ORDER BY created_at DESC
+        """,
+        (partner_id,)
+    ).fetchall()
+
+    address_map = {}
+    for row in address_rows:
+        d = dict(row)
+        d["is_active"] = bool(d["is_active"])
+        d["is_primary"] = bool(d["is_primary"])
+        d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+        d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+        address_map[d["partner_address_id"]] = d
+
+    history = []
+
+    for partner_address_id, address_info in address_map.items():
+        audit_rows = conn.execute(
+            """
+            SELECT *
+            FROM audit_events
+            WHERE entity_type = 'PartnerAddress'
+              AND entity_id = ?
+            """,
+            (partner_address_id,)
+        ).fetchall()
+
+        location_rows = conn.execute(
+            """
+            SELECT *
+            FROM location_update_requests
+            WHERE entity_type = 'PartnerAddress'
+              AND entity_id = ?
+            """,
+            (partner_address_id,)
+        ).fetchall()
+
+        for row in audit_rows:
+            d = dict(row)
+            history.append({
+                "history_type": "AUDIT_EVENT",
+                "sort_at": d.get("created_at"),
+                "partner_address_id": partner_address_id,
+                "partner_address_label": address_info["label"],
+                "partner_address_category": address_info["category"],
+                "partner_address_flags": {
+                    "is_active": address_info["is_active"],
+                    "is_primary": address_info["is_primary"],
+                    "is_default_dispatch_site": address_info["is_default_dispatch_site"],
+                    "is_default_receiving_site": address_info["is_default_receiving_site"],
+                },
+                "payload": d,
+            })
+
+        for row in location_rows:
+            d = dict(row)
+            history.append({
+                "history_type": "LOCATION_UPDATE_REQUEST",
+                "sort_at": d.get("reviewed_at") or d.get("updated_at") or d.get("created_at"),
+                "partner_address_id": partner_address_id,
+                "partner_address_label": address_info["label"],
+                "partner_address_category": address_info["category"],
+                "partner_address_flags": {
+                    "is_active": address_info["is_active"],
+                    "is_primary": address_info["is_primary"],
+                    "is_default_dispatch_site": address_info["is_default_dispatch_site"],
+                    "is_default_receiving_site": address_info["is_default_receiving_site"],
+                },
+                "payload": d,
+            })
+
+    conn.close()
+
+    history.sort(key=lambda x: x.get("sort_at") or "", reverse=True)
+
+    return jsonify({
+        "partner_id": partner["partner_id"],
+        "organisation_id": partner["organisation_id"],
+        "partner_name": partner["name"],
+        "address_count": len(address_map),
+        "address_history_count": len(history),
+        "items": history,
+    }), 200
+
+
+
 @app.get("/partner-addresses/<partner_address_id>/navigation-options")
 def get_partner_address_navigation_options(partner_address_id):
     default_nav_app = (request.args.get("default_nav_app") or "google_maps").strip().lower() or "google_maps"
@@ -4156,6 +4452,129 @@ def scan_qr_handoff_token(qr_token_id):
     }), 200
 
 
+
+
+def ensure_shared_transaction_partner_address_tables(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS shared_transaction_partner_addresses (
+            shared_transaction_id TEXT PRIMARY KEY,
+            origin_partner_address_id TEXT,
+            counterparty_partner_address_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def partner_address_row_to_payload(row):
+    if not row:
+        return None
+    d = dict(row)
+    d["is_active"] = bool(d["is_active"])
+    d["is_primary"] = bool(d["is_primary"])
+    d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+    d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+    nav_contract = build_partner_address_navigation_contract(d)
+    d["navigation"] = nav_contract["navigation"]
+    d["navigation_apps"] = nav_contract["navigation_apps"]
+    return d
+
+
+def get_partner_address_for_shared_transaction(conn, partner_address_id, partner_id, organisation_id):
+    row = conn.execute(
+        """
+        SELECT
+            pa.partner_address_id,
+            pa.partner_id,
+            pa.organisation_id,
+            p.name AS partner_name,
+            pa.label,
+            pa.category,
+            pa.custom_category_label,
+            pa.is_active,
+            pa.is_primary,
+            pa.is_default_dispatch_site,
+            pa.is_default_receiving_site,
+            pa.address_line_1,
+            pa.address_line_2,
+            pa.suburb,
+            pa.state,
+            pa.postcode,
+            pa.country,
+            pa.gate_number,
+            pa.door_number,
+            pa.entry_instructions,
+            pa.truck_access_notes,
+            pa.latitude,
+            pa.longitude,
+            pa.created_at,
+            pa.updated_at
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+          AND pa.partner_id = ?
+          AND pa.organisation_id = ?
+        """,
+        (partner_address_id, partner_id, organisation_id)
+    ).fetchone()
+
+    if not row:
+        return None, "Partner address not found for this partner and organisation"
+
+    if not row["is_active"]:
+        return None, "Inactive partner address cannot be used for a shared transaction"
+
+    return partner_address_row_to_payload(row), None
+
+
+def get_default_partner_address_for_shared_transaction(conn, partner_id, organisation_id, mode):
+    order_field = "is_default_dispatch_site" if mode == "dispatch" else "is_default_receiving_site"
+
+    row = conn.execute(
+        f"""
+        SELECT
+            pa.partner_address_id,
+            pa.partner_id,
+            pa.organisation_id,
+            p.name AS partner_name,
+            pa.label,
+            pa.category,
+            pa.custom_category_label,
+            pa.is_active,
+            pa.is_primary,
+            pa.is_default_dispatch_site,
+            pa.is_default_receiving_site,
+            pa.address_line_1,
+            pa.address_line_2,
+            pa.suburb,
+            pa.state,
+            pa.postcode,
+            pa.country,
+            pa.gate_number,
+            pa.door_number,
+            pa.entry_instructions,
+            pa.truck_access_notes,
+            pa.latitude,
+            pa.longitude,
+            pa.created_at,
+            pa.updated_at
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_id = ?
+          AND pa.organisation_id = ?
+          AND pa.is_active = 1
+        ORDER BY pa.{order_field} DESC, pa.is_primary DESC, pa.created_at DESC
+        LIMIT 1
+        """,
+        (partner_id, organisation_id)
+    ).fetchone()
+
+    return partner_address_row_to_payload(row) if row else None
+
+
+
 @app.post("/shared-transactions")
 def create_shared_transaction():
     body = request.get_json(silent=True) or {}
@@ -4163,6 +4582,8 @@ def create_shared_transaction():
     counterparty_org_id = body.get("counterparty_org_id")
     origin_partner_id = body.get("origin_partner_id")
     origin_resource_id = body.get("origin_resource_id")
+    origin_partner_address_id = body.get("origin_partner_address_id")
+    counterparty_partner_address_id = body.get("counterparty_partner_address_id")
     quantity = body.get("quantity")
     movement_type = (body.get("movement_type") or "DISPATCH").strip()
     reference_number = (body.get("reference_number") or "").strip() or None
@@ -4192,6 +4613,8 @@ def create_shared_transaction():
 
     conn = get_conn()
     ensure_shared_transaction_tables(conn)
+    ensure_partner_address_tables(conn)
+    ensure_shared_transaction_partner_address_tables(conn)
 
     origin_org = conn.execute(
         "SELECT * FROM organisations WHERE organisation_id = ?",
@@ -4256,18 +4679,60 @@ def create_shared_transaction():
         conn.close()
         return jsonify({"error": "Origin resource not found"}), 404
 
+    if origin_partner_address_id:
+        origin_partner_address, origin_addr_error = get_partner_address_for_shared_transaction(
+            conn,
+            origin_partner_address_id,
+            origin_partner_id,
+            origin_org_id
+        )
+        if origin_addr_error:
+            conn.close()
+            return jsonify({"error": origin_addr_error, "field": "origin_partner_address_id"}), 409
+    else:
+        origin_partner_address = get_default_partner_address_for_shared_transaction(
+            conn,
+            origin_partner_id,
+            origin_org_id,
+            "dispatch"
+        )
+
+    if counterparty_partner_address_id:
+        counterparty_partner_address, counterparty_addr_error = get_partner_address_for_shared_transaction(
+            conn,
+            counterparty_partner_address_id,
+            counterparty_partner["partner_id"],
+            counterparty_org_id
+        )
+        if counterparty_addr_error:
+            conn.close()
+            return jsonify({"error": counterparty_addr_error, "field": "counterparty_partner_address_id"}), 409
+    else:
+        counterparty_partner_address = get_default_partner_address_for_shared_transaction(
+            conn,
+            counterparty_partner["partner_id"],
+            counterparty_org_id,
+            "receiving"
+        )
+
     likely_duplicate = conn.execute(
         """
-        SELECT shared_transaction_id, shared_status
-        FROM shared_transactions
-        WHERE origin_org_id = ?
-          AND counterparty_org_id = ?
-          AND origin_resource_id = ?
-          AND quantity = ?
-          AND movement_type = ?
-          AND COALESCE(reference_number, '') = COALESCE(?, '')
-          AND shared_status IN ('AWAITING_COUNTERPARTY_CONFIRMATION', 'CONFIRMED', 'DISPUTED')
-        ORDER BY created_at DESC
+        SELECT
+            st.shared_transaction_id,
+            st.shared_status
+        FROM shared_transactions st
+        LEFT JOIN shared_transaction_partner_addresses stpa
+          ON stpa.shared_transaction_id = st.shared_transaction_id
+        WHERE st.origin_org_id = ?
+          AND st.counterparty_org_id = ?
+          AND st.origin_resource_id = ?
+          AND st.quantity = ?
+          AND st.movement_type = ?
+          AND COALESCE(st.reference_number, '') = COALESCE(?, '')
+          AND COALESCE(stpa.origin_partner_address_id, '') = COALESCE(?, '')
+          AND COALESCE(stpa.counterparty_partner_address_id, '') = COALESCE(?, '')
+          AND st.shared_status IN ('AWAITING_COUNTERPARTY_CONFIRMATION', 'CONFIRMED', 'DISPUTED')
+        ORDER BY st.created_at DESC
         LIMIT 1
         """,
         (
@@ -4276,7 +4741,9 @@ def create_shared_transaction():
             origin_resource_id,
             quantity,
             movement_type,
-            reference_number
+            reference_number,
+            origin_partner_address["partner_address_id"] if origin_partner_address else None,
+            counterparty_partner_address["partner_address_id"] if counterparty_partner_address else None,
         )
     ).fetchone()
 
@@ -4330,13 +4797,35 @@ def create_shared_transaction():
         )
     )
 
+    conn.execute(
+        """
+        INSERT INTO shared_transaction_partner_addresses (
+            shared_transaction_id,
+            origin_partner_address_id,
+            counterparty_partner_address_id,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            shared_transaction_id,
+            origin_partner_address["partner_address_id"] if origin_partner_address else None,
+            counterparty_partner_address["partner_address_id"] if counterparty_partner_address else None,
+            ts,
+            ts
+        )
+    )
+
+    origin_site_suffix = f" from site {origin_partner_address['label']}" if origin_partner_address else ""
+    counterparty_site_suffix = f" to site {counterparty_partner_address['label']}" if counterparty_partner_address else ""
+
     record_shared_transaction_event(
         conn=conn,
         shared_transaction_id=shared_transaction_id,
         organisation_id=origin_org_id,
         actor_org_role="DISPATCHING",
         action="CREATE",
-        summary=f"Shared transaction created for {quantity} {origin_resource['name']} from {origin_org['name']} to {counterparty_org['name']}",
+        summary=f"Shared transaction created for {quantity} {origin_resource['name']} from {origin_org['name']}{origin_site_suffix} to {counterparty_org['name']}{counterparty_site_suffix}",
         previous_status=None,
         new_status="AWAITING_COUNTERPARTY_CONFIRMATION",
         created_by_display_name=created_by_display_name
@@ -4384,6 +4873,10 @@ def create_shared_transaction():
         "counterparty_org_name": counterparty_org["name"],
         "origin_partner_id": origin_partner_id,
         "counterparty_partner_id": counterparty_partner["partner_id"],
+        "origin_partner_address_id": origin_partner_address["partner_address_id"] if origin_partner_address else None,
+        "counterparty_partner_address_id": counterparty_partner_address["partner_address_id"] if counterparty_partner_address else None,
+        "origin_partner_address": origin_partner_address,
+        "counterparty_partner_address": counterparty_partner_address,
         "origin_resource_id": origin_resource_id,
         "resource_name": origin_resource["name"],
         "unit_type": origin_resource["unit_type"],
