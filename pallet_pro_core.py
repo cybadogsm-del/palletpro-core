@@ -1233,6 +1233,417 @@ def get_partner_address(partner_address_id):
     return jsonify(dict(row)), 200
 
 
+
+
+@app.patch("/partner-addresses/<partner_address_id>")
+def update_partner_address(partner_address_id):
+    body = request.get_json(silent=True) or {}
+    organisation_id = body.get("organisation_id")
+    updated_by_display_name = (body.get("updated_by_display_name") or "Unknown Admin").strip()
+
+    if not organisation_id:
+        return jsonify({"error": "organisation_id is required"}), 400
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    addr = conn.execute(
+        """
+        SELECT pa.*, p.name AS partner_name
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ? AND pa.organisation_id = ?
+        """,
+        (partner_address_id, organisation_id)
+    ).fetchone()
+
+    if not addr:
+        conn.close()
+        return jsonify({"error": "Partner address not found"}), 404
+
+    allowed_categories = {
+        "HEAD_OFFICE",
+        "WORK_SITE",
+        "WAREHOUSE",
+        "FACTORY",
+        "YARD",
+        "DEPOT",
+        "DISTRIBUTION_CENTRE",
+        "OFFICE",
+        "RETURN_SITE",
+        "OTHER",
+        "CUSTOM",
+    }
+
+    new_category = body.get("category", addr["category"])
+    if isinstance(new_category, str):
+        new_category = new_category.strip().upper()
+
+    new_custom_category_label = body.get("custom_category_label", addr["custom_category_label"])
+    if isinstance(new_custom_category_label, str):
+        new_custom_category_label = new_custom_category_label.strip() or None
+
+    if new_category not in allowed_categories:
+        conn.close()
+        return jsonify({"error": "Invalid category"}), 400
+
+    if new_category == "CUSTOM" and not new_custom_category_label:
+        conn.close()
+        return jsonify({"error": "custom_category_label is required when category is CUSTOM"}), 400
+
+    if "label" in body:
+        label_check = (body.get("label") or "").strip()
+        if not label_check:
+            conn.close()
+            return jsonify({"error": "label cannot be blank"}), 400
+
+    updates = []
+    params = []
+
+    text_fields = [
+        "label",
+        "category",
+        "custom_category_label",
+        "address_line_1",
+        "address_line_2",
+        "suburb",
+        "state",
+        "postcode",
+        "country",
+        "gate_number",
+        "door_number",
+        "entry_instructions",
+        "truck_access_notes",
+    ]
+
+    for field in text_fields:
+        if field in body:
+            value = body.get(field)
+            if isinstance(value, str):
+                value = value.strip()
+            if field == "category" and value is not None:
+                value = value.upper()
+            if field not in ("label", "category") and value == "":
+                value = None
+            updates.append(f"{field} = ?")
+            params.append(value)
+
+    for field in ("latitude", "longitude"):
+        if field in body:
+            value = body.get(field)
+            if value in ("", None):
+                value = None
+            else:
+                try:
+                    value = float(value)
+                except Exception:
+                    conn.close()
+                    return jsonify({"error": f"{field} must be a number"}), 400
+            updates.append(f"{field} = ?")
+            params.append(value)
+
+    if not updates:
+        conn.close()
+        return jsonify({"error": "No editable fields were provided"}), 400
+
+    updates.append("updated_at = ?")
+    params.append(now_iso())
+    params.append(partner_address_id)
+
+    conn.execute(
+        f"UPDATE partner_addresses SET {', '.join(updates)} WHERE partner_address_id = ?",
+        params
+    )
+
+    audit_event(
+        conn,
+        entity_type="PartnerAddress",
+        entity_id=partner_address_id,
+        action="PARTNER_ADDRESS_UPDATED",
+        summary=f"Partner address updated by {updated_by_display_name}",
+        organisation_id=organisation_id
+    )
+
+    updated = conn.execute(
+        """
+        SELECT pa.*, p.name AS partner_name
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchone()
+
+    conn.commit()
+    conn.close()
+
+    d = dict(updated)
+    d["is_active"] = bool(d["is_active"])
+    d["is_primary"] = bool(d["is_primary"])
+    d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+    d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+    return jsonify(d), 200
+
+
+@app.post("/partner-addresses/<partner_address_id>/deactivate")
+def deactivate_partner_address(partner_address_id):
+    body = request.get_json(silent=True) or {}
+    organisation_id = body.get("organisation_id")
+    deactivated_by_display_name = (body.get("deactivated_by_display_name") or "Unknown Admin").strip()
+
+    if not organisation_id:
+        return jsonify({"error": "organisation_id is required"}), 400
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    addr = conn.execute(
+        """
+        SELECT pa.*, p.name AS partner_name
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ? AND pa.organisation_id = ?
+        """,
+        (partner_address_id, organisation_id)
+    ).fetchone()
+
+    if not addr:
+        conn.close()
+        return jsonify({"error": "Partner address not found"}), 404
+
+    conn.execute(
+        """
+        UPDATE partner_addresses
+        SET is_active = 0,
+            is_primary = 0,
+            is_default_dispatch_site = 0,
+            is_default_receiving_site = 0,
+            updated_at = ?
+        WHERE partner_address_id = ?
+        """,
+        (now_iso(), partner_address_id)
+    )
+
+    audit_event(
+        conn,
+        entity_type="PartnerAddress",
+        entity_id=partner_address_id,
+        action="PARTNER_ADDRESS_DEACTIVATED",
+        summary=f"Partner address deactivated by {deactivated_by_display_name}",
+        organisation_id=organisation_id
+    )
+
+    updated = conn.execute(
+        """
+        SELECT pa.*, p.name AS partner_name
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchone()
+
+    conn.commit()
+    conn.close()
+
+    d = dict(updated)
+    d["is_active"] = bool(d["is_active"])
+    d["is_primary"] = bool(d["is_primary"])
+    d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+    d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+    return jsonify(d), 200
+
+
+@app.post("/partner-addresses/<partner_address_id>/set-primary")
+def set_primary_partner_address(partner_address_id):
+    body = request.get_json(silent=True) or {}
+    organisation_id = body.get("organisation_id")
+    updated_by_display_name = (body.get("updated_by_display_name") or "Unknown Admin").strip()
+
+    if not organisation_id:
+        return jsonify({"error": "organisation_id is required"}), 400
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    addr = conn.execute(
+        "SELECT * FROM partner_addresses WHERE partner_address_id = ? AND organisation_id = ?",
+        (partner_address_id, organisation_id)
+    ).fetchone()
+
+    if not addr:
+        conn.close()
+        return jsonify({"error": "Partner address not found"}), 404
+    if not addr["is_active"]:
+        conn.close()
+        return jsonify({"error": "Inactive address cannot be set as primary"}), 400
+
+    conn.execute(
+        "UPDATE partner_addresses SET is_primary = 0 WHERE partner_id = ? AND organisation_id = ?",
+        (addr["partner_id"], organisation_id)
+    )
+    conn.execute(
+        "UPDATE partner_addresses SET is_primary = 1, updated_at = ? WHERE partner_address_id = ?",
+        (now_iso(), partner_address_id)
+    )
+
+    audit_event(
+        conn,
+        entity_type="PartnerAddress",
+        entity_id=partner_address_id,
+        action="PARTNER_ADDRESS_SET_PRIMARY",
+        summary=f"Primary partner address set by {updated_by_display_name}",
+        organisation_id=organisation_id
+    )
+
+    updated = conn.execute(
+        """
+        SELECT pa.*, p.name AS partner_name
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchone()
+
+    conn.commit()
+    conn.close()
+
+    d = dict(updated)
+    d["is_active"] = bool(d["is_active"])
+    d["is_primary"] = bool(d["is_primary"])
+    d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+    d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+    return jsonify(d), 200
+
+
+@app.post("/partner-addresses/<partner_address_id>/set-default-dispatch")
+def set_default_dispatch_partner_address(partner_address_id):
+    body = request.get_json(silent=True) or {}
+    organisation_id = body.get("organisation_id")
+    updated_by_display_name = (body.get("updated_by_display_name") or "Unknown Admin").strip()
+
+    if not organisation_id:
+        return jsonify({"error": "organisation_id is required"}), 400
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    addr = conn.execute(
+        "SELECT * FROM partner_addresses WHERE partner_address_id = ? AND organisation_id = ?",
+        (partner_address_id, organisation_id)
+    ).fetchone()
+
+    if not addr:
+        conn.close()
+        return jsonify({"error": "Partner address not found"}), 404
+    if not addr["is_active"]:
+        conn.close()
+        return jsonify({"error": "Inactive address cannot be default dispatch"}), 400
+
+    conn.execute(
+        "UPDATE partner_addresses SET is_default_dispatch_site = 0 WHERE partner_id = ? AND organisation_id = ?",
+        (addr["partner_id"], organisation_id)
+    )
+    conn.execute(
+        "UPDATE partner_addresses SET is_default_dispatch_site = 1, updated_at = ? WHERE partner_address_id = ?",
+        (now_iso(), partner_address_id)
+    )
+
+    audit_event(
+        conn,
+        entity_type="PartnerAddress",
+        entity_id=partner_address_id,
+        action="PARTNER_ADDRESS_SET_DEFAULT_DISPATCH",
+        summary=f"Default dispatch partner address set by {updated_by_display_name}",
+        organisation_id=organisation_id
+    )
+
+    updated = conn.execute(
+        """
+        SELECT pa.*, p.name AS partner_name
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchone()
+
+    conn.commit()
+    conn.close()
+
+    d = dict(updated)
+    d["is_active"] = bool(d["is_active"])
+    d["is_primary"] = bool(d["is_primary"])
+    d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+    d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+    return jsonify(d), 200
+
+
+@app.post("/partner-addresses/<partner_address_id>/set-default-receiving")
+def set_default_receiving_partner_address(partner_address_id):
+    body = request.get_json(silent=True) or {}
+    organisation_id = body.get("organisation_id")
+    updated_by_display_name = (body.get("updated_by_display_name") or "Unknown Admin").strip()
+
+    if not organisation_id:
+        return jsonify({"error": "organisation_id is required"}), 400
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    addr = conn.execute(
+        "SELECT * FROM partner_addresses WHERE partner_address_id = ? AND organisation_id = ?",
+        (partner_address_id, organisation_id)
+    ).fetchone()
+
+    if not addr:
+        conn.close()
+        return jsonify({"error": "Partner address not found"}), 404
+    if not addr["is_active"]:
+        conn.close()
+        return jsonify({"error": "Inactive address cannot be default receiving"}), 400
+
+    conn.execute(
+        "UPDATE partner_addresses SET is_default_receiving_site = 0 WHERE partner_id = ? AND organisation_id = ?",
+        (addr["partner_id"], organisation_id)
+    )
+    conn.execute(
+        "UPDATE partner_addresses SET is_default_receiving_site = 1, updated_at = ? WHERE partner_address_id = ?",
+        (now_iso(), partner_address_id)
+    )
+
+    audit_event(
+        conn,
+        entity_type="PartnerAddress",
+        entity_id=partner_address_id,
+        action="PARTNER_ADDRESS_SET_DEFAULT_RECEIVING",
+        summary=f"Default receiving partner address set by {updated_by_display_name}",
+        organisation_id=organisation_id
+    )
+
+    updated = conn.execute(
+        """
+        SELECT pa.*, p.name AS partner_name
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchone()
+
+    conn.commit()
+    conn.close()
+
+    d = dict(updated)
+    d["is_active"] = bool(d["is_active"])
+    d["is_primary"] = bool(d["is_primary"])
+    d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+    d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+    return jsonify(d), 200
+
+
+
 @app.post("/partner-addresses/<partner_address_id>/location-update-request")
 def submit_partner_address_location_update_request(partner_address_id):
     body = request.get_json(silent=True) or {}
@@ -2401,6 +2812,7 @@ def list_partners():
 def get_partner_profile(partner_id):
     conn = get_conn()
     ensure_partner_connection_tables(conn)
+    ensure_partner_address_tables(conn)
 
     row = conn.execute(
         """
@@ -2424,6 +2836,45 @@ def get_partner_profile(partner_id):
         """,
         (partner_id,)
     ).fetchone()
+
+    address_rows = conn.execute(
+        """
+        SELECT
+            partner_address_id,
+            partner_id,
+            organisation_id,
+            label,
+            category,
+            custom_category_label,
+            is_active,
+            is_primary,
+            is_default_dispatch_site,
+            is_default_receiving_site,
+            address_line_1,
+            address_line_2,
+            suburb,
+            state,
+            postcode,
+            country,
+            gate_number,
+            door_number,
+            entry_instructions,
+            truck_access_notes,
+            latitude,
+            longitude,
+            created_at,
+            updated_at
+        FROM partner_addresses
+        WHERE partner_id = ?
+        ORDER BY
+            is_primary DESC,
+            is_default_dispatch_site DESC,
+            is_default_receiving_site DESC,
+            label ASC,
+            created_at DESC
+        """,
+        (partner_id,)
+    ).fetchall()
 
     conn.close()
 
@@ -2450,6 +2901,21 @@ def get_partner_profile(partner_id):
         d["connection_label"] = "Connection Requested"
     else:
         d["connection_label"] = "Local Partner Only"
+
+    partner_addresses = []
+    for addr in address_rows:
+        a = dict(addr)
+        a["is_active"] = bool(a["is_active"])
+        a["is_primary"] = bool(a["is_primary"])
+        a["is_default_dispatch_site"] = bool(a["is_default_dispatch_site"])
+        a["is_default_receiving_site"] = bool(a["is_default_receiving_site"])
+        partner_addresses.append(a)
+
+    d["partner_address_count"] = len(partner_addresses)
+    d["partner_addresses"] = partner_addresses
+    d["primary_partner_address"] = next((a for a in partner_addresses if a["is_primary"]), None)
+    d["default_dispatch_partner_address"] = next((a for a in partner_addresses if a["is_default_dispatch_site"]), None)
+    d["default_receiving_partner_address"] = next((a for a in partner_addresses if a["is_default_receiving_site"]), None)
 
     return jsonify(d), 200
 
