@@ -351,6 +351,14 @@ def ensure_shared_transaction_tables(conn):
         conn.execute("ALTER TABLE shared_transactions ADD COLUMN correction_proposed_by_display_name TEXT")
     if "correction_proposed_at" not in cols:
         conn.execute("ALTER TABLE shared_transactions ADD COLUMN correction_proposed_at TEXT")
+    if "resolution_code" not in cols:
+        conn.execute("ALTER TABLE shared_transactions ADD COLUMN resolution_code TEXT")
+    if "resolution_notes" not in cols:
+        conn.execute("ALTER TABLE shared_transactions ADD COLUMN resolution_notes TEXT")
+    if "resolved_by_display_name" not in cols:
+        conn.execute("ALTER TABLE shared_transactions ADD COLUMN resolved_by_display_name TEXT")
+    if "resolved_at" not in cols:
+        conn.execute("ALTER TABLE shared_transactions ADD COLUMN resolved_at TEXT")
 
     conn.commit()
 
@@ -2228,6 +2236,219 @@ def reject_org_connection_request(connection_request_id):
 
 
 
+
+@app.get("/organisations/<organisation_id>/shared-transaction-disputes")
+def list_shared_transaction_disputes(organisation_id):
+    conn = get_conn()
+    ensure_shared_transaction_tables(conn)
+
+    rows = conn.execute(
+        """
+        SELECT
+            st.shared_transaction_id,
+            st.origin_org_id,
+            oo.name AS origin_org_name,
+            st.counterparty_org_id,
+            co.name AS counterparty_org_name,
+            st.origin_partner_id,
+            op.name AS origin_partner_name,
+            st.counterparty_partner_id,
+            cp.name AS counterparty_partner_name,
+            st.origin_resource_id,
+            st.resource_name,
+            st.unit_type,
+            st.quantity,
+            st.proposed_quantity,
+            st.reference_number,
+            st.proposed_reference_number,
+            st.shared_status,
+            st.dispute_reason_code,
+            st.dispute_reason_text,
+            st.disputed_by_display_name,
+            st.disputed_at,
+            st.created_at,
+            st.updated_at
+        FROM shared_transactions st
+        LEFT JOIN organisations oo ON oo.organisation_id = st.origin_org_id
+        LEFT JOIN organisations co ON co.organisation_id = st.counterparty_org_id
+        LEFT JOIN partners op ON op.partner_id = st.origin_partner_id
+        LEFT JOIN partners cp ON cp.partner_id = st.counterparty_partner_id
+        WHERE (st.origin_org_id = ? OR st.counterparty_org_id = ?)
+          AND st.shared_status = 'DISPUTED'
+        ORDER BY COALESCE(st.disputed_at, st.updated_at) DESC
+        """,
+        (organisation_id, organisation_id)
+    ).fetchall()
+
+    conn.close()
+
+    items = []
+    for row in rows:
+        d = dict(row)
+        if d["origin_org_id"] == organisation_id:
+            d["perspective_role"] = "DISPATCHING"
+            d["lane"] = "outgoing"
+            d["counterparty_label"] = d["counterparty_org_name"]
+        else:
+            d["perspective_role"] = "RECEIVING"
+            d["lane"] = "incoming"
+            d["counterparty_label"] = d["origin_org_name"]
+
+        d["next_action"] = "admin_resolve"
+        d["entry_target_section"] = "shared_transaction_disputes"
+        d["entry_target_entity_type"] = "SharedTransaction"
+        d["entry_target_action"] = "open_dispute_review"
+        d["highlight_key"] = d["shared_transaction_id"]
+        items.append(d)
+
+    return jsonify({
+        "organisation_id": organisation_id,
+        "count": len(items),
+        "items": items
+    }), 200
+
+
+@app.post("/shared-transactions/<shared_transaction_id>/admin-resolve")
+def admin_resolve_shared_transaction(shared_transaction_id):
+    body = request.get_json(silent=True) or {}
+    organisation_id = body.get("organisation_id")
+    resolution_action = (body.get("resolution_action") or "").strip().upper()
+    resolved_by_display_name = (body.get("resolved_by_display_name") or "Unknown Admin").strip()
+    resolution_notes = (body.get("resolution_notes") or "").strip() or None
+
+    if not organisation_id:
+        return jsonify({"error": "organisation_id is required"}), 400
+    if resolution_action not in ("KEEP_ORIGINAL", "ACCEPT_PROPOSED_CORRECTION"):
+        return jsonify({"error": "resolution_action must be KEEP_ORIGINAL or ACCEPT_PROPOSED_CORRECTION"}), 400
+
+    conn = get_conn()
+    ensure_shared_transaction_tables(conn)
+
+    st = conn.execute(
+        "SELECT * FROM shared_transactions WHERE shared_transaction_id = ?",
+        (shared_transaction_id,)
+    ).fetchone()
+
+    if not st:
+        conn.close()
+        return jsonify({"error": "Shared transaction not found"}), 404
+
+    if organisation_id not in (st["origin_org_id"], st["counterparty_org_id"]):
+        conn.close()
+        return jsonify({"error": "Organisation is not part of this shared transaction"}), 403
+
+    if st["shared_status"] != "DISPUTED":
+        conn.close()
+        return jsonify({"error": "Shared transaction is not currently disputed"}), 400
+
+    actor_org_role = "DISPATCHING" if organisation_id == st["origin_org_id"] else "RECEIVING"
+    other_org_id = st["counterparty_org_id"] if organisation_id == st["origin_org_id"] else st["origin_org_id"]
+    previous_status = st["shared_status"]
+
+    final_quantity = st["quantity"]
+    final_reference = st["reference_number"]
+
+    if resolution_action == "ACCEPT_PROPOSED_CORRECTION":
+        if st["proposed_quantity"] is not None:
+            final_quantity = st["proposed_quantity"]
+        if st["proposed_reference_number"] not in (None, ""):
+            final_reference = st["proposed_reference_number"]
+        resolution_code = "ADMIN_ACCEPTED_PROPOSED_CORRECTION"
+        event_action = "ADMIN_RESOLVED_ACCEPT_PROPOSED_CORRECTION"
+        summary = f"Org Admin resolved dispute by accepting proposed correction. Final quantity {final_quantity}, reference {final_reference}"
+    else:
+        resolution_code = "ADMIN_KEPT_ORIGINAL"
+        event_action = "ADMIN_RESOLVED_KEEP_ORIGINAL"
+        summary = f"Org Admin resolved dispute by keeping original values. Final quantity {final_quantity}, reference {final_reference}"
+
+    if resolution_notes:
+        summary = summary + f". Notes: {resolution_notes}"
+
+    conn.execute(
+        """
+        UPDATE shared_transactions
+        SET shared_status = ?,
+            quantity = ?,
+            reference_number = ?,
+            confirmed_by_display_name = ?,
+            confirmed_at = ?,
+            proposed_quantity = NULL,
+            proposed_reference_number = NULL,
+            correction_reason_text = NULL,
+            correction_proposed_by_display_name = NULL,
+            correction_proposed_at = NULL,
+            dispute_reason_code = NULL,
+            dispute_reason_text = NULL,
+            disputed_by_display_name = NULL,
+            disputed_at = NULL,
+            resolution_code = ?,
+            resolution_notes = ?,
+            resolved_by_display_name = ?,
+            resolved_at = ?,
+            updated_at = ?
+        WHERE shared_transaction_id = ?
+        """,
+        (
+            "CONFIRMED",
+            final_quantity,
+            final_reference,
+            resolved_by_display_name,
+            now_iso(),
+            resolution_code,
+            resolution_notes,
+            resolved_by_display_name,
+            now_iso(),
+            now_iso(),
+            shared_transaction_id
+        )
+    )
+
+    record_shared_transaction_event(
+        conn=conn,
+        shared_transaction_id=shared_transaction_id,
+        organisation_id=organisation_id,
+        actor_org_role=actor_org_role,
+        action=event_action,
+        summary=summary,
+        previous_status=previous_status,
+        new_status="CONFIRMED",
+        created_by_display_name=resolved_by_display_name
+    )
+
+    audit_event(
+        conn,
+        entity_type="SharedTransaction",
+        entity_id=shared_transaction_id,
+        action="ADMIN_RESOLVED",
+        summary=summary,
+        organisation_id=organisation_id
+    )
+
+    audit_event(
+        conn,
+        entity_type="SharedTransaction",
+        entity_id=shared_transaction_id,
+        action="ADMIN_RESOLVED",
+        summary=summary,
+        organisation_id=other_org_id
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "shared_transaction_id": shared_transaction_id,
+        "shared_status": "CONFIRMED",
+        "resolution_action": resolution_action,
+        "resolution_code": resolution_code,
+        "resolution_notes": resolution_notes,
+        "resolved_by_display_name": resolved_by_display_name,
+        "quantity": final_quantity,
+        "reference_number": final_reference
+    }), 200
+
+
+
 @app.post("/shared-transactions/<shared_transaction_id>/generate-qr-token")
 def generate_shared_transaction_qr_token(shared_transaction_id):
     body = request.get_json(silent=True) or {}
@@ -2893,6 +3114,10 @@ def list_shared_transactions(organisation_id):
             st.disputed_at,
             st.dispute_reason_code,
             st.dispute_reason_text,
+            st.resolution_code,
+            st.resolution_notes,
+            st.resolved_by_display_name,
+            st.resolved_at,
             st.created_at,
             st.updated_at
         FROM shared_transactions st
@@ -2994,6 +3219,10 @@ def get_shared_transaction(shared_transaction_id):
             st.disputed_at,
             st.dispute_reason_code,
             st.dispute_reason_text,
+            st.resolution_code,
+            st.resolution_notes,
+            st.resolved_by_display_name,
+            st.resolved_at,
             st.created_at,
             st.updated_at
         FROM shared_transactions st
