@@ -364,6 +364,61 @@ def ensure_shared_transaction_tables(conn):
 
 
 
+
+def ensure_partner_address_tables(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS partner_addresses (
+        partner_address_id TEXT PRIMARY KEY,
+        partner_id TEXT NOT NULL,
+        organisation_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        category TEXT NOT NULL,
+        custom_category_label TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        is_primary INTEGER NOT NULL DEFAULT 0,
+        is_default_dispatch_site INTEGER NOT NULL DEFAULT 0,
+        is_default_receiving_site INTEGER NOT NULL DEFAULT 0,
+        address_line_1 TEXT,
+        address_line_2 TEXT,
+        suburb TEXT,
+        state TEXT,
+        postcode TEXT,
+        country TEXT,
+        gate_number TEXT,
+        door_number TEXT,
+        entry_instructions TEXT,
+        truck_access_notes TEXT,
+        latitude REAL,
+        longitude REAL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS location_update_requests (
+        location_update_request_id TEXT PRIMARY KEY,
+        organisation_id TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        current_latitude REAL,
+        current_longitude REAL,
+        proposed_latitude REAL NOT NULL,
+        proposed_longitude REAL NOT NULL,
+        reason_text TEXT,
+        status TEXT NOT NULL,
+        submitted_by_display_name TEXT NOT NULL,
+        reviewed_by_display_name TEXT,
+        review_notes TEXT,
+        reviewed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    conn.commit()
+
+
 def ensure_qr_token_tables(conn):
     conn.execute("""
     CREATE TABLE IF NOT EXISTS qr_handoff_tokens (
@@ -878,6 +933,596 @@ def get_admin_dashboard(organisation_id):
         },
         "recent_open_items": [dict(r) for r in recent_open_rows],
         "recent_resolved_items": [dict(r) for r in recent_resolved_rows]
+    }), 200
+
+
+
+@app.post("/partners/<partner_id>/addresses")
+def create_partner_address(partner_id):
+    body = request.get_json(silent=True) or {}
+    organisation_id = body.get("organisation_id")
+    label = (body.get("label") or "").strip()
+    category = (body.get("category") or "").strip().upper()
+    custom_category_label = (body.get("custom_category_label") or "").strip() or None
+
+    address_line_1 = (body.get("address_line_1") or "").strip() or None
+    address_line_2 = (body.get("address_line_2") or "").strip() or None
+    suburb = (body.get("suburb") or "").strip() or None
+    state = (body.get("state") or "").strip() or None
+    postcode = (body.get("postcode") or "").strip() or None
+    country = (body.get("country") or "").strip() or None
+    gate_number = (body.get("gate_number") or "").strip() or None
+    door_number = (body.get("door_number") or "").strip() or None
+    entry_instructions = (body.get("entry_instructions") or "").strip() or None
+    truck_access_notes = (body.get("truck_access_notes") or "").strip() or None
+
+    latitude = body.get("latitude")
+    longitude = body.get("longitude")
+
+    is_primary = 1 if bool(body.get("is_primary")) else 0
+    is_default_dispatch_site = 1 if bool(body.get("is_default_dispatch_site")) else 0
+    is_default_receiving_site = 1 if bool(body.get("is_default_receiving_site")) else 0
+
+    if not organisation_id:
+        return jsonify({"error": "organisation_id is required"}), 400
+    if not label:
+        return jsonify({"error": "label is required"}), 400
+
+    allowed_categories = {
+        "HEAD_OFFICE",
+        "WORK_SITE",
+        "WAREHOUSE",
+        "FACTORY",
+        "YARD",
+        "DEPOT",
+        "DISTRIBUTION_CENTRE",
+        "OFFICE",
+        "RETURN_SITE",
+        "OTHER",
+        "CUSTOM",
+    }
+    if category not in allowed_categories:
+        return jsonify({"error": "Invalid category"}), 400
+    if category == "CUSTOM" and not custom_category_label:
+        return jsonify({"error": "custom_category_label is required when category is CUSTOM"}), 400
+
+    if latitude is not None:
+        try:
+            latitude = float(latitude)
+        except Exception:
+            return jsonify({"error": "latitude must be a number"}), 400
+    if longitude is not None:
+        try:
+            longitude = float(longitude)
+        except Exception:
+            return jsonify({"error": "longitude must be a number"}), 400
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    partner = conn.execute(
+        "SELECT partner_id, organisation_id, name FROM partners WHERE partner_id = ? AND organisation_id = ?",
+        (partner_id, organisation_id)
+    ).fetchone()
+
+    if not partner:
+        conn.close()
+        return jsonify({"error": "Partner not found"}), 404
+
+    if is_primary:
+        conn.execute(
+            "UPDATE partner_addresses SET is_primary = 0 WHERE partner_id = ? AND organisation_id = ?",
+            (partner_id, organisation_id)
+        )
+    if is_default_dispatch_site:
+        conn.execute(
+            "UPDATE partner_addresses SET is_default_dispatch_site = 0 WHERE partner_id = ? AND organisation_id = ?",
+            (partner_id, organisation_id)
+        )
+    if is_default_receiving_site:
+        conn.execute(
+            "UPDATE partner_addresses SET is_default_receiving_site = 0 WHERE partner_id = ? AND organisation_id = ?",
+            (partner_id, organisation_id)
+        )
+
+    partner_address_id = make_id("paddr")
+    now = now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO partner_addresses (
+            partner_address_id,
+            partner_id,
+            organisation_id,
+            label,
+            category,
+            custom_category_label,
+            is_active,
+            is_primary,
+            is_default_dispatch_site,
+            is_default_receiving_site,
+            address_line_1,
+            address_line_2,
+            suburb,
+            state,
+            postcode,
+            country,
+            gate_number,
+            door_number,
+            entry_instructions,
+            truck_access_notes,
+            latitude,
+            longitude,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            partner_address_id,
+            partner_id,
+            organisation_id,
+            label,
+            category,
+            custom_category_label,
+            1,
+            is_primary,
+            is_default_dispatch_site,
+            is_default_receiving_site,
+            address_line_1,
+            address_line_2,
+            suburb,
+            state,
+            postcode,
+            country,
+            gate_number,
+            door_number,
+            entry_instructions,
+            truck_access_notes,
+            latitude,
+            longitude,
+            now,
+            now
+        )
+    )
+
+    audit_event(
+        conn,
+        entity_type="Partner",
+        entity_id=partner_id,
+        action="PARTNER_ADDRESS_CREATED",
+        summary=f"Created partner address: {label}",
+        organisation_id=organisation_id
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "partner_address_id": partner_address_id,
+        "partner_id": partner_id,
+        "organisation_id": organisation_id,
+        "partner_name": partner["name"],
+        "label": label,
+        "category": category,
+        "custom_category_label": custom_category_label,
+        "is_active": True,
+        "is_primary": bool(is_primary),
+        "is_default_dispatch_site": bool(is_default_dispatch_site),
+        "is_default_receiving_site": bool(is_default_receiving_site),
+        "address_line_1": address_line_1,
+        "address_line_2": address_line_2,
+        "suburb": suburb,
+        "state": state,
+        "postcode": postcode,
+        "country": country,
+        "gate_number": gate_number,
+        "door_number": door_number,
+        "entry_instructions": entry_instructions,
+        "truck_access_notes": truck_access_notes,
+        "latitude": latitude,
+        "longitude": longitude,
+        "created_at": now,
+        "updated_at": now
+    }), 201
+
+
+@app.get("/partners/<partner_id>/addresses")
+def list_partner_addresses(partner_id):
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    partner = conn.execute(
+        "SELECT partner_id, organisation_id, name FROM partners WHERE partner_id = ?",
+        (partner_id,)
+    ).fetchone()
+
+    if not partner:
+        conn.close()
+        return jsonify({"error": "Partner not found"}), 404
+
+    rows = conn.execute(
+        """
+        SELECT
+            partner_address_id,
+            partner_id,
+            organisation_id,
+            label,
+            category,
+            custom_category_label,
+            is_active,
+            is_primary,
+            is_default_dispatch_site,
+            is_default_receiving_site,
+            address_line_1,
+            address_line_2,
+            suburb,
+            state,
+            postcode,
+            country,
+            gate_number,
+            door_number,
+            entry_instructions,
+            truck_access_notes,
+            latitude,
+            longitude,
+            created_at,
+            updated_at
+        FROM partner_addresses
+        WHERE partner_id = ?
+        ORDER BY is_primary DESC, label ASC, created_at DESC
+        """,
+        (partner_id,)
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "partner_id": partner_id,
+        "organisation_id": partner["organisation_id"],
+        "partner_name": partner["name"],
+        "count": len(rows),
+        "items": [dict(r) for r in rows]
+    }), 200
+
+
+@app.get("/partner-addresses/<partner_address_id>")
+def get_partner_address(partner_address_id):
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    row = conn.execute(
+        """
+        SELECT
+            pa.partner_address_id,
+            pa.partner_id,
+            pa.organisation_id,
+            p.name AS partner_name,
+            pa.label,
+            pa.category,
+            pa.custom_category_label,
+            pa.is_active,
+            pa.is_primary,
+            pa.is_default_dispatch_site,
+            pa.is_default_receiving_site,
+            pa.address_line_1,
+            pa.address_line_2,
+            pa.suburb,
+            pa.state,
+            pa.postcode,
+            pa.country,
+            pa.gate_number,
+            pa.door_number,
+            pa.entry_instructions,
+            pa.truck_access_notes,
+            pa.latitude,
+            pa.longitude,
+            pa.created_at,
+            pa.updated_at
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "Partner address not found"}), 404
+
+    return jsonify(dict(row)), 200
+
+
+@app.post("/partner-addresses/<partner_address_id>/location-update-request")
+def submit_partner_address_location_update_request(partner_address_id):
+    body = request.get_json(silent=True) or {}
+    organisation_id = body.get("organisation_id")
+    proposed_latitude = body.get("proposed_latitude")
+    proposed_longitude = body.get("proposed_longitude")
+    reason_text = (body.get("reason_text") or "Field user suggested GPS update").strip()
+    submitted_by_display_name = (body.get("submitted_by_display_name") or "Unknown User").strip()
+
+    if not organisation_id:
+        return jsonify({"error": "organisation_id is required"}), 400
+    if proposed_latitude is None or proposed_longitude is None:
+        return jsonify({"error": "proposed_latitude and proposed_longitude are required"}), 400
+
+    try:
+        proposed_latitude = float(proposed_latitude)
+        proposed_longitude = float(proposed_longitude)
+    except Exception:
+        return jsonify({"error": "proposed_latitude and proposed_longitude must be numbers"}), 400
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    addr = conn.execute(
+        """
+        SELECT pa.*, p.name AS partner_name
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ? AND pa.organisation_id = ?
+        """,
+        (partner_address_id, organisation_id)
+    ).fetchone()
+
+    if not addr:
+        conn.close()
+        return jsonify({"error": "Partner address not found"}), 404
+
+    req_id = make_id("lreq")
+    now = now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO location_update_requests (
+            location_update_request_id,
+            organisation_id,
+            entity_type,
+            entity_id,
+            current_latitude,
+            current_longitude,
+            proposed_latitude,
+            proposed_longitude,
+            reason_text,
+            status,
+            submitted_by_display_name,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            req_id,
+            organisation_id,
+            "PartnerAddress",
+            partner_address_id,
+            addr["latitude"],
+            addr["longitude"],
+            proposed_latitude,
+            proposed_longitude,
+            reason_text,
+            "PENDING_APPROVAL",
+            submitted_by_display_name,
+            now,
+            now
+        )
+    )
+
+    audit_event(
+        conn,
+        entity_type="PartnerAddress",
+        entity_id=partner_address_id,
+        action="LOCATION_UPDATE_REQUESTED",
+        summary=f"GPS update requested for partner address by {submitted_by_display_name}",
+        organisation_id=organisation_id
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "location_update_request_id": req_id,
+        "organisation_id": organisation_id,
+        "entity_type": "PartnerAddress",
+        "entity_id": partner_address_id,
+        "partner_id": addr["partner_id"],
+        "partner_name": addr["partner_name"],
+        "label": addr["label"],
+        "status": "PENDING_APPROVAL",
+        "current_latitude": addr["latitude"],
+        "current_longitude": addr["longitude"],
+        "proposed_latitude": proposed_latitude,
+        "proposed_longitude": proposed_longitude,
+        "reason_text": reason_text,
+        "submitted_by_display_name": submitted_by_display_name
+    }), 201
+
+
+@app.get("/organisations/<organisation_id>/location-update-requests")
+def list_location_update_requests(organisation_id):
+    status = (request.args.get("status") or "PENDING_APPROVAL").strip().upper()
+    entity_type = (request.args.get("entity_type") or "").strip()
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    sql = """
+        SELECT
+            lur.location_update_request_id,
+            lur.organisation_id,
+            lur.entity_type,
+            lur.entity_id,
+            pa.partner_id,
+            p.name AS partner_name,
+            pa.label AS entity_name,
+            lur.current_latitude,
+            lur.current_longitude,
+            lur.proposed_latitude,
+            lur.proposed_longitude,
+            lur.reason_text,
+            lur.status,
+            lur.submitted_by_display_name,
+            lur.reviewed_by_display_name,
+            lur.review_notes,
+            lur.reviewed_at,
+            lur.created_at,
+            lur.updated_at
+        FROM location_update_requests lur
+        LEFT JOIN partner_addresses pa
+            ON lur.entity_type = 'PartnerAddress' AND pa.partner_address_id = lur.entity_id
+        LEFT JOIN partners p
+            ON p.partner_id = pa.partner_id
+        WHERE lur.organisation_id = ?
+          AND lur.status = ?
+    """
+    params = [organisation_id, status]
+
+    if entity_type:
+        sql += " AND lur.entity_type = ?"
+        params.append(entity_type)
+
+    sql += " ORDER BY lur.created_at DESC"
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    return jsonify({
+        "organisation_id": organisation_id,
+        "count": len(rows),
+        "items": [dict(r) for r in rows]
+    }), 200
+
+
+@app.post("/location-update-requests/<location_update_request_id>/approve")
+def approve_location_update_request(location_update_request_id):
+    body = request.get_json(silent=True) or {}
+    organisation_id = body.get("organisation_id")
+    reviewed_by_display_name = (body.get("reviewed_by_display_name") or "Unknown Admin").strip()
+    review_notes = (body.get("review_notes") or "").strip() or None
+
+    if not organisation_id:
+        return jsonify({"error": "organisation_id is required"}), 400
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    req = conn.execute(
+        "SELECT * FROM location_update_requests WHERE location_update_request_id = ? AND organisation_id = ?",
+        (location_update_request_id, organisation_id)
+    ).fetchone()
+
+    if not req:
+        conn.close()
+        return jsonify({"error": "Location update request not found"}), 404
+
+    if req["status"] != "PENDING_APPROVAL":
+        conn.close()
+        return jsonify({"error": "Location update request is not pending approval"}), 400
+
+    if req["entity_type"] != "PartnerAddress":
+        conn.close()
+        return jsonify({"error": "Unsupported entity_type for this approval route"}), 400
+
+    conn.execute(
+        "UPDATE partner_addresses SET latitude = ?, longitude = ?, updated_at = ? WHERE partner_address_id = ?",
+        (req["proposed_latitude"], req["proposed_longitude"], now_iso(), req["entity_id"])
+    )
+
+    conn.execute(
+        """
+        UPDATE location_update_requests
+        SET status = 'APPROVED',
+            reviewed_by_display_name = ?,
+            review_notes = ?,
+            reviewed_at = ?,
+            updated_at = ?
+        WHERE location_update_request_id = ?
+        """,
+        (reviewed_by_display_name, review_notes, now_iso(), now_iso(), location_update_request_id)
+    )
+
+    audit_event(
+        conn,
+        entity_type="PartnerAddress",
+        entity_id=req["entity_id"],
+        action="LOCATION_UPDATE_APPROVED",
+        summary=f"GPS update approved by {reviewed_by_display_name}",
+        organisation_id=organisation_id
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "location_update_request_id": location_update_request_id,
+        "status": "APPROVED",
+        "entity_type": "PartnerAddress",
+        "entity_id": req["entity_id"],
+        "latitude": req["proposed_latitude"],
+        "longitude": req["proposed_longitude"],
+        "reviewed_by_display_name": reviewed_by_display_name,
+        "review_notes": review_notes
+    }), 200
+
+
+@app.post("/location-update-requests/<location_update_request_id>/reject")
+def reject_location_update_request(location_update_request_id):
+    body = request.get_json(silent=True) or {}
+    organisation_id = body.get("organisation_id")
+    reviewed_by_display_name = (body.get("reviewed_by_display_name") or "Unknown Admin").strip()
+    review_notes = (body.get("review_notes") or "").strip() or None
+
+    if not organisation_id:
+        return jsonify({"error": "organisation_id is required"}), 400
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    req = conn.execute(
+        "SELECT * FROM location_update_requests WHERE location_update_request_id = ? AND organisation_id = ?",
+        (location_update_request_id, organisation_id)
+    ).fetchone()
+
+    if not req:
+        conn.close()
+        return jsonify({"error": "Location update request not found"}), 404
+
+    if req["status"] != "PENDING_APPROVAL":
+        conn.close()
+        return jsonify({"error": "Location update request is not pending approval"}), 400
+
+    conn.execute(
+        """
+        UPDATE location_update_requests
+        SET status = 'REJECTED',
+            reviewed_by_display_name = ?,
+            review_notes = ?,
+            reviewed_at = ?,
+            updated_at = ?
+        WHERE location_update_request_id = ?
+        """,
+        (reviewed_by_display_name, review_notes, now_iso(), now_iso(), location_update_request_id)
+    )
+
+    audit_event(
+        conn,
+        entity_type=req["entity_type"],
+        entity_id=req["entity_id"],
+        action="LOCATION_UPDATE_REJECTED",
+        summary=f"GPS update rejected by {reviewed_by_display_name}",
+        organisation_id=organisation_id
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "location_update_request_id": location_update_request_id,
+        "status": "REJECTED",
+        "entity_type": req["entity_type"],
+        "entity_id": req["entity_id"],
+        "reviewed_by_display_name": reviewed_by_display_name,
+        "review_notes": review_notes
     }), 200
 
 
