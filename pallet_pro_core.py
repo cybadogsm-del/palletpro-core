@@ -937,6 +937,120 @@ def get_admin_dashboard(organisation_id):
 
 
 
+
+
+def build_partner_address_navigation_contract(addr_like, default_nav_app="google_maps"):
+    from urllib.parse import quote
+
+    addr = dict(addr_like)
+
+    def clean(value):
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
+    label = clean(addr.get("label")) or "Partner Address"
+    gate_number = clean(addr.get("gate_number"))
+    door_number = clean(addr.get("door_number"))
+
+    address_parts = [
+        clean(addr.get("address_line_1")),
+        clean(addr.get("address_line_2")),
+        clean(addr.get("suburb")),
+        clean(addr.get("state")),
+        clean(addr.get("postcode")),
+        clean(addr.get("country")),
+    ]
+    formatted_address = ", ".join([x for x in address_parts if x]) or None
+
+    latitude = addr.get("latitude")
+    longitude = addr.get("longitude")
+
+    has_gps = latitude is not None and longitude is not None
+    destination_type = "gps" if has_gps else ("address" if formatted_address else None)
+    can_navigate = destination_type is not None
+
+    arrival_bits = []
+    if gate_number:
+        arrival_bits.append(f"Gate {gate_number}")
+    if door_number:
+        arrival_bits.append(f"Door {door_number}")
+    arrival_hint = ", ".join(arrival_bits) or None
+
+    apps = []
+    if can_navigate:
+        if has_gps:
+            gps_pair = f"{latitude},{longitude}"
+            google_uri = f"google.navigation:q={gps_pair}"
+            waze_uri = f"waze://?ll={gps_pair}&navigate=yes"
+            apple_uri = f"http://maps.apple.com/?ll={gps_pair}&q={quote(label)}"
+            geo_uri = f"geo:{gps_pair}?q={gps_pair}({quote(label)})"
+        else:
+            encoded_address = quote(formatted_address)
+            google_uri = f"google.navigation:q={encoded_address}"
+            waze_uri = f"waze://?q={encoded_address}&navigate=yes"
+            apple_uri = f"http://maps.apple.com/?address={encoded_address}"
+            geo_uri = f"geo:0,0?q={encoded_address}"
+
+        apps = [
+            {
+                "app_key": "google_maps",
+                "app_label": "Google Maps",
+                "is_default": False,
+                "launch_uri": google_uri,
+            },
+            {
+                "app_key": "waze",
+                "app_label": "Waze",
+                "is_default": False,
+                "launch_uri": waze_uri,
+            },
+            {
+                "app_key": "apple_maps",
+                "app_label": "Apple Maps",
+                "is_default": False,
+                "launch_uri": apple_uri,
+            },
+            {
+                "app_key": "generic_geo",
+                "app_label": "Default Navigation App",
+                "is_default": False,
+                "launch_uri": geo_uri,
+            },
+        ]
+
+        wanted = (default_nav_app or "google_maps").strip().lower()
+        order = [wanted] + [a["app_key"] for a in apps if a["app_key"] != wanted]
+        app_map = {a["app_key"]: a for a in apps}
+        ordered = []
+        for key in order:
+            if key in app_map:
+                item = dict(app_map[key])
+                item["is_default"] = (key == wanted)
+                ordered.append(item)
+        apps = ordered
+
+    navigation = {
+        "can_navigate": can_navigate,
+        "destination_type": destination_type,
+        "latitude": latitude,
+        "longitude": longitude,
+        "formatted_address": formatted_address,
+        "gate_number": gate_number,
+        "door_number": door_number,
+        "arrival_hint": arrival_hint,
+        "preferred_label": label,
+        "default_nav_app": (default_nav_app or "google_maps").strip().lower() or "google_maps",
+    }
+
+    return {
+        "navigation": navigation,
+        "navigation_apps": apps,
+    }
+
+
+
 @app.post("/partners/<partner_id>/addresses")
 def create_partner_address(partner_id):
     body = request.get_json(silent=True) or {}
@@ -1176,12 +1290,24 @@ def list_partner_addresses(partner_id):
 
     conn.close()
 
+    items = []
+    for row in rows:
+        d = dict(row)
+        d["is_active"] = bool(d["is_active"])
+        d["is_primary"] = bool(d["is_primary"])
+        d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+        d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+        nav_contract = build_partner_address_navigation_contract(d)
+        d["navigation"] = nav_contract["navigation"]
+        d["navigation_apps"] = nav_contract["navigation_apps"]
+        items.append(d)
+
     return jsonify({
         "partner_id": partner_id,
         "organisation_id": partner["organisation_id"],
         "partner_name": partner["name"],
-        "count": len(rows),
-        "items": [dict(r) for r in rows]
+        "count": len(items),
+        "items": items
     }), 200
 
 
@@ -1230,7 +1356,16 @@ def get_partner_address(partner_address_id):
     if not row:
         return jsonify({"error": "Partner address not found"}), 404
 
-    return jsonify(dict(row)), 200
+    d = dict(row)
+    d["is_active"] = bool(d["is_active"])
+    d["is_primary"] = bool(d["is_primary"])
+    d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+    d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+    nav_contract = build_partner_address_navigation_contract(d)
+    d["navigation"] = nav_contract["navigation"]
+    d["navigation_apps"] = nav_contract["navigation_apps"]
+
+    return jsonify(d), 200
 
 
 
@@ -1641,6 +1776,75 @@ def set_default_receiving_partner_address(partner_address_id):
     d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
     d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
     return jsonify(d), 200
+
+
+
+
+
+@app.get("/partner-addresses/<partner_address_id>/navigation-options")
+def get_partner_address_navigation_options(partner_address_id):
+    default_nav_app = (request.args.get("default_nav_app") or "google_maps").strip().lower() or "google_maps"
+
+    conn = get_conn()
+    ensure_partner_address_tables(conn)
+
+    row = conn.execute(
+        """
+        SELECT
+            pa.partner_address_id,
+            pa.partner_id,
+            pa.organisation_id,
+            p.name AS partner_name,
+            pa.label,
+            pa.category,
+            pa.custom_category_label,
+            pa.is_active,
+            pa.is_primary,
+            pa.is_default_dispatch_site,
+            pa.is_default_receiving_site,
+            pa.address_line_1,
+            pa.address_line_2,
+            pa.suburb,
+            pa.state,
+            pa.postcode,
+            pa.country,
+            pa.gate_number,
+            pa.door_number,
+            pa.entry_instructions,
+            pa.truck_access_notes,
+            pa.latitude,
+            pa.longitude,
+            pa.created_at,
+            pa.updated_at
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+        """,
+        (partner_address_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if not row:
+        return jsonify({"error": "Partner address not found"}), 404
+
+    d = dict(row)
+    d["is_active"] = bool(d["is_active"])
+    d["is_primary"] = bool(d["is_primary"])
+    d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+    d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+
+    nav_contract = build_partner_address_navigation_contract(d, default_nav_app=default_nav_app)
+
+    return jsonify({
+        "partner_address_id": d["partner_address_id"],
+        "partner_id": d["partner_id"],
+        "organisation_id": d["organisation_id"],
+        "partner_name": d["partner_name"],
+        "label": d["label"],
+        "navigation": nav_contract["navigation"],
+        "navigation_apps": nav_contract["navigation_apps"],
+    }), 200
 
 
 
@@ -2909,6 +3113,9 @@ def get_partner_profile(partner_id):
         a["is_primary"] = bool(a["is_primary"])
         a["is_default_dispatch_site"] = bool(a["is_default_dispatch_site"])
         a["is_default_receiving_site"] = bool(a["is_default_receiving_site"])
+        nav_contract = build_partner_address_navigation_contract(a)
+        a["navigation"] = nav_contract["navigation"]
+        a["navigation_apps"] = nav_contract["navigation_apps"]
         partner_addresses.append(a)
 
     d["partner_address_count"] = len(partner_addresses)
