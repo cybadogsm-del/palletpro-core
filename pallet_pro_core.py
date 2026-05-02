@@ -448,6 +448,19 @@ def ensure_qr_token_tables(conn):
     conn.commit()
 
 
+
+
+def ensure_shared_transaction_partner_address_tables(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS shared_transaction_partner_addresses (
+        shared_transaction_id TEXT PRIMARY KEY,
+        origin_partner_address_id TEXT,
+        counterparty_partner_address_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
 def validate_qr_handoff_token_for_action(conn, qr_token_id, shared_transaction_id, organisation_id, expected_purpose):
     if not qr_token_id:
         return None, None
@@ -776,6 +789,18 @@ init_db()
 
 
 @app.get("/")
+
+@app.route("/health")
+@app.route("/api/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "app": "Pallet Pro Core",
+        "backend": "Flask",
+        "port": 8000
+    })
+
+
 def root():
     return jsonify({
         "status": "Pallet Pro Core Running",
@@ -4087,6 +4112,8 @@ def generate_shared_transaction_qr_token(shared_transaction_id):
     conn = get_conn()
     ensure_shared_transaction_tables(conn)
     ensure_qr_token_tables(conn)
+    ensure_partner_address_tables(conn)
+    ensure_shared_transaction_partner_address_tables(conn)
 
     st = conn.execute(
         "SELECT * FROM shared_transactions WHERE shared_transaction_id = ?",
@@ -4096,6 +4123,8 @@ def generate_shared_transaction_qr_token(shared_transaction_id):
     if not st:
         conn.close()
         return jsonify({"error": "Shared transaction not found"}), 404
+
+    address_payloads = get_shared_transaction_partner_address_payloads(conn, shared_transaction_id)
 
     if purpose == "INITIAL_CONFIRMATION":
         if organisation_id != st["origin_org_id"]:
@@ -4110,11 +4139,11 @@ def generate_shared_transaction_qr_token(shared_transaction_id):
         screen_title = "Incoming Transaction"
         role_banner = "You are Receiving"
         next_expected_action = "confirm_or_dispute"
-
     else:
         if organisation_id != st["counterparty_org_id"]:
             conn.close()
             return jsonify({"error": "Only the counterparty org can generate the correction review QR"}), 403
+
         if st["shared_status"] != "CORRECTION_PROPOSED":
             conn.close()
             return jsonify({"error": "Shared transaction is not awaiting correction review"}), 400
@@ -4222,7 +4251,11 @@ def generate_shared_transaction_qr_token(shared_transaction_id):
         "issued_at": issued_at,
         "expires_at": expires_at,
         "qr_open_path": f"/qr-handoff/{qr_token_id}",
-        "qr_scan_path": f"/qr-handoff/{qr_token_id}/scan"
+        "qr_scan_path": f"/qr-handoff/{qr_token_id}/scan",
+        "origin_partner_address_id": address_payloads["origin_partner_address_id"],
+        "counterparty_partner_address_id": address_payloads["counterparty_partner_address_id"],
+        "origin_partner_address": address_payloads["origin_partner_address"],
+        "counterparty_partner_address": address_payloads["counterparty_partner_address"],
     }), 201
 
 
@@ -4231,6 +4264,8 @@ def get_qr_handoff_token(qr_token_id):
     conn = get_conn()
     ensure_shared_transaction_tables(conn)
     ensure_qr_token_tables(conn)
+    ensure_partner_address_tables(conn)
+    ensure_shared_transaction_partner_address_tables(conn)
 
     row = conn.execute(
         """
@@ -4255,6 +4290,10 @@ def get_qr_handoff_token(qr_token_id):
             oo.name AS origin_org_name,
             st.counterparty_org_id,
             co.name AS counterparty_org_name,
+            st.origin_partner_id,
+            op.name AS origin_partner_name,
+            st.counterparty_partner_id,
+            cp.name AS counterparty_partner_name,
             st.resource_name,
             st.unit_type,
             st.quantity,
@@ -4268,15 +4307,19 @@ def get_qr_handoff_token(qr_token_id):
         LEFT JOIN shared_transactions st ON st.shared_transaction_id = q.shared_transaction_id
         LEFT JOIN organisations oo ON oo.organisation_id = st.origin_org_id
         LEFT JOIN organisations co ON co.organisation_id = st.counterparty_org_id
+        LEFT JOIN partners op ON op.partner_id = st.origin_partner_id
+        LEFT JOIN partners cp ON cp.partner_id = st.counterparty_partner_id
         WHERE q.qr_token_id = ?
         """,
         (qr_token_id,)
     ).fetchone()
 
-    conn.close()
-
     if not row:
+        conn.close()
         return jsonify({"error": "QR handoff token not found"}), 404
+
+    address_payloads = get_shared_transaction_partner_address_payloads(conn, row["shared_transaction_id"])
+    conn.close()
 
     d = dict(row)
 
@@ -4294,6 +4337,11 @@ def get_qr_handoff_token(qr_token_id):
         d["role_banner"] = "You are Dispatching"
         d["next_expected_action"] = "accept_or_reject_correction"
 
+    d["origin_partner_address_id"] = address_payloads["origin_partner_address_id"]
+    d["counterparty_partner_address_id"] = address_payloads["counterparty_partner_address_id"]
+    d["origin_partner_address"] = address_payloads["origin_partner_address"]
+    d["counterparty_partner_address"] = address_payloads["counterparty_partner_address"]
+
     return jsonify(d), 200
 
 
@@ -4309,6 +4357,8 @@ def scan_qr_handoff_token(qr_token_id):
     conn = get_conn()
     ensure_shared_transaction_tables(conn)
     ensure_qr_token_tables(conn)
+    ensure_partner_address_tables(conn)
+    ensure_shared_transaction_partner_address_tables(conn)
 
     row = conn.execute(
         """
@@ -4333,6 +4383,10 @@ def scan_qr_handoff_token(qr_token_id):
             oo.name AS origin_org_name,
             st.counterparty_org_id,
             co.name AS counterparty_org_name,
+            st.origin_partner_id,
+            op.name AS origin_partner_name,
+            st.counterparty_partner_id,
+            cp.name AS counterparty_partner_name,
             st.resource_name,
             st.unit_type,
             st.quantity,
@@ -4346,6 +4400,8 @@ def scan_qr_handoff_token(qr_token_id):
         LEFT JOIN shared_transactions st ON st.shared_transaction_id = q.shared_transaction_id
         LEFT JOIN organisations oo ON oo.organisation_id = st.origin_org_id
         LEFT JOIN organisations co ON co.organisation_id = st.counterparty_org_id
+        LEFT JOIN partners op ON op.partner_id = st.origin_partner_id
+        LEFT JOIN partners cp ON cp.partner_id = st.counterparty_partner_id
         WHERE q.qr_token_id = ?
         """,
         (qr_token_id,)
@@ -4372,6 +4428,7 @@ def scan_qr_handoff_token(qr_token_id):
     import datetime as _dt
     expires = _dt.datetime.fromisoformat(d["expires_at"])
     current_dt = _dt.datetime.fromisoformat(now_iso())
+
     if current_dt > expires:
         conn.execute(
             "UPDATE qr_handoff_tokens SET token_status = ? WHERE qr_token_id = ?",
@@ -4416,6 +4473,7 @@ def scan_qr_handoff_token(qr_token_id):
 
         conn.commit()
 
+    address_payloads = get_shared_transaction_partner_address_payloads(conn, d["shared_transaction_id"])
     conn.close()
 
     if d["purpose"] == "INITIAL_CONFIRMATION":
@@ -4439,8 +4497,16 @@ def scan_qr_handoff_token(qr_token_id):
         "shared_status": d["shared_status"],
         "origin_org_id": d["origin_org_id"],
         "origin_org_name": d["origin_org_name"],
+        "origin_partner_id": d["origin_partner_id"],
+        "origin_partner_name": d["origin_partner_name"],
         "counterparty_org_id": d["counterparty_org_id"],
         "counterparty_org_name": d["counterparty_org_name"],
+        "counterparty_partner_id": d["counterparty_partner_id"],
+        "counterparty_partner_name": d["counterparty_partner_name"],
+        "origin_partner_address_id": address_payloads["origin_partner_address_id"],
+        "counterparty_partner_address_id": address_payloads["counterparty_partner_address_id"],
+        "origin_partner_address": address_payloads["origin_partner_address"],
+        "counterparty_partner_address": address_payloads["counterparty_partner_address"],
         "resource_name": d["resource_name"],
         "unit_type": d["unit_type"],
         "quantity": d["quantity"],
@@ -4454,136 +4520,17 @@ def scan_qr_handoff_token(qr_token_id):
 
 
 
-def ensure_shared_transaction_partner_address_tables(conn):
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS shared_transaction_partner_addresses (
-            shared_transaction_id TEXT PRIMARY KEY,
-            origin_partner_address_id TEXT,
-            counterparty_partner_address_id TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
 
-
-def partner_address_row_to_payload(row):
-    if not row:
-        return None
-    d = dict(row)
-    d["is_active"] = bool(d["is_active"])
-    d["is_primary"] = bool(d["is_primary"])
-    d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
-    d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
-    nav_contract = build_partner_address_navigation_contract(d)
-    d["navigation"] = nav_contract["navigation"]
-    d["navigation_apps"] = nav_contract["navigation_apps"]
-    return d
-
-
-def get_partner_address_for_shared_transaction(conn, partner_address_id, partner_id, organisation_id):
-    row = conn.execute(
-        """
-        SELECT
-            pa.partner_address_id,
-            pa.partner_id,
-            pa.organisation_id,
-            p.name AS partner_name,
-            pa.label,
-            pa.category,
-            pa.custom_category_label,
-            pa.is_active,
-            pa.is_primary,
-            pa.is_default_dispatch_site,
-            pa.is_default_receiving_site,
-            pa.address_line_1,
-            pa.address_line_2,
-            pa.suburb,
-            pa.state,
-            pa.postcode,
-            pa.country,
-            pa.gate_number,
-            pa.door_number,
-            pa.entry_instructions,
-            pa.truck_access_notes,
-            pa.latitude,
-            pa.longitude,
-            pa.created_at,
-            pa.updated_at
-        FROM partner_addresses pa
-        LEFT JOIN partners p ON p.partner_id = pa.partner_id
-        WHERE pa.partner_address_id = ?
-          AND pa.partner_id = ?
-          AND pa.organisation_id = ?
-        """,
-        (partner_address_id, partner_id, organisation_id)
-    ).fetchone()
-
-    if not row:
-        return None, "Partner address not found for this partner and organisation"
-
-    if not row["is_active"]:
-        return None, "Inactive partner address cannot be used for a shared transaction"
-
-    return partner_address_row_to_payload(row), None
-
-
-def get_default_partner_address_for_shared_transaction(conn, partner_id, organisation_id, mode):
-    order_field = "is_default_dispatch_site" if mode == "dispatch" else "is_default_receiving_site"
-
-    row = conn.execute(
-        f"""
-        SELECT
-            pa.partner_address_id,
-            pa.partner_id,
-            pa.organisation_id,
-            p.name AS partner_name,
-            pa.label,
-            pa.category,
-            pa.custom_category_label,
-            pa.is_active,
-            pa.is_primary,
-            pa.is_default_dispatch_site,
-            pa.is_default_receiving_site,
-            pa.address_line_1,
-            pa.address_line_2,
-            pa.suburb,
-            pa.state,
-            pa.postcode,
-            pa.country,
-            pa.gate_number,
-            pa.door_number,
-            pa.entry_instructions,
-            pa.truck_access_notes,
-            pa.latitude,
-            pa.longitude,
-            pa.created_at,
-            pa.updated_at
-        FROM partner_addresses pa
-        LEFT JOIN partners p ON p.partner_id = pa.partner_id
-        WHERE pa.partner_id = ?
-          AND pa.organisation_id = ?
-          AND pa.is_active = 1
-        ORDER BY pa.{order_field} DESC, pa.is_primary DESC, pa.created_at DESC
-        LIMIT 1
-        """,
-        (partner_id, organisation_id)
-    ).fetchone()
-
-    return partner_address_row_to_payload(row) if row else None
-
-
-
+# === SHARED TRANSACTION CREATE ROUTE START ===
 @app.post("/shared-transactions")
 def create_shared_transaction():
     body = request.get_json(silent=True) or {}
     origin_org_id = body.get("origin_org_id")
     counterparty_org_id = body.get("counterparty_org_id")
     origin_partner_id = body.get("origin_partner_id")
-    origin_resource_id = body.get("origin_resource_id")
     origin_partner_address_id = body.get("origin_partner_address_id")
     counterparty_partner_address_id = body.get("counterparty_partner_address_id")
+    origin_resource_id = body.get("origin_resource_id")
     quantity = body.get("quantity")
     movement_type = (body.get("movement_type") or "DISPATCH").strip()
     reference_number = (body.get("reference_number") or "").strip() or None
@@ -4620,7 +4567,6 @@ def create_shared_transaction():
         "SELECT * FROM organisations WHERE organisation_id = ?",
         (origin_org_id,)
     ).fetchone()
-
     counterparty_org = conn.execute(
         "SELECT * FROM organisations WHERE organisation_id = ?",
         (counterparty_org_id,)
@@ -4639,7 +4585,6 @@ def create_shared_transaction():
         """,
         (origin_partner_id, origin_org_id)
     ).fetchone()
-
     if not origin_partner:
         conn.close()
         return jsonify({"error": "Origin partner not found"}), 404
@@ -4660,7 +4605,6 @@ def create_shared_transaction():
         """,
         (counterparty_org_id, origin_org_id)
     ).fetchone()
-
     if not counterparty_partner:
         conn.close()
         return jsonify({"error": "Counterparty connected partner record not found"}), 409
@@ -4674,65 +4618,22 @@ def create_shared_transaction():
         """,
         (origin_resource_id, origin_org_id)
     ).fetchone()
-
     if not origin_resource:
         conn.close()
         return jsonify({"error": "Origin resource not found"}), 404
 
-    if origin_partner_address_id:
-        origin_partner_address, origin_addr_error = get_partner_address_for_shared_transaction(
-            conn,
-            origin_partner_address_id,
-            origin_partner_id,
-            origin_org_id
-        )
-        if origin_addr_error:
-            conn.close()
-            return jsonify({"error": origin_addr_error, "field": "origin_partner_address_id"}), 409
-    else:
-        origin_partner_address = get_default_partner_address_for_shared_transaction(
-            conn,
-            origin_partner_id,
-            origin_org_id,
-            "dispatch"
-        )
-
-    if counterparty_partner_address_id:
-        counterparty_partner_address, counterparty_addr_error = get_partner_address_for_shared_transaction(
-            conn,
-            counterparty_partner_address_id,
-            counterparty_partner["partner_id"],
-            counterparty_org_id
-        )
-        if counterparty_addr_error:
-            conn.close()
-            return jsonify({"error": counterparty_addr_error, "field": "counterparty_partner_address_id"}), 409
-    else:
-        counterparty_partner_address = get_default_partner_address_for_shared_transaction(
-            conn,
-            counterparty_partner["partner_id"],
-            counterparty_org_id,
-            "receiving"
-        )
-
     likely_duplicate = conn.execute(
         """
-        SELECT
-            st.shared_transaction_id,
-            st.shared_status
-        FROM shared_transactions st
-        LEFT JOIN shared_transaction_partner_addresses stpa
-          ON stpa.shared_transaction_id = st.shared_transaction_id
-        WHERE st.origin_org_id = ?
-          AND st.counterparty_org_id = ?
-          AND st.origin_resource_id = ?
-          AND st.quantity = ?
-          AND st.movement_type = ?
-          AND COALESCE(st.reference_number, '') = COALESCE(?, '')
-          AND COALESCE(stpa.origin_partner_address_id, '') = COALESCE(?, '')
-          AND COALESCE(stpa.counterparty_partner_address_id, '') = COALESCE(?, '')
-          AND st.shared_status IN ('AWAITING_COUNTERPARTY_CONFIRMATION', 'CONFIRMED', 'DISPUTED')
-        ORDER BY st.created_at DESC
+        SELECT shared_transaction_id, shared_status
+        FROM shared_transactions
+        WHERE origin_org_id = ?
+          AND counterparty_org_id = ?
+          AND origin_resource_id = ?
+          AND quantity = ?
+          AND movement_type = ?
+          AND COALESCE(reference_number, '') = COALESCE(?, '')
+          AND shared_status IN ('AWAITING_COUNTERPARTY_CONFIRMATION', 'CONFIRMED', 'DISPUTED')
+        ORDER BY created_at DESC
         LIMIT 1
         """,
         (
@@ -4742,11 +4643,8 @@ def create_shared_transaction():
             quantity,
             movement_type,
             reference_number,
-            origin_partner_address["partner_address_id"] if origin_partner_address else None,
-            counterparty_partner_address["partner_address_id"] if counterparty_partner_address else None,
         )
     ).fetchone()
-
     if likely_duplicate:
         conn.close()
         return jsonify({
@@ -4754,6 +4652,42 @@ def create_shared_transaction():
             "shared_transaction_id": likely_duplicate["shared_transaction_id"],
             "status": likely_duplicate["shared_status"]
         }), 409
+
+    if origin_partner_address_id:
+        origin_partner_address = get_partner_address_for_shared_transaction(
+            conn,
+            origin_partner_address_id,
+            origin_partner_id,
+            origin_org_id,
+        )
+        if not origin_partner_address:
+            conn.close()
+            return jsonify({"error": "Origin partner address not found"}), 404
+    else:
+        origin_partner_address = get_default_partner_address_for_shared_transaction(
+            conn,
+            origin_partner_id,
+            origin_org_id,
+            "dispatch",
+        )
+
+    if counterparty_partner_address_id:
+        counterparty_partner_address = get_partner_address_for_shared_transaction(
+            conn,
+            counterparty_partner_address_id,
+            counterparty_partner["partner_id"],
+            counterparty_org_id,
+        )
+        if not counterparty_partner_address:
+            conn.close()
+            return jsonify({"error": "Counterparty partner address not found"}), 404
+    else:
+        counterparty_partner_address = get_default_partner_address_for_shared_transaction(
+            conn,
+            counterparty_partner["partner_id"],
+            counterparty_org_id,
+            "receiving",
+        )
 
     shared_transaction_id = make_id("stxn")
     ts = now_iso()
@@ -4793,7 +4727,7 @@ def create_shared_transaction():
             "AWAITING_COUNTERPARTY_CONFIRMATION",
             created_by_display_name,
             ts,
-            ts
+            ts,
         )
     )
 
@@ -4812,7 +4746,7 @@ def create_shared_transaction():
             origin_partner_address["partner_address_id"] if origin_partner_address else None,
             counterparty_partner_address["partner_address_id"] if counterparty_partner_address else None,
             ts,
-            ts
+            ts,
         )
     )
 
@@ -4885,7 +4819,278 @@ def create_shared_transaction():
         "reference_number": reference_number,
         "created_by_display_name": created_by_display_name
     }), 201
+# === SHARED TRANSACTION CREATE ROUTE END ===
 
+
+def get_shared_transaction_partner_address_payloads(conn, shared_transaction_id):
+    ensure_partner_address_tables(conn)
+    ensure_shared_transaction_partner_address_tables(conn)
+
+    payload = {
+        "origin_partner_address_id": None,
+        "counterparty_partner_address_id": None,
+        "origin_partner_address": None,
+        "counterparty_partner_address": None,
+    }
+
+    link = conn.execute(
+        """
+        SELECT
+            origin_partner_address_id,
+            counterparty_partner_address_id
+        FROM shared_transaction_partner_addresses
+        WHERE shared_transaction_id = ?
+        """,
+        (shared_transaction_id,)
+    ).fetchone()
+
+    if not link:
+        return payload
+
+    payload["origin_partner_address_id"] = link["origin_partner_address_id"]
+    payload["counterparty_partner_address_id"] = link["counterparty_partner_address_id"]
+
+    st = conn.execute(
+        """
+        SELECT
+            origin_partner_id,
+            counterparty_partner_id,
+            origin_org_id,
+            counterparty_org_id
+        FROM shared_transactions
+        WHERE shared_transaction_id = ?
+        """,
+        (shared_transaction_id,)
+    ).fetchone()
+
+    if not st:
+        return payload
+
+    if payload["origin_partner_address_id"]:
+        payload["origin_partner_address"] = get_partner_address_for_shared_transaction(
+            conn,
+            payload["origin_partner_address_id"],
+            st["origin_partner_id"],
+            st["origin_org_id"],
+        )
+
+    if payload["counterparty_partner_address_id"]:
+        payload["counterparty_partner_address"] = get_partner_address_for_shared_transaction(
+            conn,
+            payload["counterparty_partner_address_id"],
+            st["counterparty_partner_id"],
+            st["counterparty_org_id"],
+        )
+
+    return payload
+
+# === SHARED TRANSACTION ADDRESS HELPERS START ===
+def get_partner_address_for_shared_transaction(conn, partner_address_id, partner_id, organisation_id):
+    ensure_partner_address_tables(conn)
+
+    row = conn.execute(
+        """
+        SELECT
+            pa.partner_address_id,
+            pa.partner_id,
+            p.name AS partner_name,
+            pa.organisation_id,
+            pa.label,
+            pa.category,
+            pa.custom_category_label,
+            pa.address_line_1,
+            pa.address_line_2,
+            pa.suburb,
+            pa.state,
+            pa.postcode,
+            pa.country,
+            pa.gate_number,
+            pa.door_number,
+            pa.entry_instructions,
+            pa.truck_access_notes,
+            pa.latitude,
+            pa.longitude,
+            pa.is_primary,
+            pa.is_default_dispatch_site,
+            pa.is_default_receiving_site,
+            pa.is_active,
+            pa.created_at,
+            pa.updated_at
+        FROM partner_addresses pa
+        LEFT JOIN partners p ON p.partner_id = pa.partner_id
+        WHERE pa.partner_address_id = ?
+          AND pa.partner_id = ?
+          AND pa.organisation_id = ?
+        LIMIT 1
+        """,
+        (partner_address_id, partner_id, organisation_id),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    d = dict(row)
+    d["is_primary"] = bool(d["is_primary"])
+    d["is_default_dispatch_site"] = bool(d["is_default_dispatch_site"])
+    d["is_default_receiving_site"] = bool(d["is_default_receiving_site"])
+    d["is_active"] = bool(d["is_active"])
+
+    nav = build_partner_address_navigation_contract(d)
+    d["navigation"] = nav["navigation"]
+    d["navigation_apps"] = nav["navigation_apps"]
+    return d
+
+
+def get_default_partner_address_for_shared_transaction(conn, partner_id, organisation_id, mode):
+    ensure_partner_address_tables(conn)
+
+    mode = (mode or "").strip().upper()
+    default_flag = "is_default_dispatch_site" if mode == "DISPATCH" else "is_default_receiving_site"
+
+    row = conn.execute(
+        f"""
+        SELECT partner_address_id
+        FROM partner_addresses
+        WHERE partner_id = ?
+          AND organisation_id = ?
+          AND is_active = 1
+          AND {default_flag} = 1
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+        """,
+        (partner_id, organisation_id),
+    ).fetchone()
+
+    if row:
+        return get_partner_address_for_shared_transaction(
+            conn, row["partner_address_id"], partner_id, organisation_id
+        )
+
+    row = conn.execute(
+        """
+        SELECT partner_address_id
+        FROM partner_addresses
+        WHERE partner_id = ?
+          AND organisation_id = ?
+          AND is_active = 1
+          AND is_primary = 1
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+        """,
+        (partner_id, organisation_id),
+    ).fetchone()
+
+    if row:
+        return get_partner_address_for_shared_transaction(
+            conn, row["partner_address_id"], partner_id, organisation_id
+        )
+
+    row = conn.execute(
+        """
+        SELECT partner_address_id
+        FROM partner_addresses
+        WHERE partner_id = ?
+          AND organisation_id = ?
+          AND is_active = 1
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+        """,
+        (partner_id, organisation_id),
+    ).fetchone()
+
+    if row:
+        return get_partner_address_for_shared_transaction(
+            conn, row["partner_address_id"], partner_id, organisation_id
+        )
+
+    return None
+
+
+def get_shared_transaction_partner_address_payloads(conn, shared_transaction_id):
+    ensure_partner_address_tables(conn)
+    ensure_shared_transaction_partner_address_tables(conn)
+
+    payload = {
+        "origin_partner_address_id": None,
+        "counterparty_partner_address_id": None,
+        "origin_partner_address": None,
+        "counterparty_partner_address": None,
+    }
+
+    st = conn.execute(
+        """
+        SELECT
+            shared_transaction_id,
+            origin_partner_id,
+            counterparty_partner_id,
+            origin_org_id,
+            counterparty_org_id,
+            movement_type
+        FROM shared_transactions
+        WHERE shared_transaction_id = ?
+        """,
+        (shared_transaction_id,),
+    ).fetchone()
+
+    if not st:
+        return payload
+
+    link = conn.execute(
+        """
+        SELECT
+            origin_partner_address_id,
+            counterparty_partner_address_id
+        FROM shared_transaction_partner_addresses
+        WHERE shared_transaction_id = ?
+        LIMIT 1
+        """,
+        (shared_transaction_id,),
+    ).fetchone()
+
+    if link and link["origin_partner_address_id"]:
+        payload["origin_partner_address"] = get_partner_address_for_shared_transaction(
+            conn,
+            link["origin_partner_address_id"],
+            st["origin_partner_id"],
+            st["origin_org_id"],
+        )
+    else:
+        payload["origin_partner_address"] = get_default_partner_address_for_shared_transaction(
+            conn,
+            st["origin_partner_id"],
+            st["origin_org_id"],
+            "DISPATCH",
+        )
+
+    if link and link["counterparty_partner_address_id"]:
+        payload["counterparty_partner_address"] = get_partner_address_for_shared_transaction(
+            conn,
+            link["counterparty_partner_address_id"],
+            st["counterparty_partner_id"],
+            st["counterparty_org_id"],
+        )
+    else:
+        payload["counterparty_partner_address"] = get_default_partner_address_for_shared_transaction(
+            conn,
+            st["counterparty_partner_id"],
+            st["counterparty_org_id"],
+            "RECEIVING",
+        )
+
+    payload["origin_partner_address_id"] = (
+        payload["origin_partner_address"]["partner_address_id"]
+        if payload["origin_partner_address"]
+        else (link["origin_partner_address_id"] if link else None)
+    )
+
+    payload["counterparty_partner_address_id"] = (
+        payload["counterparty_partner_address"]["partner_address_id"]
+        if payload["counterparty_partner_address"]
+        else (link["counterparty_partner_address_id"] if link else None)
+    )
+
+    return payload
+# === SHARED TRANSACTION ADDRESS HELPERS END ===
 
 @app.get("/organisations/<organisation_id>/shared-transactions")
 def list_shared_transactions(organisation_id):
@@ -4894,6 +5099,8 @@ def list_shared_transactions(organisation_id):
 
     conn = get_conn()
     ensure_shared_transaction_tables(conn)
+    ensure_partner_address_tables(conn)
+    ensure_shared_transaction_partner_address_tables(conn)
 
     sql = """
         SELECT
@@ -4954,11 +5161,16 @@ def list_shared_transactions(organisation_id):
     sql += " ORDER BY st.created_at DESC"
 
     rows = conn.execute(sql, params).fetchall()
-    conn.close()
 
     items = []
     for row in rows:
         d = dict(row)
+
+        address_payloads = get_shared_transaction_partner_address_payloads(conn, d["shared_transaction_id"])
+        d["origin_partner_address_id"] = address_payloads["origin_partner_address_id"]
+        d["counterparty_partner_address_id"] = address_payloads["counterparty_partner_address_id"]
+        d["origin_partner_address"] = address_payloads["origin_partner_address"]
+        d["counterparty_partner_address"] = address_payloads["counterparty_partner_address"]
 
         if d["origin_org_id"] == organisation_id:
             d["perspective_role"] = "DISPATCHING"
@@ -4986,11 +5198,14 @@ def list_shared_transactions(organisation_id):
         d["highlight_key"] = d["shared_transaction_id"]
         items.append(d)
 
+    conn.close()
+
     return jsonify({
         "organisation_id": organisation_id,
         "count": len(items),
         "items": items
     }), 200
+
 
 @app.get("/shared-transactions/<shared_transaction_id>")
 def get_shared_transaction(shared_transaction_id):
@@ -4998,6 +5213,8 @@ def get_shared_transaction(shared_transaction_id):
 
     conn = get_conn()
     ensure_shared_transaction_tables(conn)
+    ensure_partner_address_tables(conn)
+    ensure_shared_transaction_partner_address_tables(conn)
 
     row = conn.execute(
         """
@@ -5069,6 +5286,7 @@ def get_shared_transaction(shared_transaction_id):
         (shared_transaction_id,)
     ).fetchall()
 
+    address_payloads = get_shared_transaction_partner_address_payloads(conn, shared_transaction_id)
     conn.close()
 
     d = dict(row)
@@ -5079,7 +5297,12 @@ def get_shared_transaction(shared_transaction_id):
         elif organisation_id == d["counterparty_org_id"]:
             d["perspective_role"] = "RECEIVING"
 
+    d["origin_partner_address_id"] = address_payloads["origin_partner_address_id"]
+    d["counterparty_partner_address_id"] = address_payloads["counterparty_partner_address_id"]
+    d["origin_partner_address"] = address_payloads["origin_partner_address"]
+    d["counterparty_partner_address"] = address_payloads["counterparty_partner_address"]
     d["events"] = [dict(r) for r in events]
+
     return jsonify(d), 200
 
 
