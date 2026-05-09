@@ -9063,6 +9063,150 @@ def get_organisation_exit_dashboard(organisation_id):
 
 # === UNSUBSCRIBED ORG ACCESS GUARD V0.1 END ===
 
+# === TEMPORARY USER ACCESS V0.1 START ===
+
+@app.post("/organisations/<organisation_id>/temporary-users")
+def create_temporary_user_access(organisation_id):
+    from datetime import datetime, timedelta
+
+    body = request.get_json(silent=True) or {}
+    user_display_name = (body.get("user_display_name") or "").strip() or None
+    user_email = (body.get("user_email") or "").strip() or None
+    created_by_display_name = (body.get("created_by_display_name") or "Org Admin").strip()
+
+    if not user_display_name and not user_email:
+        return jsonify({"error": "user_display_name or user_email is required"}), 400
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    access_error = require_active_org_access(conn, organisation_id)
+    if access_error:
+        conn.close()
+        return jsonify(access_error), 403
+
+    settings = conn.execute(
+        "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
+    ).fetchone()
+
+    if not settings:
+        conn.close()
+        return jsonify({"error": "Pricing settings not configured"}), 500
+
+    ts = now_iso()
+    activated_at = datetime.fromisoformat(ts)
+    access_starts_at = activated_at + timedelta(days=1)
+    access_ends_at = access_starts_at + timedelta(days=settings["temporary_access_days"] - 1)
+
+    temporary_user_access_id = make_id("tua")
+
+    conn.execute(
+        """
+        INSERT INTO temporary_user_access (
+            temporary_user_access_id,
+            organisation_id,
+            user_display_name,
+            user_email,
+            access_status,
+            fee_cents,
+            access_days,
+            activated_at,
+            access_starts_at,
+            access_ends_at,
+            charged_on_next_billing_cycle,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            temporary_user_access_id,
+            organisation_id,
+            user_display_name,
+            user_email,
+            "ACTIVE",
+            settings["temporary_user_access_fee_cents"],
+            settings["temporary_access_days"],
+            ts,
+            access_starts_at.isoformat(),
+            access_ends_at.isoformat(),
+            1,
+            ts,
+            ts,
+        )
+    )
+
+    audit_event(
+        conn,
+        entity_type="TemporaryUserAccess",
+        entity_id=temporary_user_access_id,
+        action="CREATE",
+        summary=f"Temporary user access created for {user_display_name or user_email}",
+        organisation_id=organisation_id,
+    )
+
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT * FROM temporary_user_access WHERE temporary_user_access_id = ?",
+        (temporary_user_access_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "temporary_user_access": dict(row),
+        "pricing_rule": "Temporary users receive 28 days of access from the day after activation.",
+        "billing_rule": "Temporary user fee is charged on the customer’s next billing cycle.",
+        "created_by_display_name": created_by_display_name,
+    }), 201
+
+
+@app.get("/organisations/<organisation_id>/temporary-users")
+def list_temporary_user_access(organisation_id):
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM temporary_user_access
+        WHERE organisation_id = ?
+        ORDER BY created_at DESC
+        """,
+        (organisation_id,)
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "organisation_id": organisation_id,
+        "organisation_name": org["name"],
+        "count": len(rows),
+        "items": [dict(row) for row in rows],
+    }), 200
+
+# === TEMPORARY USER ACCESS V0.1 END ===
+
+
+
 
 # === SUBSCRIPTION GUARD V0.1 END ===
 
