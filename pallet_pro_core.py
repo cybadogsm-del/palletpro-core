@@ -12354,6 +12354,124 @@ def sweep_expired_sessions():
 
 # === SESSION EXPIRY SWEEP V0.1 END ===
 
+# === TEMPORARY USER EXPIRY SWEEP V0.1 START ===
+
+@app.post("/global-admin/temporary-user-expiry-sweep")
+def sweep_expired_temporary_users():
+    body = request.get_json(silent=True) or {}
+
+    swept_by_display_name = (body.get("swept_by_display_name") or "Global Admin").strip()
+    confirmation_text = (body.get("confirmation_text") or "").strip()
+    as_of = body.get("as_of") or now_iso()
+
+    required_confirmation = "SWEEP EXPIRED TEMPORARY USERS"
+
+    if confirmation_text != required_confirmation:
+        return jsonify({
+            "error": "Confirmation text is required before sweeping expired temporary users",
+            "required_confirmation_text": required_confirmation,
+            "received_confirmation_text": confirmation_text,
+            "rule": "Temporary user expiry changes access state and must be deliberate.",
+        }), 400
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+    ensure_user_access_tables(conn)
+
+    expired_access_rows = conn.execute(
+        """
+        SELECT *
+        FROM temporary_user_access
+        WHERE access_status = 'ACTIVE'
+          AND access_ends_at < ?
+        ORDER BY access_ends_at ASC
+        """,
+        (as_of,)
+    ).fetchall()
+
+    expired_access_ids = [row["temporary_user_access_id"] for row in expired_access_rows]
+    ts = now_iso()
+
+    for row in expired_access_rows:
+        conn.execute(
+            """
+            UPDATE temporary_user_access
+            SET access_status = ?,
+                updated_at = ?
+            WHERE temporary_user_access_id = ?
+            """,
+            (
+                "EXPIRED",
+                ts,
+                row["temporary_user_access_id"],
+            )
+        )
+
+        conn.execute(
+            """
+            UPDATE user_accounts
+            SET access_status = ?,
+                updated_at = ?
+            WHERE temporary_user_access_id = ?
+              AND role = 'TEMPORARY_USER'
+              AND access_status = 'ACTIVE'
+            """,
+            (
+                "EXPIRED",
+                ts,
+                row["temporary_user_access_id"],
+            )
+        )
+
+        record_user_access_event(
+            conn,
+            user_id=row["temporary_user_access_id"],
+            organisation_id=row["organisation_id"],
+            action="TEMPORARY_ACCESS_EXPIRED",
+            summary="Temporary user access expired and linked temporary users were marked expired.",
+            changed_by_display_name=swept_by_display_name,
+        )
+
+    audit_event(
+        conn,
+        entity_type="TemporaryUserAccess",
+        entity_id="temporary_user_expiry_sweep",
+        action="SWEEP_EXPIRED_TEMPORARY_USERS",
+        summary=f"Temporary user expiry sweep expired {len(expired_access_rows)} temporary access records.",
+        organisation_id=None,
+    )
+
+    conn.commit()
+
+    linked_users = []
+    if expired_access_ids:
+        placeholders = ",".join(["?"] * len(expired_access_ids))
+        linked_users = conn.execute(
+            f"""
+            SELECT *
+            FROM user_accounts
+            WHERE temporary_user_access_id IN ({placeholders})
+            ORDER BY display_name ASC
+            """,
+            expired_access_ids,
+        ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "sweep_type": "TEMPORARY_USER_EXPIRY_SWEEP",
+        "as_of": as_of,
+        "swept_by_display_name": swept_by_display_name,
+        "expired_temporary_access_count": len(expired_access_rows),
+        "expired_temporary_access_ids": expired_access_ids,
+        "linked_temporary_users": [dict(row) for row in linked_users],
+        "rule": "Expired temporary access records and linked temporary users are marked EXPIRED.",
+    }), 200
+
+# === TEMPORARY USER EXPIRY SWEEP V0.1 END ===
+
+
+
 
 
 
