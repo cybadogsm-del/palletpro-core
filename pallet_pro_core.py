@@ -11991,6 +11991,86 @@ def complete_login_integrity_admin_action(login_integrity_action_id):
 
 # === LOGIN INTEGRITY ACTION COMPLETION V0.1 END ===
 
+# === LOGIN INTEGRITY ACTION QUEUE V0.1 START ===
+
+@app.get("/global-admin/login-integrity-actions")
+def list_login_integrity_action_queue():
+    action_status = request.args.get("action_status")
+    organisation_id = request.args.get("organisation_id")
+    user_id = request.args.get("user_id")
+
+    conn = get_conn()
+    ensure_login_integrity_action_tables(conn)
+
+    sql = """
+        SELECT
+            a.*,
+            e.event_type,
+            e.risk_level,
+            e.risk_score,
+            e.review_status,
+            e.ai_report_summary,
+            u.display_name,
+            u.email,
+            u.role,
+            o.name AS organisation_name
+        FROM login_integrity_admin_actions a
+        LEFT JOIN login_integrity_events e
+            ON e.login_integrity_event_id = a.login_integrity_event_id
+        LEFT JOIN user_accounts u
+            ON u.user_id = a.user_id
+        LEFT JOIN organisations o
+            ON o.organisation_id = a.organisation_id
+        WHERE 1 = 1
+    """
+    params = []
+
+    if action_status:
+        sql += " AND a.action_status = ?"
+        params.append(action_status)
+
+    if organisation_id:
+        sql += " AND a.organisation_id = ?"
+        params.append(organisation_id)
+
+    if user_id:
+        sql += " AND a.user_id = ?"
+        params.append(user_id)
+
+    sql += """
+        ORDER BY
+            CASE a.action_status
+                WHEN 'OPEN' THEN 0
+                WHEN 'COMPLETED' THEN 1
+                ELSE 2
+            END,
+            a.created_at DESC
+    """
+
+    rows = conn.execute(sql, params).fetchall()
+
+    status_counts = {}
+    type_counts = {}
+
+    for row in rows:
+        status_counts[row["action_status"]] = status_counts.get(row["action_status"], 0) + 1
+        type_counts[row["action_type"]] = type_counts.get(row["action_type"], 0) + 1
+
+    conn.close()
+
+    return jsonify({
+        "queue_type": "GLOBAL_ADMIN_LOGIN_INTEGRITY_ACTION_QUEUE",
+        "count": len(rows),
+        "action_status_counts": status_counts,
+        "action_type_counts": type_counts,
+        "items": [dict(row) for row in rows],
+        "rule": "Global Admin owns the course of action. AI reports are advisory only.",
+    }), 200
+
+# === LOGIN INTEGRITY ACTION QUEUE V0.1 END ===
+
+
+
 
 
 
