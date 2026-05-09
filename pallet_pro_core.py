@@ -9259,6 +9259,157 @@ def export_organisation_operating_data(organisation_id):
 
 # === OPERATING DATA EXPORT V0.1 END ===
 
+# === DATA RETENTION PREVIEW V0.1 START ===
+
+def get_operating_data_tables_for_retention():
+    return [
+        "depots",
+        "resources",
+        "partners",
+        "partner_addresses",
+        "transactions",
+        "ledger_entries",
+        "balance_projection",
+        "shared_transactions",
+        "shared_transaction_partner_addresses",
+        "temporary_user_access",
+        "pending_approval_entries",
+        "audit_events",
+    ]
+
+
+def count_org_rows_for_table(conn, table_name, organisation_id):
+    if not table_exists(conn, table_name):
+        return 0
+
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+    if "organisation_id" not in cols:
+        return 0
+
+    row = conn.execute(
+        f"SELECT COUNT(*) AS c FROM {table_name} WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    return row["c"] if row else 0
+
+
+@app.get("/global-admin/data-retention-jobs")
+def list_data_retention_jobs():
+    status = request.args.get("status")
+    organisation_id = request.args.get("organisation_id")
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    sql = """
+        SELECT
+            j.*,
+            o.name AS organisation_name
+        FROM data_retention_jobs j
+        LEFT JOIN organisations o ON o.organisation_id = j.organisation_id
+        WHERE 1 = 1
+    """
+    params = []
+
+    if status:
+        sql += " AND j.job_status = ?"
+        params.append(status)
+
+    if organisation_id:
+        sql += " AND j.organisation_id = ?"
+        params.append(organisation_id)
+
+    sql += " ORDER BY j.scheduled_for ASC"
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    return jsonify({
+        "count": len(rows),
+        "items": [dict(row) for row in rows],
+    }), 200
+
+
+@app.post("/global-admin/data-retention-preview")
+def preview_due_data_retention_jobs():
+    body = request.get_json(silent=True) or {}
+    as_of = body.get("as_of") or now_iso()
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    jobs = conn.execute(
+        """
+        SELECT
+            j.*,
+            o.name AS organisation_name
+        FROM data_retention_jobs j
+        LEFT JOIN organisations o ON o.organisation_id = j.organisation_id
+        WHERE j.job_status = 'SCHEDULED'
+          AND j.scheduled_for <= ?
+        ORDER BY j.scheduled_for ASC
+        """,
+        (as_of,)
+    ).fetchall()
+
+    previews = []
+
+    for job in jobs:
+        d = dict(job)
+
+        if d["job_type"] == "DELETE_OPERATING_DATA":
+            counts = {}
+            total_rows = 0
+
+            for table in get_operating_data_tables_for_retention():
+                c = count_org_rows_for_table(conn, table, d["organisation_id"])
+                counts[table] = c
+                total_rows += c
+
+            d["preview"] = {
+                "delete_type": "OPERATING_DATA",
+                "destructive_action_required": True,
+                "would_delete_row_count": total_rows,
+                "table_counts": counts,
+                "safety_note": "Preview only. No rows were deleted.",
+            }
+
+        elif d["job_type"] == "DELETE_HISTORICAL_ACCOUNT_DATA":
+            d["preview"] = {
+                "delete_type": "HISTORICAL_ACCOUNT_DATA",
+                "destructive_action_required": True,
+                "would_delete_row_count": 0,
+                "table_counts": {},
+                "safety_note": "Historical account deletion is not implemented in v0.1. Preview only.",
+            }
+
+        else:
+            d["preview"] = {
+                "delete_type": "UNKNOWN",
+                "destructive_action_required": False,
+                "would_delete_row_count": 0,
+                "table_counts": {},
+                "safety_note": "Unknown job type. No action proposed.",
+            }
+
+        previews.append(d)
+
+    conn.close()
+
+    return jsonify({
+        "preview_type": "DATA_RETENTION_DUE_JOBS_PREVIEW",
+        "as_of": as_of,
+        "due_job_count": len(previews),
+        "items": previews,
+        "rule": "This endpoint previews scheduled data retention deletion work only. It does not delete data.",
+    }), 200
+
+# === DATA RETENTION PREVIEW V0.1 END ===
+
+
+
 
 
 
