@@ -10117,6 +10117,129 @@ def get_global_admin_pricing_dashboard():
 
 # === GLOBAL ADMIN PRICING DASHBOARD V0.1 END ===
 
+# === ORG ADMIN SUBSCRIPTION DASHBOARD V0.1 START ===
+
+@app.get("/organisations/<organisation_id>/subscription-dashboard")
+def get_org_admin_subscription_dashboard(organisation_id):
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    sub = get_or_create_subscription(conn, organisation_id)
+    access = get_org_access_status_payload(conn, organisation_id)
+
+    settings = conn.execute(
+        "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
+    ).fetchone()
+
+    temp_users = conn.execute(
+        """
+        SELECT *
+        FROM temporary_user_access
+        WHERE organisation_id = ?
+        ORDER BY created_at DESC
+        """,
+        (organisation_id,)
+    ).fetchall()
+
+    scheduled_jobs = conn.execute(
+        """
+        SELECT *
+        FROM data_retention_jobs
+        WHERE organisation_id = ?
+        ORDER BY scheduled_for ASC
+        """,
+        (organisation_id,)
+    ).fetchall()
+
+    unbilled_temp_fee_cents = 0
+    active_temp_user_count = 0
+
+    for row in temp_users:
+        if row["access_status"] == "ACTIVE":
+            active_temp_user_count += 1
+        if row["charged_on_next_billing_cycle"] == 1 and row["billed_at"] is None:
+            unbilled_temp_fee_cents += int(row["fee_cents"])
+
+    dashboard_actions = []
+
+    if access["access_state"] == "ACTIVE":
+        dashboard_actions.append({
+            "action_key": "unsubscribe",
+            "label": "Unsubscribe",
+            "route": f"/organisations/{organisation_id}/unsubscribe",
+            "method": "POST",
+            "requires_confirmation": True,
+            "confirmation_guidance": "Unsubscribing stops future billing and starts the 7-day operating data retention window.",
+        })
+
+    if access["exit_only_access_allowed"]:
+        dashboard_actions.extend([
+            {
+                "action_key": "export_operating_data",
+                "label": "Export operating data",
+                "route": f"/organisations/{organisation_id}/operating-data-export",
+                "method": "GET",
+                "requires_confirmation": False,
+            },
+            {
+                "action_key": "reactivate",
+                "label": "Reactivate subscription",
+                "route": f"/organisations/{organisation_id}/reactivate",
+                "method": "POST",
+                "requires_confirmation": True,
+                "confirmation_guidance": "Reactivation is available during the 7-day retention window before operating data deletion.",
+            },
+        ])
+
+    conn.close()
+
+    return jsonify({
+        "dashboard_type": "ORG_ADMIN_SUBSCRIPTION_DASHBOARD",
+        "organisation_id": organisation_id,
+        "organisation_name": org["name"],
+        "subscription": dict(sub),
+        "access_status": access,
+        "billing": {
+            "billing_status": sub["billing_status"],
+            "do_not_bill": sub["do_not_bill"],
+            "billing_anniversary_day": sub["billing_anniversary_day"],
+            "unbilled_temporary_user_fee_cents": unbilled_temp_fee_cents,
+            "currency": settings["currency"] if settings else "AUD",
+            "temporary_user_access_fee_cents": settings["temporary_user_access_fee_cents"] if settings else None,
+            "temporary_access_days": settings["temporary_access_days"] if settings else None,
+        },
+        "temporary_users": {
+            "active_count": active_temp_user_count,
+            "total_count": len(temp_users),
+            "items": [dict(row) for row in temp_users],
+        },
+        "data_retention": {
+            "operating_data_delete_after": sub["operating_data_delete_after"],
+            "historical_data_delete_after": sub["historical_data_delete_after"],
+            "scheduled_jobs": [dict(row) for row in scheduled_jobs],
+        },
+        "dashboard_actions": dashboard_actions,
+        "rules": [
+            "Pallet Pro must be easy to unsubscribe from.",
+            "Unsubscribing stops future billing immediately.",
+            "After unsubscribe, normal operational access is blocked but exit/export access remains available during the 7-day retention window.",
+            "Operating data is deleted after 7 days unless the organisation reactivates before deletion.",
+        ],
+    }), 200
+
+# === ORG ADMIN SUBSCRIPTION DASHBOARD V0.1 END ===
+
+
+
 
 
 
