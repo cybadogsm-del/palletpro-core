@@ -11662,6 +11662,214 @@ def get_login_integrity_review_history(login_integrity_event_id):
 
 # === LOGIN INTEGRITY REVIEW HISTORY V0.1 END ===
 
+# === LOGIN INTEGRITY ADMIN ACTIONS V0.1 START ===
+
+def ensure_login_integrity_action_tables(conn):
+    ensure_login_integrity_review_tables(conn)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS login_integrity_admin_actions (
+        login_integrity_action_id TEXT PRIMARY KEY,
+        login_integrity_event_id TEXT NOT NULL,
+        organisation_id TEXT,
+        user_id TEXT NOT NULL,
+        action_type TEXT NOT NULL,
+        action_status TEXT NOT NULL,
+        assigned_to_display_name TEXT,
+        action_notes TEXT,
+        due_at TEXT,
+        completed_at TEXT,
+        created_by_display_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+
+@app.post("/global-admin/login-integrity-reports/<login_integrity_event_id>/actions")
+def create_login_integrity_admin_action(login_integrity_event_id):
+    body = request.get_json(silent=True) or {}
+
+    action_type = (body.get("action_type") or "").strip().upper()
+    assigned_to_display_name = (body.get("assigned_to_display_name") or "").strip() or None
+    action_notes = (body.get("action_notes") or "").strip() or None
+    due_at = body.get("due_at")
+    created_by_display_name = (body.get("created_by_display_name") or "Global Admin").strip()
+    confirmation_text = (body.get("confirmation_text") or "").strip()
+
+    required_confirmation = "RECORD LOGIN INTEGRITY ACTION"
+
+    allowed_action_types = {
+        "MONITOR_ONLY",
+        "CONTACT_ORG_ADMIN",
+        "REQUIRE_SEPARATE_LOGINS",
+        "REVIEW_WITH_CUSTOMER",
+        "MARK_FALSE_POSITIVE",
+        "ESCALATE_TO_SUPER_GLOBAL_ADMIN",
+    }
+
+    if confirmation_text != required_confirmation:
+        return jsonify({
+            "error": "Confirmation text is required before recording a login integrity action",
+            "required_confirmation_text": required_confirmation,
+            "received_confirmation_text": confirmation_text,
+            "rule": "Global Admin decides and records the course of action. AI does not automatically penalise users or organisations.",
+        }), 400
+
+    if action_type not in allowed_action_types:
+        return jsonify({
+            "error": "Invalid action_type",
+            "allowed_action_types": sorted(allowed_action_types),
+        }), 400
+
+    conn = get_conn()
+    ensure_login_integrity_action_tables(conn)
+
+    event = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_events
+        WHERE login_integrity_event_id = ?
+        """,
+        (login_integrity_event_id,)
+    ).fetchone()
+
+    if not event:
+        conn.close()
+        return jsonify({"error": "Login integrity report not found"}), 404
+
+    ts = now_iso()
+    action_id = make_id("lia")
+
+    conn.execute(
+        """
+        INSERT INTO login_integrity_admin_actions (
+            login_integrity_action_id,
+            login_integrity_event_id,
+            organisation_id,
+            user_id,
+            action_type,
+            action_status,
+            assigned_to_display_name,
+            action_notes,
+            due_at,
+            completed_at,
+            created_by_display_name,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            action_id,
+            login_integrity_event_id,
+            event["organisation_id"],
+            event["user_id"],
+            action_type,
+            "OPEN",
+            assigned_to_display_name,
+            action_notes,
+            due_at,
+            None,
+            created_by_display_name,
+            ts,
+            ts,
+        )
+    )
+
+    conn.execute(
+        """
+        UPDATE login_integrity_events
+        SET review_status = ?,
+            summary = summary || ?,
+            updated_at = ?
+        WHERE login_integrity_event_id = ?
+        """,
+        (
+            "ACTION_REQUIRED" if action_type not in ("MONITOR_ONLY", "MARK_FALSE_POSITIVE") else "MONITORING",
+            f" Global Admin action recorded: {action_type}.",
+            ts,
+            login_integrity_event_id,
+        )
+    )
+
+    audit_event(
+        conn,
+        entity_type="LoginIntegrityEvent",
+        entity_id=login_integrity_event_id,
+        action="RECORD_ADMIN_ACTION",
+        summary=f"Global Admin recorded login integrity action: {action_type}.",
+        organisation_id=event["organisation_id"],
+    )
+
+    conn.commit()
+
+    action = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_admin_actions
+        WHERE login_integrity_action_id = ?
+        """,
+        (action_id,)
+    ).fetchone()
+
+    updated_event = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_events
+        WHERE login_integrity_event_id = ?
+        """,
+        (login_integrity_event_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "login_integrity_action": dict(action),
+        "login_integrity_report": dict(updated_event),
+        "rule": "AI reports are advisory only. Global Admin records and decides the course of action.",
+    }), 201
+
+
+@app.get("/global-admin/login-integrity-reports/<login_integrity_event_id>/actions")
+def list_login_integrity_admin_actions(login_integrity_event_id):
+    conn = get_conn()
+    ensure_login_integrity_action_tables(conn)
+
+    event = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_events
+        WHERE login_integrity_event_id = ?
+        """,
+        (login_integrity_event_id,)
+    ).fetchone()
+
+    if not event:
+        conn.close()
+        return jsonify({"error": "Login integrity report not found"}), 404
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_admin_actions
+        WHERE login_integrity_event_id = ?
+        ORDER BY created_at ASC
+        """,
+        (login_integrity_event_id,)
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "login_integrity_event_id": login_integrity_event_id,
+        "action_count": len(rows),
+        "items": [dict(row) for row in rows],
+    }), 200
+
+# === LOGIN INTEGRITY ADMIN ACTIONS V0.1 END ===
+
+
+
 
 
 
