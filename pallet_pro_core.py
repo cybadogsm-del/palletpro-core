@@ -11491,6 +11491,179 @@ def get_login_integrity_dashboard():
 
 # === LOGIN INTEGRITY DASHBOARD V0.1 END ===
 
+# === LOGIN INTEGRITY REVIEW HISTORY V0.1 START ===
+
+def ensure_login_integrity_review_tables(conn):
+    ensure_login_integrity_tables(conn)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS login_integrity_review_history (
+        login_integrity_review_id TEXT PRIMARY KEY,
+        login_integrity_event_id TEXT NOT NULL,
+        organisation_id TEXT,
+        user_id TEXT NOT NULL,
+        previous_review_status TEXT,
+        new_review_status TEXT NOT NULL,
+        reviewed_by_display_name TEXT NOT NULL,
+        review_notes TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+
+@app.post("/global-admin/login-integrity-reports/<login_integrity_event_id>/review-v2")
+def review_login_integrity_report_v2(login_integrity_event_id):
+    body = request.get_json(silent=True) or {}
+    review_status = (body.get("review_status") or "").strip().upper()
+    reviewed_by_display_name = (body.get("reviewed_by_display_name") or "Global Admin").strip()
+    review_notes = (body.get("review_notes") or "").strip() or None
+
+    allowed_statuses = {"OPEN", "MONITORING", "DISMISSED", "ACTION_REQUIRED", "RESOLVED"}
+
+    if review_status not in allowed_statuses:
+        return jsonify({
+            "error": "Invalid review_status",
+            "allowed_statuses": sorted(allowed_statuses),
+        }), 400
+
+    conn = get_conn()
+    ensure_login_integrity_review_tables(conn)
+
+    event = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_events
+        WHERE login_integrity_event_id = ?
+        """,
+        (login_integrity_event_id,)
+    ).fetchone()
+
+    if not event:
+        conn.close()
+        return jsonify({"error": "Login integrity report not found"}), 404
+
+    previous_status = event["review_status"]
+    ts = now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO login_integrity_review_history (
+            login_integrity_review_id,
+            login_integrity_event_id,
+            organisation_id,
+            user_id,
+            previous_review_status,
+            new_review_status,
+            reviewed_by_display_name,
+            review_notes,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            make_id("lirh"),
+            login_integrity_event_id,
+            event["organisation_id"],
+            event["user_id"],
+            previous_status,
+            review_status,
+            reviewed_by_display_name,
+            review_notes,
+            ts,
+        )
+    )
+
+    summary_suffix = f" Review status changed from {previous_status} to {review_status} by {reviewed_by_display_name}."
+    if review_notes:
+        summary_suffix += f" Notes: {review_notes}"
+
+    conn.execute(
+        """
+        UPDATE login_integrity_events
+        SET review_status = ?,
+            summary = summary || ?,
+            updated_at = ?
+        WHERE login_integrity_event_id = ?
+        """,
+        (
+            review_status,
+            summary_suffix,
+            ts,
+            login_integrity_event_id,
+        )
+    )
+
+    conn.commit()
+
+    updated = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_events
+        WHERE login_integrity_event_id = ?
+        """,
+        (login_integrity_event_id,)
+    ).fetchone()
+
+    history = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_review_history
+        WHERE login_integrity_event_id = ?
+        ORDER BY created_at ASC
+        """,
+        (login_integrity_event_id,)
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "login_integrity_report": dict(updated),
+        "review_history_count": len(history),
+        "review_history": [dict(row) for row in history],
+        "rule": "Global Admin review decisions are stored as review history. AI reports are advisory only.",
+    }), 200
+
+
+@app.get("/global-admin/login-integrity-reports/<login_integrity_event_id>/review-history")
+def get_login_integrity_review_history(login_integrity_event_id):
+    conn = get_conn()
+    ensure_login_integrity_review_tables(conn)
+
+    event = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_events
+        WHERE login_integrity_event_id = ?
+        """,
+        (login_integrity_event_id,)
+    ).fetchone()
+
+    if not event:
+        conn.close()
+        return jsonify({"error": "Login integrity report not found"}), 404
+
+    history = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_review_history
+        WHERE login_integrity_event_id = ?
+        ORDER BY created_at ASC
+        """,
+        (login_integrity_event_id,)
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "login_integrity_event_id": login_integrity_event_id,
+        "current_review_status": event["review_status"],
+        "review_history_count": len(history),
+        "review_history": [dict(row) for row in history],
+    }), 200
+
+# === LOGIN INTEGRITY REVIEW HISTORY V0.1 END ===
+
+
+
 
 
 
