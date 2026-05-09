@@ -9646,6 +9646,145 @@ def reactivate_organisation(organisation_id):
 
 # === REACTIVATION GUARD V0.1 END ===
 
+# === SUBSCRIPTION MODE CONTROLS V0.1 START ===
+
+@app.post("/global-admin/organisations/<organisation_id>/subscription-mode")
+def set_organisation_subscription_mode(organisation_id):
+    body = request.get_json(silent=True) or {}
+
+    subscription_mode = (body.get("subscription_mode") or "").strip().upper()
+    custom_pricing_notes = (body.get("custom_pricing_notes") or "").strip() or None
+    billing_anniversary_day = body.get("billing_anniversary_day")
+    pricing_plan_id = body.get("pricing_plan_id")
+    changed_by_display_name = (body.get("changed_by_display_name") or "Super Global Admin").strip()
+    confirmation_text = (body.get("confirmation_text") or "").strip()
+
+    required_confirmation = "CHANGE SUBSCRIPTION MODE"
+
+    allowed_modes = {
+        "STANDARD",
+        "CUSTOM",
+        "FREE",
+        "BETA_TESTER",
+        "QUOTED",
+        "SUSPENDED",
+    }
+
+    if subscription_mode not in allowed_modes:
+        return jsonify({
+            "error": "Invalid subscription_mode",
+            "allowed_modes": sorted(allowed_modes),
+        }), 400
+
+    if confirmation_text != required_confirmation:
+        return jsonify({
+            "error": "Confirmation text is required before changing subscription mode",
+            "required_confirmation_text": required_confirmation,
+            "received_confirmation_text": confirmation_text,
+            "rule": "Only Super Global Admin should change subscription mode. This action must be deliberate and audited.",
+        }), 400
+
+    if billing_anniversary_day is not None:
+        try:
+            billing_anniversary_day = int(billing_anniversary_day)
+        except Exception:
+            return jsonify({"error": "billing_anniversary_day must be an integer from 1 to 28"}), 400
+
+        if billing_anniversary_day < 1 or billing_anniversary_day > 28:
+            return jsonify({"error": "billing_anniversary_day must be between 1 and 28"}), 400
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    get_or_create_subscription(conn, organisation_id)
+
+    ts = now_iso()
+
+    if subscription_mode in ("STANDARD", "CUSTOM"):
+        subscription_status = "ACTIVE"
+        billing_status = "BILLABLE"
+        do_not_bill = 0
+    elif subscription_mode == "QUOTED":
+        subscription_status = "ACTIVE"
+        billing_status = "MANUAL_REVIEW"
+        do_not_bill = 1
+    elif subscription_mode in ("FREE", "BETA_TESTER"):
+        subscription_status = "ACTIVE"
+        billing_status = "FREE"
+        do_not_bill = 1
+    elif subscription_mode == "SUSPENDED":
+        subscription_status = "SUSPENDED"
+        billing_status = "DO_NOT_BILL"
+        do_not_bill = 1
+
+    conn.execute(
+        """
+        UPDATE organisation_subscriptions
+        SET subscription_mode = ?,
+            subscription_status = ?,
+            billing_status = ?,
+            do_not_bill = ?,
+            billing_anniversary_day = COALESCE(?, billing_anniversary_day),
+            pricing_plan_id = ?,
+            custom_pricing_notes = ?,
+            updated_at = ?
+        WHERE organisation_id = ?
+        """,
+        (
+            subscription_mode,
+            subscription_status,
+            billing_status,
+            do_not_bill,
+            billing_anniversary_day,
+            pricing_plan_id,
+            custom_pricing_notes,
+            ts,
+            organisation_id,
+        )
+    )
+
+    audit_event(
+        conn,
+        entity_type="OrganisationSubscription",
+        entity_id=organisation_id,
+        action="SET_SUBSCRIPTION_MODE",
+        summary=f"Subscription mode changed to {subscription_mode} by {changed_by_display_name}.",
+        organisation_id=organisation_id,
+    )
+
+    conn.commit()
+
+    sub = conn.execute(
+        "SELECT * FROM organisation_subscriptions WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    access_payload = get_org_access_status_payload(conn, organisation_id)
+
+    conn.close()
+
+    return jsonify({
+        "organisation_id": organisation_id,
+        "organisation_name": org["name"],
+        "subscription": dict(sub),
+        "access_status": access_payload,
+        "changed_by_display_name": changed_by_display_name,
+        "rule": "Subscription mode changes are Super Global Admin actions and must be audited.",
+    }), 200
+
+# === SUBSCRIPTION MODE CONTROLS V0.1 END ===
+
+
+
 
 
 
@@ -9844,12 +9983,21 @@ def classify_org_access_state(subscription_row):
             "reason": "No cancellation record found.",
         }
 
+    subscription_mode = subscription_row["subscription_mode"]
     subscription_status = subscription_row["subscription_status"]
     billing_status = subscription_row["billing_status"]
     do_not_bill = subscription_row["do_not_bill"]
     operating_data_delete_after = subscription_row["operating_data_delete_after"]
 
-    if subscription_status not in ("CANCELLED", "UNSUBSCRIBED") and billing_status != "DO_NOT_BILL" and do_not_bill != 1:
+    if subscription_mode == "SUSPENDED" or subscription_status == "SUSPENDED":
+        return {
+            "access_state": "SUSPENDED",
+            "normal_access_allowed": False,
+            "exit_only_access_allowed": False,
+            "reason": "Organisation subscription is suspended.",
+        }
+
+    if subscription_status not in ("CANCELLED", "UNSUBSCRIBED") and subscription_mode not in ("CANCELLED", "UNSUBSCRIBED"):
         return {
             "access_state": "ACTIVE",
             "normal_access_allowed": True,
