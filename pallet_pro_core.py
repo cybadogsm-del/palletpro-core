@@ -8621,6 +8621,17 @@ def get_pricing_table():
     }), 200
 
 
+
+def ensure_temporary_user_billing_columns(conn):
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(temporary_user_access)").fetchall()}
+
+    if "billed_at" not in cols:
+        conn.execute("ALTER TABLE temporary_user_access ADD COLUMN billed_at TEXT")
+
+    if "billing_export_run_id" not in cols:
+        conn.execute("ALTER TABLE temporary_user_access ADD COLUMN billing_export_run_id TEXT")
+
+
 @app.post("/global-admin/billing-export-preview")
 def billing_export_preview():
     body = request.get_json(silent=True) or {}
@@ -8630,6 +8641,13 @@ def billing_export_preview():
 
     conn = get_conn()
     ensure_subscription_guard_tables(conn)
+    ensure_temporary_user_billing_columns(conn)
+
+    settings = conn.execute(
+        "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
+    ).fetchone()
+
+    gst_rate_percent = settings["gst_rate_percent"] if settings else 10.0
 
     orgs = conn.execute(
         """
@@ -8663,6 +8681,26 @@ def billing_export_preview():
             })
             continue
 
+        temp_rows = conn.execute(
+            """
+            SELECT *
+            FROM temporary_user_access
+            WHERE organisation_id = ?
+              AND charged_on_next_billing_cycle = 1
+              AND billed_at IS NULL
+              AND access_status = 'ACTIVE'
+            ORDER BY created_at ASC
+            """,
+            (d["organisation_id"],)
+        ).fetchall()
+
+        temporary_user_count = len(temp_rows)
+        temporary_user_fee_cents = sum(int(r["fee_cents"]) for r in temp_rows)
+        subscription_subtotal_cents = 0
+        subtotal_cents = subscription_subtotal_cents + temporary_user_fee_cents
+        gst_cents = int(round(subtotal_cents * (gst_rate_percent / 100.0)))
+        total_cents = subtotal_cents + gst_cents
+
         export_items.append({
             "organisation_id": d["organisation_id"],
             "organisation_name": d["organisation_name"],
@@ -8673,8 +8711,15 @@ def billing_export_preview():
             "billing_period_start": billing_period_start,
             "billing_period_end": billing_period_end,
             "currency": "AUD",
-            "amount_cents": 0,
-            "gst_cents": 0,
+            "subscription_subtotal_cents": subscription_subtotal_cents,
+            "temporary_user_count": temporary_user_count,
+            "temporary_user_fee_cents": temporary_user_fee_cents,
+            "subtotal_cents": subtotal_cents,
+            "gst_rate_percent": gst_rate_percent,
+            "gst_cents": gst_cents,
+            "total_cents": total_cents,
+            "amount_cents": total_cents,
+            "temporary_user_access_ids": [r["temporary_user_access_id"] for r in temp_rows],
             "billing_instruction": "PREVIEW_ONLY",
         })
 
@@ -8720,6 +8765,7 @@ def billing_export_preview():
         "items": export_items,
         "excluded": excluded,
         "rule": "Organisations marked unsubscribed or do-not-bill must not be exported for billing.",
+        "temporary_user_rule": "Active temporary user access marked for next-cycle billing is included in export preview.",
     }), 200
 
 
