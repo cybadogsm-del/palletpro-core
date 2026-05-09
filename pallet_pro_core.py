@@ -12678,6 +12678,160 @@ def get_access_operations_health():
 
 # === ACCESS OPERATIONS HEALTH CHECK V0.1 END ===
 
+# === SYSTEM CONTROL PANEL V0.1 START ===
+
+@app.get("/global-admin/system-control-panel")
+def get_global_admin_system_control_panel():
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+    ensure_user_access_tables(conn)
+    ensure_login_integrity_tables(conn)
+    ensure_login_integrity_action_tables(conn)
+
+    active_sessions_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM user_sessions WHERE session_status = 'ACTIVE'"
+    ).fetchone()["c"]
+
+    open_login_actions_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM login_integrity_admin_actions WHERE action_status = 'OPEN'"
+    ).fetchone()["c"]
+
+    due_retention_jobs_count = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM data_retention_jobs
+        WHERE job_status = 'SCHEDULED'
+          AND scheduled_for <= ?
+        """,
+        (now_iso(),)
+    ).fetchone()["c"]
+
+    do_not_bill_orgs_count = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM organisation_subscriptions
+        WHERE do_not_bill = 1
+           OR billing_status = 'DO_NOT_BILL'
+        """
+    ).fetchone()["c"]
+
+    active_temp_access_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM temporary_user_access WHERE access_status = 'ACTIVE'"
+    ).fetchone()["c"]
+
+    expired_temp_access_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM temporary_user_access WHERE access_status = 'EXPIRED'"
+    ).fetchone()["c"]
+
+    latest_billing_export = conn.execute(
+        """
+        SELECT *
+        FROM billing_export_runs
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    conn.close()
+
+    control_panel_status = "GREEN"
+    warnings = []
+
+    if due_retention_jobs_count > 0:
+        control_panel_status = "AMBER"
+        warnings.append("Due retention jobs need Global Admin review.")
+
+    if open_login_actions_count > 0:
+        control_panel_status = "AMBER"
+        warnings.append("Open login-integrity actions need review.")
+
+    if due_retention_jobs_count > 10 or open_login_actions_count > 10:
+        control_panel_status = "RED"
+        warnings.append("High volume of unresolved admin work.")
+
+    return jsonify({
+        "panel_type": "GLOBAL_ADMIN_SYSTEM_CONTROL_PANEL",
+        "status": control_panel_status,
+        "warnings": warnings,
+        "metrics": {
+            "active_sessions_count": active_sessions_count,
+            "open_login_integrity_action_count": open_login_actions_count,
+            "due_retention_jobs_count": due_retention_jobs_count,
+            "do_not_bill_organisation_count": do_not_bill_orgs_count,
+            "active_temporary_access_count": active_temp_access_count,
+            "expired_temporary_access_count": expired_temp_access_count,
+        },
+        "latest_billing_export": dict(latest_billing_export) if latest_billing_export else None,
+        "admin_surfaces": [
+            {
+                "key": "pricing_dashboard",
+                "label": "Pricing Dashboard",
+                "route": "/global-admin/pricing-dashboard",
+                "purpose": "Review pricing philosophy, pricing table, plans, temp user fees, and billing settings.",
+            },
+            {
+                "key": "billing_export_preview",
+                "label": "Billing Export Preview",
+                "route": "/global-admin/billing-export-preview",
+                "purpose": "Preview biller export without marking fees as billed.",
+            },
+            {
+                "key": "billing_export_finalise",
+                "label": "Billing Export Finalise",
+                "route": "/global-admin/billing-export-finalise",
+                "purpose": "Finalise billing export, snapshot line items, and mark included temp fees as billed.",
+            },
+            {
+                "key": "access_operations_dashboard",
+                "label": "Access Operations Dashboard",
+                "route": "/global-admin/access-operations-dashboard",
+                "purpose": "Review sessions, user status, temporary access, retention, and login-integrity work.",
+            },
+            {
+                "key": "access_operations_health",
+                "label": "Access Operations Health",
+                "route": "/global-admin/access-operations-health",
+                "purpose": "Quick GREEN/AMBER/RED access operations health check.",
+            },
+            {
+                "key": "login_integrity_dashboard",
+                "label": "Login Integrity Dashboard",
+                "route": "/global-admin/login-integrity-dashboard",
+                "purpose": "Review AI-advisory login integrity reports for Global Admin eyes only.",
+            },
+            {
+                "key": "login_integrity_action_queue",
+                "label": "Login Integrity Action Queue",
+                "route": "/global-admin/login-integrity-actions",
+                "purpose": "Review open and completed Global Admin courses of action.",
+            },
+            {
+                "key": "data_retention_preview",
+                "label": "Data Retention Preview",
+                "route": "/global-admin/data-retention-preview",
+                "purpose": "Preview scheduled deletion work before running destructive actions.",
+            },
+            {
+                "key": "data_retention_execute",
+                "label": "Data Retention Execute",
+                "route": "/global-admin/data-retention-execute",
+                "purpose": "Run safety-gated operating-data deletion.",
+            },
+        ],
+        "rules": [
+            "Global Admin controls the course of action.",
+            "AI reports are advisory only.",
+            "Billing exports must exclude unsubscribed and do-not-bill organisations.",
+            "Pallet Pro must be easy to unsubscribe from.",
+            "One worker, one login, one active device for standard and temporary users.",
+            "Admins may use multiple devices, but activity is logged and visible to Global Admin.",
+        ],
+    }), 200
+
+# === SYSTEM CONTROL PANEL V0.1 END ===
+
+
+
 
 
 
