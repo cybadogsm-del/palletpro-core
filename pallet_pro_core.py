@@ -11868,6 +11868,131 @@ def list_login_integrity_admin_actions(login_integrity_event_id):
 
 # === LOGIN INTEGRITY ADMIN ACTIONS V0.1 END ===
 
+# === LOGIN INTEGRITY ACTION COMPLETION V0.1 START ===
+
+@app.post("/global-admin/login-integrity-actions/<login_integrity_action_id>/complete")
+def complete_login_integrity_admin_action(login_integrity_action_id):
+    body = request.get_json(silent=True) or {}
+
+    completed_by_display_name = (body.get("completed_by_display_name") or "Global Admin").strip()
+    completion_notes = (body.get("completion_notes") or "").strip() or None
+    confirmation_text = (body.get("confirmation_text") or "").strip()
+
+    required_confirmation = "COMPLETE LOGIN INTEGRITY ACTION"
+
+    if confirmation_text != required_confirmation:
+        return jsonify({
+            "error": "Confirmation text is required before completing a login integrity action",
+            "required_confirmation_text": required_confirmation,
+            "received_confirmation_text": confirmation_text,
+            "rule": "Global Admin must deliberately complete recorded login integrity actions.",
+        }), 400
+
+    conn = get_conn()
+    ensure_login_integrity_action_tables(conn)
+
+    action = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_admin_actions
+        WHERE login_integrity_action_id = ?
+        """,
+        (login_integrity_action_id,)
+    ).fetchone()
+
+    if not action:
+        conn.close()
+        return jsonify({"error": "Login integrity action not found"}), 404
+
+    ts = now_iso()
+
+    conn.execute(
+        """
+        UPDATE login_integrity_admin_actions
+        SET action_status = ?,
+            completed_at = ?,
+            action_notes = COALESCE(action_notes, '') || ?,
+            updated_at = ?
+        WHERE login_integrity_action_id = ?
+        """,
+        (
+            "COMPLETED",
+            ts,
+            f" Completion by {completed_by_display_name}: {completion_notes or 'No notes supplied.'}",
+            ts,
+            login_integrity_action_id,
+        )
+    )
+
+    open_actions = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM login_integrity_admin_actions
+        WHERE login_integrity_event_id = ?
+          AND action_status != 'COMPLETED'
+        """,
+        (action["login_integrity_event_id"],)
+    ).fetchone()["c"]
+
+    if open_actions == 0:
+        conn.execute(
+            """
+            UPDATE login_integrity_events
+            SET review_status = ?,
+                summary = summary || ?,
+                updated_at = ?
+            WHERE login_integrity_event_id = ?
+            """,
+            (
+                "RESOLVED",
+                f" All recorded Global Admin actions completed by {completed_by_display_name}.",
+                ts,
+                action["login_integrity_event_id"],
+            )
+        )
+
+    audit_event(
+        conn,
+        entity_type="LoginIntegrityAction",
+        entity_id=login_integrity_action_id,
+        action="COMPLETE",
+        summary=f"Login integrity admin action completed by {completed_by_display_name}.",
+        organisation_id=action["organisation_id"],
+    )
+
+    conn.commit()
+
+    updated_action = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_admin_actions
+        WHERE login_integrity_action_id = ?
+        """,
+        (login_integrity_action_id,)
+    ).fetchone()
+
+    updated_event = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_events
+        WHERE login_integrity_event_id = ?
+        """,
+        (action["login_integrity_event_id"],)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "login_integrity_action": dict(updated_action),
+        "login_integrity_report": dict(updated_event),
+        "open_action_count_after_completion": open_actions,
+        "rule": "Completing the final open action resolves the login integrity report.",
+    }), 200
+
+# === LOGIN INTEGRITY ACTION COMPLETION V0.1 END ===
+
+
+
 
 
 
