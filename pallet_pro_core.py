@@ -8769,6 +8769,173 @@ def billing_export_preview():
     }), 200
 
 
+
+
+# === BILLING EXPORT FINALISE V0.1 START ===
+
+@app.post("/global-admin/billing-export-finalise")
+def billing_export_finalise():
+    body = request.get_json(silent=True) or {}
+    billing_period_start = body.get("billing_period_start")
+    billing_period_end = body.get("billing_period_end")
+    created_by_display_name = (body.get("created_by_display_name") or "Global Admin").strip()
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+    ensure_temporary_user_billing_columns(conn)
+
+    settings = conn.execute(
+        "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
+    ).fetchone()
+
+    gst_rate_percent = settings["gst_rate_percent"] if settings else 10.0
+
+    orgs = conn.execute(
+        """
+        SELECT
+            o.organisation_id,
+            o.name AS organisation_name,
+            COALESCE(s.subscription_mode, 'STANDARD') AS subscription_mode,
+            COALESCE(s.subscription_status, 'ACTIVE') AS subscription_status,
+            COALESCE(s.billing_status, 'BILLABLE') AS billing_status,
+            COALESCE(s.do_not_bill, 0) AS do_not_bill,
+            s.unsubscribed_at,
+            s.pricing_plan_id
+        FROM organisations o
+        LEFT JOIN organisation_subscriptions s
+            ON s.organisation_id = o.organisation_id
+        ORDER BY o.name ASC
+        """
+    ).fetchall()
+
+    run_id = make_id("bexp")
+    ts = now_iso()
+
+    export_items = []
+    excluded = []
+    temp_ids_to_mark = []
+
+    for row in orgs:
+        d = dict(row)
+
+        if d["do_not_bill"] == 1 or d["subscription_status"] in ("CANCELLED", "UNSUBSCRIBED") or d["billing_status"] == "DO_NOT_BILL":
+            excluded.append({
+                "organisation_id": d["organisation_id"],
+                "organisation_name": d["organisation_name"],
+                "reason": "Organisation is marked do-not-bill / unsubscribed.",
+            })
+            continue
+
+        temp_rows = conn.execute(
+            """
+            SELECT *
+            FROM temporary_user_access
+            WHERE organisation_id = ?
+              AND charged_on_next_billing_cycle = 1
+              AND billed_at IS NULL
+              AND access_status = 'ACTIVE'
+            ORDER BY created_at ASC
+            """,
+            (d["organisation_id"],)
+        ).fetchall()
+
+        temporary_user_count = len(temp_rows)
+        temporary_user_fee_cents = sum(int(r["fee_cents"]) for r in temp_rows)
+        subscription_subtotal_cents = 0
+        subtotal_cents = subscription_subtotal_cents + temporary_user_fee_cents
+        gst_cents = int(round(subtotal_cents * (gst_rate_percent / 100.0)))
+        total_cents = subtotal_cents + gst_cents
+        temp_ids = [r["temporary_user_access_id"] for r in temp_rows]
+        temp_ids_to_mark.extend(temp_ids)
+
+        export_items.append({
+            "organisation_id": d["organisation_id"],
+            "organisation_name": d["organisation_name"],
+            "subscription_mode": d["subscription_mode"],
+            "subscription_status": d["subscription_status"],
+            "billing_status": d["billing_status"],
+            "pricing_plan_id": d["pricing_plan_id"],
+            "billing_period_start": billing_period_start,
+            "billing_period_end": billing_period_end,
+            "currency": "AUD",
+            "subscription_subtotal_cents": subscription_subtotal_cents,
+            "temporary_user_count": temporary_user_count,
+            "temporary_user_fee_cents": temporary_user_fee_cents,
+            "subtotal_cents": subtotal_cents,
+            "gst_rate_percent": gst_rate_percent,
+            "gst_cents": gst_cents,
+            "total_cents": total_cents,
+            "amount_cents": total_cents,
+            "temporary_user_access_ids": temp_ids,
+            "billing_instruction": "FINALISE_FOR_THIRD_PARTY_BILLER",
+        })
+
+    conn.execute(
+        """
+        INSERT INTO billing_export_runs (
+            billing_export_run_id,
+            export_status,
+            export_type,
+            created_by_display_name,
+            billing_period_start,
+            billing_period_end,
+            organisation_count,
+            do_not_bill_excluded_count,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            "FINALISED",
+            "THIRD_PARTY_BILLER",
+            created_by_display_name,
+            billing_period_start,
+            billing_period_end,
+            len(export_items),
+            len(excluded),
+            ts,
+        )
+    )
+
+    for temp_id in temp_ids_to_mark:
+        conn.execute(
+            """
+            UPDATE temporary_user_access
+            SET billed_at = ?,
+                billing_export_run_id = ?,
+                updated_at = ?
+            WHERE temporary_user_access_id = ?
+            """,
+            (ts, run_id, ts, temp_id)
+        )
+
+    audit_event(
+        conn,
+        entity_type="BillingExportRun",
+        entity_id=run_id,
+        action="FINALISE",
+        summary=f"Billing export finalised with {len(export_items)} billable organisations and {len(excluded)} do-not-bill exclusions.",
+        organisation_id=None,
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "billing_export_run_id": run_id,
+        "export_status": "FINALISED",
+        "export_type": "THIRD_PARTY_BILLER",
+        "organisation_count": len(export_items),
+        "do_not_bill_excluded_count": len(excluded),
+        "temporary_user_access_marked_billed_count": len(temp_ids_to_mark),
+        "items": export_items,
+        "excluded": excluded,
+        "rule": "Finalised billing exports exclude unsubscribed/do-not-bill organisations and mark included temporary user fees as billed.",
+    }), 200
+
+# === BILLING EXPORT FINALISE V0.1 END ===
+
+
 @app.post("/organisations/<organisation_id>/unsubscribe")
 def unsubscribe_organisation(organisation_id):
     from datetime import datetime, timedelta
