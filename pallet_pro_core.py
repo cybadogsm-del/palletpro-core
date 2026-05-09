@@ -7683,6 +7683,7 @@ def create_transaction():
     quantity = body.get("quantity")
     direction = (body.get("direction") or "").strip().upper()
     submitted_by_display_name = (body.get("submitted_by_display_name") or "Unknown User").strip()
+    submitted_by_user_id = body.get("submitted_by_user_id")
     partner_id = body.get("partner_id")
     partner_address_id = body.get("partner_address_id")
 
@@ -7713,6 +7714,11 @@ def create_transaction():
     if access_error:
         conn.close()
         return jsonify(access_error), 403
+
+    user_access_error = require_user_org_operation_access(conn, submitted_by_user_id, organisation_id)
+    if user_access_error:
+        conn.close()
+        return jsonify(user_access_error), 403
 
     org = conn.execute(
         "SELECT * FROM organisations WHERE organisation_id = ?",
@@ -10747,6 +10753,46 @@ def update_user_access(user_id):
     }), 200
 
 # === USER ROLE ACCESS LAYER V0.1 END ===
+
+# === USER ENFORCED TRANSACTION ACCESS V0.1 START ===
+
+def require_user_org_operation_access(conn, user_id, organisation_id):
+    if not user_id:
+        return None
+
+    ensure_user_access_tables(conn)
+
+    user = get_user_account(conn, user_id)
+
+    if not user:
+        return {
+            "error": "Submitting user not found",
+            "submitted_by_user_id": user_id,
+        }
+
+    if user["role"] not in ("SUPER_GLOBAL_ADMIN", "GLOBAL_ADMIN") and user["organisation_id"] != organisation_id:
+        return {
+            "error": "Submitting user does not belong to this organisation",
+            "submitted_by_user_id": user_id,
+            "organisation_id": organisation_id,
+            "user_organisation_id": user["organisation_id"],
+        }
+
+    policy = build_user_access_policy(conn, user)
+
+    if not policy["can_use_org_operations"]:
+        return {
+            "error": "Submitting user does not have permission to create operational transactions",
+            "submitted_by_user_id": user_id,
+            "organisation_id": organisation_id,
+            "access_policy": policy,
+        }
+
+    return None
+
+# === USER ENFORCED TRANSACTION ACCESS V0.1 END ===
+
+
 
 
 
