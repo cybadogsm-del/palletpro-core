@@ -12153,6 +12153,107 @@ def get_login_integrity_action_summary():
 
 # === LOGIN INTEGRITY ACTION QUEUE SUMMARY V0.2 END ===
 
+# === SESSION HEARTBEAT V0.1 START ===
+
+@app.post("/sessions/<session_id>/heartbeat")
+def heartbeat_user_session(session_id):
+    conn = get_conn()
+    ensure_login_integrity_tables(conn)
+    ensure_user_access_tables(conn)
+
+    session = conn.execute(
+        "SELECT * FROM user_sessions WHERE session_id = ?",
+        (session_id,)
+    ).fetchone()
+
+    if not session:
+        conn.close()
+        return jsonify({"error": "Session not found"}), 404
+
+    user = get_user_account(conn, session["user_id"])
+
+    if not user:
+        conn.close()
+        return jsonify({"error": "User not found for session"}), 404
+
+    policy = build_user_access_policy(conn, user)
+
+    if session["session_status"] != "ACTIVE":
+        conn.close()
+        return jsonify({
+            "error": "Session is not active",
+            "session": dict(session),
+            "access_policy": policy,
+        }), 403
+
+    if not policy["can_use_platform"]:
+        ts = now_iso()
+
+        conn.execute(
+            """
+            UPDATE user_sessions
+            SET session_status = ?,
+                logout_at = ?,
+                ended_reason = ?,
+                updated_at = ?
+            WHERE session_id = ?
+            """,
+            (
+                "ENDED",
+                ts,
+                "ACCESS_POLICY_NO_LONGER_ALLOWS_PLATFORM_USE",
+                ts,
+                session_id,
+            )
+        )
+
+        conn.commit()
+
+        updated = conn.execute(
+            "SELECT * FROM user_sessions WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()
+
+        conn.close()
+
+        return jsonify({
+            "error": "Session ended because user access is no longer allowed",
+            "session": dict(updated),
+            "access_policy": policy,
+        }), 403
+
+    ts = now_iso()
+
+    conn.execute(
+        """
+        UPDATE user_sessions
+        SET last_seen_at = ?,
+            updated_at = ?
+        WHERE session_id = ?
+        """,
+        (ts, ts, session_id)
+    )
+
+    conn.commit()
+
+    updated = conn.execute(
+        "SELECT * FROM user_sessions WHERE session_id = ?",
+        (session_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "session": dict(updated),
+        "access_policy": policy,
+        "message": "Session heartbeat accepted.",
+        "rule": "Active sessions update last_seen_at so Login Integrity Guard can track live device activity.",
+    }), 200
+
+# === SESSION HEARTBEAT V0.1 END ===
+
+
+
 
 
 
