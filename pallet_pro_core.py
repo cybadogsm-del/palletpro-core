@@ -13071,6 +13071,252 @@ def list_access_operations_metrics_snapshots():
 
 # === ACCESS OPERATIONS METRICS SNAPSHOT V0.1 END ===
 
+# === TRANSACTION REPORTING SUMMARY V0.1 START ===
+
+def build_transaction_summary(conn, organisation_id=None, date_from=None, date_to=None):
+    where = ["1 = 1"]
+    params = []
+
+    if organisation_id:
+        where.append("t.organisation_id = ?")
+        params.append(organisation_id)
+
+    if date_from:
+        where.append("t.created_at >= ?")
+        params.append(date_from)
+
+    if date_to:
+        where.append("t.created_at <= ?")
+        params.append(date_to)
+
+    where_sql = " AND ".join(where)
+
+    total_row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS total_transactions
+        FROM transactions t
+        WHERE {where_sql}
+        """,
+        params,
+    ).fetchone()
+
+    status_rows = conn.execute(
+        f"""
+        SELECT
+            CASE
+                WHEN t.posted_at IS NULL THEN 'PENDING'
+                ELSE 'POSTED'
+            END AS transaction_status,
+            COUNT(*) AS count
+        FROM transactions t
+        WHERE {where_sql}
+        GROUP BY transaction_status
+        ORDER BY transaction_status ASC
+        """,
+        params,
+    ).fetchall()
+
+    type_rows = conn.execute(
+        f"""
+        SELECT
+            COALESCE(t.transaction_type, 'UNKNOWN') AS transaction_type,
+            COUNT(*) AS count,
+            COALESCE(SUM(t.quantity), 0) AS total_quantity
+        FROM transactions t
+        WHERE {where_sql}
+        GROUP BY t.transaction_type
+        ORDER BY count DESC, transaction_type ASC
+        """,
+        params,
+    ).fetchall()
+
+    direction_rows = conn.execute(
+        f"""
+        SELECT
+            COALESCE(t.direction, 'UNKNOWN') AS direction,
+            COUNT(*) AS count,
+            COALESCE(SUM(t.quantity), 0) AS total_quantity
+        FROM transactions t
+        WHERE {where_sql}
+        GROUP BY t.direction
+        ORDER BY count DESC, direction ASC
+        """,
+        params,
+    ).fetchall()
+
+    org_rows = conn.execute(
+        f"""
+        SELECT
+            t.organisation_id,
+            o.name AS organisation_name,
+            COUNT(*) AS transaction_count,
+            COALESCE(SUM(t.quantity), 0) AS total_quantity
+        FROM transactions t
+        LEFT JOIN organisations o ON o.organisation_id = t.organisation_id
+        WHERE {where_sql}
+        GROUP BY t.organisation_id, o.name
+        ORDER BY transaction_count DESC, organisation_name ASC
+        """,
+        params,
+    ).fetchall()
+
+    depot_rows = conn.execute(
+        f"""
+        SELECT
+            t.depot_id,
+            d.name AS depot_name,
+            COUNT(*) AS transaction_count,
+            COALESCE(SUM(t.quantity), 0) AS total_quantity
+        FROM transactions t
+        LEFT JOIN depots d ON d.depot_id = t.depot_id
+        WHERE {where_sql}
+        GROUP BY t.depot_id, d.name
+        ORDER BY transaction_count DESC, depot_name ASC
+        """,
+        params,
+    ).fetchall()
+
+    resource_rows = conn.execute(
+        f"""
+        SELECT
+            t.resource_id,
+            r.name AS resource_name,
+            r.resource_type,
+            COUNT(*) AS transaction_count,
+            COALESCE(SUM(t.quantity), 0) AS total_quantity
+        FROM transactions t
+        LEFT JOIN resources r ON r.resource_id = t.resource_id
+        WHERE {where_sql}
+        GROUP BY t.resource_id, r.name, r.resource_type
+        ORDER BY transaction_count DESC, resource_name ASC
+        """,
+        params,
+    ).fetchall()
+
+    partner_rows = conn.execute(
+        f"""
+        SELECT
+            t.partner_id,
+            p.name AS partner_name,
+            COUNT(*) AS transaction_count,
+            COALESCE(SUM(t.quantity), 0) AS total_quantity
+        FROM transactions t
+        LEFT JOIN partners p ON p.partner_id = t.partner_id
+        WHERE {where_sql}
+        GROUP BY t.partner_id, p.name
+        ORDER BY transaction_count DESC, partner_name ASC
+        """,
+        params,
+    ).fetchall()
+
+    date_rows = conn.execute(
+        f"""
+        SELECT
+            substr(t.created_at, 1, 10) AS transaction_date,
+            COUNT(*) AS transaction_count,
+            COALESCE(SUM(t.quantity), 0) AS total_quantity
+        FROM transactions t
+        WHERE {where_sql}
+        GROUP BY substr(t.created_at, 1, 10)
+        ORDER BY transaction_date DESC
+        LIMIT 60
+        """,
+        params,
+    ).fetchall()
+
+    return {
+        "filters": {
+            "organisation_id": organisation_id,
+            "date_from": date_from,
+            "date_to": date_to,
+        },
+        "total_transactions": total_row["total_transactions"] if total_row else 0,
+        "status_counts": [dict(row) for row in status_rows],
+        "transaction_type_counts": [dict(row) for row in type_rows],
+        "direction_counts": [dict(row) for row in direction_rows],
+        "organisation_counts": [dict(row) for row in org_rows],
+        "depot_counts": [dict(row) for row in depot_rows],
+        "resource_counts": [dict(row) for row in resource_rows],
+        "partner_counts": [dict(row) for row in partner_rows],
+        "daily_counts": [dict(row) for row in date_rows],
+    }
+
+
+@app.get("/global-admin/transaction-summary")
+def get_global_admin_transaction_summary():
+    organisation_id = request.args.get("organisation_id")
+    date_from = request.args.get("date_from")
+    date_to = request.args.get("date_to")
+
+    conn = get_conn()
+    ensure_transaction_partner_columns(conn)
+    ensure_partner_address_tables(conn)
+
+    summary = build_transaction_summary(
+        conn,
+        organisation_id=organisation_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+    conn.close()
+
+    return jsonify({
+        "summary_type": "GLOBAL_ADMIN_TRANSACTION_SUMMARY",
+        "visibility": "GLOBAL_ADMIN_PLATFORM_SUMMARY",
+        "summary": summary,
+        "rules": [
+            "Global Admin transaction reporting is for platform activity, support, audit, growth, and pricing intelligence.",
+            "Global Admin sees summary reporting first, not deep operational interference.",
+            "Use organisation_id and date range filters to narrow the report.",
+        ],
+    }), 200
+
+
+@app.get("/organisations/<organisation_id>/transaction-summary")
+def get_org_admin_transaction_summary(organisation_id):
+    date_from = request.args.get("date_from")
+    date_to = request.args.get("date_to")
+
+    conn = get_conn()
+    ensure_transaction_partner_columns(conn)
+    ensure_partner_address_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    summary = build_transaction_summary(
+        conn,
+        organisation_id=organisation_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+    conn.close()
+
+    return jsonify({
+        "summary_type": "ORG_ADMIN_TRANSACTION_SUMMARY",
+        "visibility": "ORG_SCOPED_OPERATIONAL_SUMMARY",
+        "organisation_id": organisation_id,
+        "organisation_name": org["name"],
+        "summary": summary,
+        "rules": [
+            "Org Admin transaction reporting is operational and organisation-scoped.",
+            "Org Admins can review transaction totals by date, depot, partner, resource, type, and status.",
+            "This summary supports daily operation review: what happened, where, with whom, and how much.",
+        ],
+    }), 200
+
+# === TRANSACTION REPORTING SUMMARY V0.1 END ===
+
+
+
 
 
 
