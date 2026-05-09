@@ -9783,6 +9783,257 @@ def set_organisation_subscription_mode(organisation_id):
 
 # === SUBSCRIPTION MODE CONTROLS V0.1 END ===
 
+# === GLOBAL ADMIN PRICING EDIT V0.1 START ===
+
+@app.post("/global-admin/pricing-settings")
+def update_global_pricing_settings():
+    body = request.get_json(silent=True) or {}
+
+    confirmation_text = (body.get("confirmation_text") or "").strip()
+    changed_by_display_name = (body.get("changed_by_display_name") or "Super Global Admin").strip()
+
+    required_confirmation = "UPDATE PRICING SETTINGS"
+
+    if confirmation_text != required_confirmation:
+        return jsonify({
+            "error": "Confirmation text is required before changing pricing settings",
+            "required_confirmation_text": required_confirmation,
+            "received_confirmation_text": confirmation_text,
+            "rule": "Pricing settings affect billing and must be changed deliberately.",
+        }), 400
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    settings = conn.execute(
+        "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
+    ).fetchone()
+
+    if not settings:
+        conn.close()
+        return jsonify({"error": "Pricing settings not found"}), 404
+
+    updates = {}
+    errors = []
+
+    if "temporary_user_access_fee_cents" in body:
+        try:
+            value = int(body["temporary_user_access_fee_cents"])
+            if value < 0:
+                errors.append("temporary_user_access_fee_cents must be zero or greater")
+            else:
+                updates["temporary_user_access_fee_cents"] = value
+        except Exception:
+            errors.append("temporary_user_access_fee_cents must be an integer")
+
+    if "temporary_access_days" in body:
+        try:
+            value = int(body["temporary_access_days"])
+            if value < 1:
+                errors.append("temporary_access_days must be at least 1")
+            else:
+                updates["temporary_access_days"] = value
+        except Exception:
+            errors.append("temporary_access_days must be an integer")
+
+    if "gst_rate_percent" in body:
+        try:
+            value = float(body["gst_rate_percent"])
+            if value < 0:
+                errors.append("gst_rate_percent must be zero or greater")
+            else:
+                updates["gst_rate_percent"] = value
+        except Exception:
+            errors.append("gst_rate_percent must be a number")
+
+    if "currency" in body:
+        value = (body.get("currency") or "").strip().upper()
+        if not value:
+            errors.append("currency cannot be blank")
+        else:
+            updates["currency"] = value
+
+    if errors:
+        conn.close()
+        return jsonify({"error": "Invalid pricing settings", "details": errors}), 400
+
+    if not updates:
+        conn.close()
+        return jsonify({"error": "No pricing setting changes supplied"}), 400
+
+    ts = now_iso()
+    updates["updated_at"] = ts
+
+    set_clause = ", ".join([f"{key} = ?" for key in updates.keys()])
+    values = list(updates.values())
+    values.append(settings["pricing_settings_id"])
+
+    conn.execute(
+        f"""
+        UPDATE pricing_settings
+        SET {set_clause}
+        WHERE pricing_settings_id = ?
+        """,
+        values
+    )
+
+    audit_event(
+        conn,
+        entity_type="PricingSettings",
+        entity_id=settings["pricing_settings_id"],
+        action="UPDATE",
+        summary=f"Pricing settings updated by {changed_by_display_name}.",
+        organisation_id=None,
+    )
+
+    conn.commit()
+
+    updated = conn.execute(
+        "SELECT * FROM pricing_settings WHERE pricing_settings_id = ?",
+        (settings["pricing_settings_id"],)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "pricing_settings": dict(updated),
+        "changed_by_display_name": changed_by_display_name,
+        "rule": "Pricing settings updates are Super Global Admin actions and must be audited.",
+    }), 200
+
+
+@app.post("/global-admin/pricing-plans/<pricing_plan_id>")
+def update_global_pricing_plan(pricing_plan_id):
+    body = request.get_json(silent=True) or {}
+
+    confirmation_text = (body.get("confirmation_text") or "").strip()
+    changed_by_display_name = (body.get("changed_by_display_name") or "Super Global Admin").strip()
+
+    required_confirmation = "UPDATE PRICING PLAN"
+
+    if confirmation_text != required_confirmation:
+        return jsonify({
+            "error": "Confirmation text is required before changing a pricing plan",
+            "required_confirmation_text": required_confirmation,
+            "received_confirmation_text": confirmation_text,
+            "rule": "Pricing plan changes affect billing and must be changed deliberately.",
+        }), 400
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    plan = conn.execute(
+        "SELECT * FROM pricing_plans WHERE pricing_plan_id = ?",
+        (pricing_plan_id,)
+    ).fetchone()
+
+    if not plan:
+        conn.close()
+        return jsonify({"error": "Pricing plan not found"}), 404
+
+    allowed_text_fields = {
+        "plan_name",
+        "plan_type",
+        "notes",
+    }
+
+    allowed_integer_fields = {
+        "min_permanent_users",
+        "max_permanent_users",
+        "price_per_user_cents",
+        "package_price_cents",
+        "requires_custom_pricing",
+        "sort_order",
+        "is_active",
+    }
+
+    updates = {}
+    errors = []
+
+    for field in allowed_text_fields:
+        if field in body:
+            updates[field] = (body.get(field) or "").strip()
+
+    for field in allowed_integer_fields:
+        if field in body:
+            value = body.get(field)
+            if value is None or value == "":
+                updates[field] = None
+                continue
+            try:
+                updates[field] = int(value)
+            except Exception:
+                errors.append(f"{field} must be an integer or null")
+
+    if "requires_custom_pricing" in updates and updates["requires_custom_pricing"] not in (0, 1, None):
+        errors.append("requires_custom_pricing must be 0 or 1")
+
+    if "is_active" in updates and updates["is_active"] not in (0, 1, None):
+        errors.append("is_active must be 0 or 1")
+
+    if "min_permanent_users" in updates and updates["min_permanent_users"] is not None and updates["min_permanent_users"] < 0:
+        errors.append("min_permanent_users must be zero or greater")
+
+    if "max_permanent_users" in updates and updates["max_permanent_users"] is not None and updates["max_permanent_users"] < 0:
+        errors.append("max_permanent_users must be zero or greater")
+
+    if "price_per_user_cents" in updates and updates["price_per_user_cents"] is not None and updates["price_per_user_cents"] < 0:
+        errors.append("price_per_user_cents must be zero or greater")
+
+    if "package_price_cents" in updates and updates["package_price_cents"] is not None and updates["package_price_cents"] < 0:
+        errors.append("package_price_cents must be zero or greater")
+
+    if errors:
+        conn.close()
+        return jsonify({"error": "Invalid pricing plan update", "details": errors}), 400
+
+    if not updates:
+        conn.close()
+        return jsonify({"error": "No pricing plan changes supplied"}), 400
+
+    updates["updated_at"] = now_iso()
+
+    set_clause = ", ".join([f"{key} = ?" for key in updates.keys()])
+    values = list(updates.values())
+    values.append(pricing_plan_id)
+
+    conn.execute(
+        f"""
+        UPDATE pricing_plans
+        SET {set_clause}
+        WHERE pricing_plan_id = ?
+        """,
+        values
+    )
+
+    audit_event(
+        conn,
+        entity_type="PricingPlan",
+        entity_id=pricing_plan_id,
+        action="UPDATE",
+        summary=f"Pricing plan updated by {changed_by_display_name}.",
+        organisation_id=None,
+    )
+
+    conn.commit()
+
+    updated = conn.execute(
+        "SELECT * FROM pricing_plans WHERE pricing_plan_id = ?",
+        (pricing_plan_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "pricing_plan": dict(updated),
+        "changed_by_display_name": changed_by_display_name,
+        "rule": "Pricing plan updates are Super Global Admin actions and must be audited.",
+    }), 200
+
+# === GLOBAL ADMIN PRICING EDIT V0.1 END ===
+
+
+
 
 
 
