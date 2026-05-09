@@ -7709,6 +7709,7 @@ def create_transaction():
     conn = get_conn()
     ensure_transaction_partner_columns(conn)
     ensure_partner_address_tables(conn)
+    ensure_transaction_user_attribution_columns(conn)
 
     access_error = require_active_org_access(conn, organisation_id)
     if access_error:
@@ -7719,6 +7720,12 @@ def create_transaction():
     if user_access_error:
         conn.close()
         return jsonify(user_access_error), 403
+
+    submitted_by_display_name = get_transaction_submitter_display_snapshot(
+        conn,
+        submitted_by_user_id,
+        submitted_by_display_name,
+    )
 
     org = conn.execute(
         "SELECT * FROM organisations WHERE organisation_id = ?",
@@ -7789,9 +7796,11 @@ def create_transaction():
             approval_reason_text,
             partner_id,
             partner_address_id,
+            submitted_by_user_id,
+            submitted_by_display_name,
             created_at,
             posted_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     if depot["opening_balance_used"] == 0:
@@ -7857,6 +7866,8 @@ def create_transaction():
             "partner_name": partner["name"] if partner else None,
             "partner_address_id": partner_address_id,
             "partner_address": partner_address,
+            "submitted_by_user_id": submitted_by_user_id,
+            "submitted_by_display_name": submitted_by_display_name,
             "message": "Opening balance has not been set for this entity. This transaction cannot be processed automatically and has been sent to your Org Admin for approval."
         }), 201
 
@@ -7898,7 +7909,9 @@ def create_transaction():
         "partner_id": partner_id,
         "partner_name": partner["name"] if partner else None,
         "partner_address_id": partner_address_id,
-        "partner_address": partner_address
+        "partner_address": partner_address,
+        "submitted_by_user_id": submitted_by_user_id,
+        "submitted_by_display_name": submitted_by_display_name
     }), 201
 
 
@@ -7930,6 +7943,8 @@ def list_transactions(organisation_id):
             t.partner_id,
             p.name AS partner_name,
             t.partner_address_id,
+            t.submitted_by_user_id,
+            t.submitted_by_display_name,
             t.created_at,
             t.posted_at
         FROM transactions t
@@ -7991,6 +8006,8 @@ def get_transaction(transaction_id):
             t.partner_id,
             p.name AS partner_name,
             t.partner_address_id,
+            t.submitted_by_user_id,
+            t.submitted_by_display_name,
             t.created_at,
             t.posted_at
         FROM transactions t
@@ -10791,6 +10808,37 @@ def require_user_org_operation_access(conn, user_id, organisation_id):
     return None
 
 # === USER ENFORCED TRANSACTION ACCESS V0.1 END ===
+
+# === TRANSACTION USER ATTRIBUTION V0.1 START ===
+
+def ensure_transaction_user_attribution_columns(conn):
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+
+    if "submitted_by_user_id" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN submitted_by_user_id TEXT")
+
+    if "submitted_by_display_name" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN submitted_by_display_name TEXT")
+
+
+def get_transaction_submitter_display_snapshot(conn, submitted_by_user_id, fallback_display_name):
+    fallback_display_name = (fallback_display_name or "Unknown User").strip() or "Unknown User"
+
+    if not submitted_by_user_id:
+        return fallback_display_name
+
+    ensure_user_access_tables(conn)
+
+    user = get_user_account(conn, submitted_by_user_id)
+
+    if not user:
+        return fallback_display_name
+
+    return (user["display_name"] or user["email"] or fallback_display_name).strip() or fallback_display_name
+
+# === TRANSACTION USER ATTRIBUTION V0.1 END ===
+
+
 
 
 
