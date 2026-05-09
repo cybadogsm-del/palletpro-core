@@ -1,51 +1,8 @@
 from flask import Flask, request, jsonify
-import sqlite3
-import uuid
-from datetime import datetime
+from audit import audit_event
+from db import DB, get_conn, make_id, now_iso
 
 app = Flask(__name__)
-
-DB = "pallet_pro.db"
-
-
-def get_conn():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def make_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
-
-
-def now_iso() -> str:
-    return datetime.utcnow().isoformat()
-
-
-def audit_event(conn, entity_type, entity_id, action, summary, organisation_id=None):
-    event_id = make_id("audit")
-    conn.execute(
-        """
-        INSERT INTO audit_events (
-            event_id,
-            organisation_id,
-            entity_type,
-            entity_id,
-            action,
-            summary,
-            created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            event_id,
-            organisation_id,
-            entity_type,
-            entity_id,
-            action,
-            summary,
-            now_iso()
-        )
-    )
 
 
 def create_pending_entry(

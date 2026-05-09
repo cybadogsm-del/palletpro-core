@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+node_modules/
+*~
 pallet_pro.db
 .env
 server.log
