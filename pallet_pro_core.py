@@ -12069,6 +12069,92 @@ def list_login_integrity_action_queue():
 
 # === LOGIN INTEGRITY ACTION QUEUE V0.1 END ===
 
+# === LOGIN INTEGRITY ACTION QUEUE SUMMARY V0.2 START ===
+
+@app.get("/global-admin/login-integrity-actions-summary")
+def get_login_integrity_action_summary():
+    conn = get_conn()
+    ensure_login_integrity_action_tables(conn)
+
+    rows = conn.execute(
+        """
+        SELECT
+            a.action_status,
+            a.action_type,
+            e.risk_level,
+            COUNT(*) AS count
+        FROM login_integrity_admin_actions a
+        LEFT JOIN login_integrity_events e
+            ON e.login_integrity_event_id = a.login_integrity_event_id
+        GROUP BY a.action_status, a.action_type, e.risk_level
+        ORDER BY a.action_status ASC, e.risk_level ASC, a.action_type ASC
+        """
+    ).fetchall()
+
+    open_rows = conn.execute(
+        """
+        SELECT
+            a.*,
+            e.event_type,
+            e.risk_level,
+            e.risk_score,
+            e.ai_report_summary,
+            u.display_name,
+            u.email,
+            u.role,
+            o.name AS organisation_name
+        FROM login_integrity_admin_actions a
+        LEFT JOIN login_integrity_events e
+            ON e.login_integrity_event_id = a.login_integrity_event_id
+        LEFT JOIN user_accounts u
+            ON u.user_id = a.user_id
+        LEFT JOIN organisations o
+            ON o.organisation_id = a.organisation_id
+        WHERE a.action_status = 'OPEN'
+        ORDER BY
+            CASE e.risk_level
+                WHEN 'CRITICAL' THEN 0
+                WHEN 'HIGH' THEN 1
+                WHEN 'MEDIUM' THEN 2
+                WHEN 'LOW' THEN 3
+                ELSE 4
+            END,
+            a.created_at ASC
+        LIMIT 20
+        """
+    ).fetchall()
+
+    total_open = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM login_integrity_admin_actions
+        WHERE action_status = 'OPEN'
+        """
+    ).fetchone()["c"]
+
+    total_completed = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM login_integrity_admin_actions
+        WHERE action_status = 'COMPLETED'
+        """
+    ).fetchone()["c"]
+
+    conn.close()
+
+    return jsonify({
+        "summary_type": "GLOBAL_ADMIN_LOGIN_INTEGRITY_ACTION_SUMMARY",
+        "open_action_count": total_open,
+        "completed_action_count": total_completed,
+        "grouped_counts": [dict(row) for row in rows],
+        "top_open_actions": [dict(row) for row in open_rows],
+        "rule": "This summary is for Global Admin dashboard badges and triage. AI reports remain advisory only.",
+    }), 200
+
+# === LOGIN INTEGRITY ACTION QUEUE SUMMARY V0.2 END ===
+
+
+
 
 
 
