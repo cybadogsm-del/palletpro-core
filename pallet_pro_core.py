@@ -11407,6 +11407,92 @@ def review_login_integrity_report(login_integrity_event_id):
 
 # === LOGIN INTEGRITY GUARD V0.1 END ===
 
+# === LOGIN INTEGRITY DASHBOARD V0.1 START ===
+
+@app.get("/global-admin/login-integrity-dashboard")
+def get_login_integrity_dashboard():
+    conn = get_conn()
+    ensure_login_integrity_tables(conn)
+    ensure_user_access_tables(conn)
+
+    reports = conn.execute(
+        """
+        SELECT
+            e.*,
+            u.display_name,
+            u.email,
+            u.role,
+            o.name AS organisation_name
+        FROM login_integrity_events e
+        LEFT JOIN user_accounts u ON u.user_id = e.user_id
+        LEFT JOIN organisations o ON o.organisation_id = e.organisation_id
+        WHERE e.global_admin_only = 1
+        ORDER BY e.created_at DESC
+        LIMIT 50
+        """
+    ).fetchall()
+
+    active_sessions = conn.execute(
+        """
+        SELECT
+            s.*,
+            u.display_name,
+            u.email,
+            o.name AS organisation_name
+        FROM user_sessions s
+        LEFT JOIN user_accounts u ON u.user_id = s.user_id
+        LEFT JOIN organisations o ON o.organisation_id = s.organisation_id
+        WHERE s.session_status = 'ACTIVE'
+        ORDER BY s.last_seen_at DESC
+        LIMIT 100
+        """
+    ).fetchall()
+
+    risk_counts = {}
+    review_counts = {}
+    event_type_counts = {}
+
+    for row in reports:
+        risk_counts[row["risk_level"]] = risk_counts.get(row["risk_level"], 0) + 1
+        review_counts[row["review_status"]] = review_counts.get(row["review_status"], 0) + 1
+        event_type_counts[row["event_type"]] = event_type_counts.get(row["event_type"], 0) + 1
+
+    one_device_roles_active_sessions = [
+        dict(row) for row in active_sessions
+        if row["role"] in ("USER", "TEMPORARY_USER")
+    ]
+
+    admin_active_sessions = [
+        dict(row) for row in active_sessions
+        if row["role"] in ("ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN")
+    ]
+
+    conn.close()
+
+    return jsonify({
+        "dashboard_type": "GLOBAL_ADMIN_LOGIN_INTEGRITY_DASHBOARD",
+        "report_count": len(reports),
+        "active_session_count": len(active_sessions),
+        "standard_user_active_session_count": len(one_device_roles_active_sessions),
+        "admin_active_session_count": len(admin_active_sessions),
+        "risk_counts": risk_counts,
+        "review_status_counts": review_counts,
+        "event_type_counts": event_type_counts,
+        "recent_reports": [dict(row) for row in reports],
+        "active_sessions": [dict(row) for row in active_sessions],
+        "rules": [
+            "Login integrity reports are for Global Admin eyes only.",
+            "AI reports are advisory only. Global Admin decides any course of action.",
+            "Standard and temporary users are limited to one active device.",
+            "Org Admins and platform admins may use multiple devices, but their sessions remain logged and monitored.",
+            "The purpose is to protect who/where/when integrity and the Pallet Pro pricing philosophy.",
+        ],
+    }), 200
+
+# === LOGIN INTEGRITY DASHBOARD V0.1 END ===
+
+
+
 
 
 
