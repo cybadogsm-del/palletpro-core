@@ -10032,6 +10032,93 @@ def update_global_pricing_plan(pricing_plan_id):
 
 # === GLOBAL ADMIN PRICING EDIT V0.1 END ===
 
+# === GLOBAL ADMIN PRICING DASHBOARD V0.1 START ===
+
+@app.get("/global-admin/pricing-dashboard")
+def get_global_admin_pricing_dashboard():
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    settings = conn.execute(
+        "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
+    ).fetchone()
+
+    plans = conn.execute(
+        """
+        SELECT *
+        FROM pricing_plans
+        ORDER BY sort_order ASC, plan_name ASC
+        """
+    ).fetchall()
+
+    subscription_rows = conn.execute(
+        """
+        SELECT
+            s.*,
+            o.name AS organisation_name
+        FROM organisation_subscriptions s
+        LEFT JOIN organisations o ON o.organisation_id = s.organisation_id
+        ORDER BY o.name ASC
+        """
+    ).fetchall()
+
+    export_runs = conn.execute(
+        """
+        SELECT *
+        FROM billing_export_runs
+        ORDER BY created_at DESC
+        LIMIT 10
+        """
+    ).fetchall()
+
+    temp_summary = conn.execute(
+        """
+        SELECT
+            access_status,
+            COUNT(*) AS count,
+            COALESCE(SUM(fee_cents), 0) AS fee_cents_total,
+            COALESCE(SUM(CASE WHEN billed_at IS NULL THEN fee_cents ELSE 0 END), 0) AS unbilled_fee_cents_total
+        FROM temporary_user_access
+        GROUP BY access_status
+        ORDER BY access_status ASC
+        """
+    ).fetchall()
+
+    mode_counts = {}
+    billing_status_counts = {}
+
+    for row in subscription_rows:
+        mode = row["subscription_mode"]
+        billing_status = row["billing_status"]
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        billing_status_counts[billing_status] = billing_status_counts.get(billing_status, 0) + 1
+
+    conn.close()
+
+    return jsonify({
+        "dashboard_type": "GLOBAL_ADMIN_PRICING_DASHBOARD",
+        "pricing_philosophy": PRICING_PHILOSOPHY_STATEMENT,
+        "settings": dict(settings) if settings else None,
+        "pricing_plan_count": len(plans),
+        "pricing_plans": [dict(row) for row in plans],
+        "subscription_count": len(subscription_rows),
+        "subscription_mode_counts": mode_counts,
+        "billing_status_counts": billing_status_counts,
+        "subscriptions": [dict(row) for row in subscription_rows],
+        "temporary_user_access_summary": [dict(row) for row in temp_summary],
+        "recent_billing_export_runs": [dict(row) for row in export_runs],
+        "rules": [
+            "Temporary User Access Fee is the final pricing-table line item.",
+            "Distribution centres and warehousing operations require custom pricing.",
+            "Free, Beta Tester, Quoted, Suspended, and Cancelled organisations are do-not-bill unless explicitly changed.",
+            "Unsubscribed organisations must not be included in billing exports.",
+        ],
+    }), 200
+
+# === GLOBAL ADMIN PRICING DASHBOARD V0.1 END ===
+
+
+
 
 
 
