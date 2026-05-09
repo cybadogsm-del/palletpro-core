@@ -12830,6 +12830,249 @@ def get_global_admin_system_control_panel():
 
 # === SYSTEM CONTROL PANEL V0.1 END ===
 
+# === ACCESS OPERATIONS METRICS SNAPSHOT V0.1 START ===
+
+def ensure_access_operations_snapshot_tables(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS access_operations_metric_snapshots (
+        access_operations_snapshot_id TEXT PRIMARY KEY,
+        snapshot_status TEXT NOT NULL,
+        captured_by_display_name TEXT NOT NULL,
+        active_sessions_count INTEGER NOT NULL,
+        open_login_integrity_action_count INTEGER NOT NULL,
+        open_login_integrity_report_count INTEGER NOT NULL,
+        due_retention_jobs_count INTEGER NOT NULL,
+        active_temporary_access_count INTEGER NOT NULL,
+        expired_temporary_access_count INTEGER NOT NULL,
+        suspended_users_count INTEGER NOT NULL,
+        expired_users_count INTEGER NOT NULL,
+        do_not_bill_organisation_count INTEGER NOT NULL,
+        health_status TEXT NOT NULL,
+        advisory_summary TEXT NOT NULL,
+        metrics_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+
+def collect_access_operations_metrics(conn):
+    import json
+
+    ensure_subscription_guard_tables(conn)
+    ensure_user_access_tables(conn)
+    ensure_login_integrity_tables(conn)
+    ensure_login_integrity_action_tables(conn)
+    ensure_access_operations_snapshot_tables(conn)
+
+    active_sessions_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM user_sessions WHERE session_status = 'ACTIVE'"
+    ).fetchone()["c"]
+
+    open_actions_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM login_integrity_admin_actions WHERE action_status = 'OPEN'"
+    ).fetchone()["c"]
+
+    open_reports_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM login_integrity_events WHERE review_status IN ('OPEN', 'ACTION_REQUIRED', 'MONITORING')"
+    ).fetchone()["c"]
+
+    due_retention_jobs_count = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM data_retention_jobs
+        WHERE job_status = 'SCHEDULED'
+          AND scheduled_for <= ?
+        """,
+        (now_iso(),)
+    ).fetchone()["c"]
+
+    active_temp_access_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM temporary_user_access WHERE access_status = 'ACTIVE'"
+    ).fetchone()["c"]
+
+    expired_temp_access_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM temporary_user_access WHERE access_status = 'EXPIRED'"
+    ).fetchone()["c"]
+
+    suspended_users_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM user_accounts WHERE access_status = 'SUSPENDED'"
+    ).fetchone()["c"]
+
+    expired_users_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM user_accounts WHERE access_status = 'EXPIRED'"
+    ).fetchone()["c"]
+
+    do_not_bill_orgs_count = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM organisation_subscriptions
+        WHERE do_not_bill = 1
+           OR billing_status = 'DO_NOT_BILL'
+        """
+    ).fetchone()["c"]
+
+    health_status = "GREEN"
+    advisory_parts = []
+
+    if due_retention_jobs_count > 0:
+        health_status = "AMBER"
+        advisory_parts.append(f"{due_retention_jobs_count} due retention job(s) need review.")
+
+    if open_actions_count > 0:
+        health_status = "AMBER"
+        advisory_parts.append(f"{open_actions_count} open login-integrity action(s) need Global Admin review.")
+
+    if open_reports_count > 5:
+        health_status = "AMBER"
+        advisory_parts.append(f"{open_reports_count} login-integrity report(s) are still open/action-required/monitoring.")
+
+    if expired_temp_access_count > 0:
+        advisory_parts.append(f"{expired_temp_access_count} expired temporary access record(s) exist.")
+
+    if due_retention_jobs_count > 10 or open_actions_count > 10:
+        health_status = "RED"
+        advisory_parts.append("High unresolved admin workload detected.")
+
+    if not advisory_parts:
+        advisory_parts.append("Access operations look healthy.")
+
+    metrics = {
+        "active_sessions_count": active_sessions_count,
+        "open_login_integrity_action_count": open_actions_count,
+        "open_login_integrity_report_count": open_reports_count,
+        "due_retention_jobs_count": due_retention_jobs_count,
+        "active_temporary_access_count": active_temp_access_count,
+        "expired_temporary_access_count": expired_temp_access_count,
+        "suspended_users_count": suspended_users_count,
+        "expired_users_count": expired_users_count,
+        "do_not_bill_organisation_count": do_not_bill_orgs_count,
+        "health_status": health_status,
+        "advisory_summary": " ".join(advisory_parts),
+    }
+
+    return metrics
+
+
+@app.post("/global-admin/access-operations-metrics-snapshot")
+def create_access_operations_metrics_snapshot():
+    import json
+
+    body = request.get_json(silent=True) or {}
+    captured_by_display_name = (body.get("captured_by_display_name") or "Global Admin").strip()
+    confirmation_text = (body.get("confirmation_text") or "").strip()
+
+    required_confirmation = "CAPTURE ACCESS OPERATIONS SNAPSHOT"
+
+    if confirmation_text != required_confirmation:
+        return jsonify({
+            "error": "Confirmation text is required before capturing an access operations snapshot",
+            "required_confirmation_text": required_confirmation,
+            "received_confirmation_text": confirmation_text,
+            "rule": "Snapshots create an audit-friendly point-in-time operations record.",
+        }), 400
+
+    conn = get_conn()
+    metrics = collect_access_operations_metrics(conn)
+
+    snapshot_id = make_id("aoms")
+    ts = now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO access_operations_metric_snapshots (
+            access_operations_snapshot_id,
+            snapshot_status,
+            captured_by_display_name,
+            active_sessions_count,
+            open_login_integrity_action_count,
+            open_login_integrity_report_count,
+            due_retention_jobs_count,
+            active_temporary_access_count,
+            expired_temporary_access_count,
+            suspended_users_count,
+            expired_users_count,
+            do_not_bill_organisation_count,
+            health_status,
+            advisory_summary,
+            metrics_json,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            snapshot_id,
+            "CAPTURED",
+            captured_by_display_name,
+            metrics["active_sessions_count"],
+            metrics["open_login_integrity_action_count"],
+            metrics["open_login_integrity_report_count"],
+            metrics["due_retention_jobs_count"],
+            metrics["active_temporary_access_count"],
+            metrics["expired_temporary_access_count"],
+            metrics["suspended_users_count"],
+            metrics["expired_users_count"],
+            metrics["do_not_bill_organisation_count"],
+            metrics["health_status"],
+            metrics["advisory_summary"],
+            json.dumps(metrics, sort_keys=True),
+            ts,
+        )
+    )
+
+    audit_event(
+        conn,
+        entity_type="AccessOperationsMetricSnapshot",
+        entity_id=snapshot_id,
+        action="CAPTURE",
+        summary=f"Access operations metrics snapshot captured with health status {metrics['health_status']}.",
+        organisation_id=None,
+    )
+
+    conn.commit()
+
+    snapshot = conn.execute(
+        """
+        SELECT *
+        FROM access_operations_metric_snapshots
+        WHERE access_operations_snapshot_id = ?
+        """,
+        (snapshot_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "snapshot": dict(snapshot),
+        "metrics": metrics,
+        "rule": "This snapshot is a point-in-time Global Admin operations record. AI-style advisory summary is informational only.",
+    }), 201
+
+
+@app.get("/global-admin/access-operations-metrics-snapshots")
+def list_access_operations_metrics_snapshots():
+    conn = get_conn()
+    ensure_access_operations_snapshot_tables(conn)
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM access_operations_metric_snapshots
+        ORDER BY created_at DESC
+        LIMIT 25
+        """
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "snapshot_list_type": "ACCESS_OPERATIONS_METRICS_SNAPSHOTS",
+        "count": len(rows),
+        "items": [dict(row) for row in rows],
+    }), 200
+
+# === ACCESS OPERATIONS METRICS SNAPSHOT V0.1 END ===
+
+
+
 
 
 
