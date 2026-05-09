@@ -8771,10 +8771,36 @@ def billing_export_preview():
 
 
 
-# === BILLING EXPORT FINALISE V0.1 START ===
+
+# === BILLING EXPORT FINALISE V0.2 START ===
+
+def ensure_billing_export_snapshot_tables(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS billing_export_line_items (
+        billing_export_line_item_id TEXT PRIMARY KEY,
+        billing_export_run_id TEXT NOT NULL,
+        organisation_id TEXT NOT NULL,
+        organisation_name TEXT NOT NULL,
+        currency TEXT NOT NULL,
+        subscription_subtotal_cents INTEGER NOT NULL,
+        temporary_user_count INTEGER NOT NULL,
+        temporary_user_fee_cents INTEGER NOT NULL,
+        subtotal_cents INTEGER NOT NULL,
+        gst_rate_percent REAL NOT NULL,
+        gst_cents INTEGER NOT NULL,
+        total_cents INTEGER NOT NULL,
+        amount_cents INTEGER NOT NULL,
+        billing_instruction TEXT NOT NULL,
+        line_item_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+
 
 @app.post("/global-admin/billing-export-finalise")
 def billing_export_finalise():
+    import json
+
     body = request.get_json(silent=True) or {}
     billing_period_start = body.get("billing_period_start")
     billing_period_end = body.get("billing_period_end")
@@ -8783,6 +8809,7 @@ def billing_export_finalise():
     conn = get_conn()
     ensure_subscription_guard_tables(conn)
     ensure_temporary_user_billing_columns(conn)
+    ensure_billing_export_snapshot_tables(conn)
 
     settings = conn.execute(
         "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
@@ -8848,7 +8875,7 @@ def billing_export_finalise():
         temp_ids = [r["temporary_user_access_id"] for r in temp_rows]
         temp_ids_to_mark.extend(temp_ids)
 
-        export_items.append({
+        item = {
             "organisation_id": d["organisation_id"],
             "organisation_name": d["organisation_name"],
             "subscription_mode": d["subscription_mode"],
@@ -8868,7 +8895,9 @@ def billing_export_finalise():
             "amount_cents": total_cents,
             "temporary_user_access_ids": temp_ids,
             "billing_instruction": "FINALISE_FOR_THIRD_PARTY_BILLER",
-        })
+        }
+
+        export_items.append(item)
 
     conn.execute(
         """
@@ -8897,6 +8926,48 @@ def billing_export_finalise():
         )
     )
 
+    for item in export_items:
+        conn.execute(
+            """
+            INSERT INTO billing_export_line_items (
+                billing_export_line_item_id,
+                billing_export_run_id,
+                organisation_id,
+                organisation_name,
+                currency,
+                subscription_subtotal_cents,
+                temporary_user_count,
+                temporary_user_fee_cents,
+                subtotal_cents,
+                gst_rate_percent,
+                gst_cents,
+                total_cents,
+                amount_cents,
+                billing_instruction,
+                line_item_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                make_id("bline"),
+                run_id,
+                item["organisation_id"],
+                item["organisation_name"],
+                item["currency"],
+                item["subscription_subtotal_cents"],
+                item["temporary_user_count"],
+                item["temporary_user_fee_cents"],
+                item["subtotal_cents"],
+                item["gst_rate_percent"],
+                item["gst_cents"],
+                item["total_cents"],
+                item["amount_cents"],
+                item["billing_instruction"],
+                json.dumps(item, sort_keys=True),
+                ts,
+            )
+        )
+
     for temp_id in temp_ids_to_mark:
         conn.execute(
             """
@@ -8914,7 +8985,7 @@ def billing_export_finalise():
         entity_type="BillingExportRun",
         entity_id=run_id,
         action="FINALISE",
-        summary=f"Billing export finalised with {len(export_items)} billable organisations and {len(excluded)} do-not-bill exclusions.",
+        summary=f"Billing export finalised with {len(export_items)} billable organisations and {len(excluded)} do-not-bill exclusions. Line-item snapshots stored.",
         organisation_id=None,
     )
 
@@ -8928,12 +8999,60 @@ def billing_export_finalise():
         "organisation_count": len(export_items),
         "do_not_bill_excluded_count": len(excluded),
         "temporary_user_access_marked_billed_count": len(temp_ids_to_mark),
+        "line_item_snapshot_count": len(export_items),
         "items": export_items,
         "excluded": excluded,
-        "rule": "Finalised billing exports exclude unsubscribed/do-not-bill organisations and mark included temporary user fees as billed.",
+        "rule": "Finalised billing exports exclude unsubscribed/do-not-bill organisations, mark included temporary user fees as billed, and store billing line snapshots for audit.",
     }), 200
 
-# === BILLING EXPORT FINALISE V0.1 END ===
+
+@app.get("/global-admin/billing-export-runs/<billing_export_run_id>")
+def get_billing_export_run(billing_export_run_id):
+    import json
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+    ensure_billing_export_snapshot_tables(conn)
+
+    run = conn.execute(
+        """
+        SELECT *
+        FROM billing_export_runs
+        WHERE billing_export_run_id = ?
+        """,
+        (billing_export_run_id,)
+    ).fetchone()
+
+    if not run:
+        conn.close()
+        return jsonify({"error": "Billing export run not found"}), 404
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM billing_export_line_items
+        WHERE billing_export_run_id = ?
+        ORDER BY organisation_name ASC
+        """,
+        (billing_export_run_id,)
+    ).fetchall()
+
+    items = []
+    for row in rows:
+        d = dict(row)
+        d["line_item"] = json.loads(d["line_item_json"])
+        items.append(d)
+
+    conn.close()
+
+    return jsonify({
+        "billing_export_run": dict(run),
+        "line_item_count": len(items),
+        "line_items": items,
+    }), 200
+
+# === BILLING EXPORT FINALISE V0.2 END ===
+
 
 
 @app.post("/organisations/<organisation_id>/unsubscribe")
