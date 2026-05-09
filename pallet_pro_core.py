@@ -7709,6 +7709,11 @@ def create_transaction():
     ensure_transaction_partner_columns(conn)
     ensure_partner_address_tables(conn)
 
+    access_error = require_active_org_access(conn, organisation_id)
+    if access_error:
+        conn.close()
+        return jsonify(access_error), 403
+
     org = conn.execute(
         "SELECT * FROM organisations WHERE organisation_id = ?",
         (organisation_id,)
@@ -8872,6 +8877,192 @@ def unsubscribe_organisation(organisation_id):
         "operating_data_rule": "Operating data is retained for 7 days after unsubscribe, then scheduled for deletion.",
         "historical_data_rule": "Minimal historical organisation and billing records are retained for 7 years, then scheduled for deletion.",
     }), 200
+
+
+
+# === UNSUBSCRIBED ORG ACCESS GUARD V0.1 START ===
+
+def get_subscription_for_access_guard(conn, organisation_id):
+    if not organisation_id:
+        return None
+
+    ensure_subscription_guard_tables(conn)
+
+    return conn.execute(
+        """
+        SELECT *
+        FROM organisation_subscriptions
+        WHERE organisation_id = ?
+        """,
+        (organisation_id,)
+    ).fetchone()
+
+
+def classify_org_access_state(subscription_row):
+    from datetime import datetime
+
+    if not subscription_row:
+        return {
+            "access_state": "ACTIVE",
+            "normal_access_allowed": True,
+            "exit_only_access_allowed": False,
+            "reason": "No cancellation record found.",
+        }
+
+    subscription_status = subscription_row["subscription_status"]
+    billing_status = subscription_row["billing_status"]
+    do_not_bill = subscription_row["do_not_bill"]
+    operating_data_delete_after = subscription_row["operating_data_delete_after"]
+
+    if subscription_status not in ("CANCELLED", "UNSUBSCRIBED") and billing_status != "DO_NOT_BILL" and do_not_bill != 1:
+        return {
+            "access_state": "ACTIVE",
+            "normal_access_allowed": True,
+            "exit_only_access_allowed": False,
+            "reason": "Organisation subscription is active.",
+        }
+
+    if operating_data_delete_after:
+        delete_after = datetime.fromisoformat(operating_data_delete_after)
+        now_dt = datetime.fromisoformat(now_iso())
+
+        if now_dt <= delete_after:
+            return {
+                "access_state": "CANCELLED_WITHIN_RETENTION",
+                "normal_access_allowed": False,
+                "exit_only_access_allowed": True,
+                "reason": "Organisation has unsubscribed. Normal access is blocked, but exit/export access is available until operating data deletion.",
+            }
+
+    return {
+        "access_state": "CANCELLED_DATA_DELETED",
+        "normal_access_allowed": False,
+        "exit_only_access_allowed": False,
+        "reason": "Organisation has unsubscribed and the operating data retention window has ended.",
+    }
+
+
+def get_org_access_status_payload(conn, organisation_id):
+    sub = get_subscription_for_access_guard(conn, organisation_id)
+    state = classify_org_access_state(sub)
+
+    return {
+        "organisation_id": organisation_id,
+        "access_state": state["access_state"],
+        "normal_access_allowed": state["normal_access_allowed"],
+        "exit_only_access_allowed": state["exit_only_access_allowed"],
+        "reason": state["reason"],
+        "subscription": dict(sub) if sub else None,
+        "allowed_exit_actions": [
+            "view_unsubscribe_status",
+            "export_operating_data",
+            "view_deletion_dates",
+            "contact_support",
+            "reactivate_within_retention_window",
+            "view_billing_stopped_status",
+        ] if state["exit_only_access_allowed"] else [],
+        "blocked_operational_actions": [
+            "create_transactions",
+            "post_transactions",
+            "add_users",
+            "add_depots",
+            "add_resources",
+            "add_partners",
+            "generate_qr_handoffs",
+            "sync_field_activity",
+        ] if not state["normal_access_allowed"] else [],
+    }
+
+
+def require_active_org_access(conn, organisation_id):
+    payload = get_org_access_status_payload(conn, organisation_id)
+
+    if payload["normal_access_allowed"]:
+        return None
+
+    return {
+        "error": "Organisation does not have active operational access",
+        "organisation_id": organisation_id,
+        "access_state": payload["access_state"],
+        "reason": payload["reason"],
+        "exit_only_access_allowed": payload["exit_only_access_allowed"],
+        "allowed_exit_actions": payload["allowed_exit_actions"],
+        "blocked_operational_actions": payload["blocked_operational_actions"],
+    }
+
+
+@app.get("/organisations/<organisation_id>/access-status")
+def get_organisation_access_status(organisation_id):
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    payload = get_org_access_status_payload(conn, organisation_id)
+    payload["organisation_name"] = org["name"]
+
+    conn.close()
+    return jsonify(payload), 200
+
+
+@app.get("/organisations/<organisation_id>/exit-dashboard")
+def get_organisation_exit_dashboard(organisation_id):
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    payload = get_org_access_status_payload(conn, organisation_id)
+
+    if payload["access_state"] == "ACTIVE":
+        conn.close()
+        return jsonify({
+            "organisation_id": organisation_id,
+            "organisation_name": org["name"],
+            "access_state": "ACTIVE",
+            "message": "Organisation is active. Exit dashboard is not required.",
+        }), 200
+
+    if not payload["exit_only_access_allowed"]:
+        conn.close()
+        return jsonify({
+            "organisation_id": organisation_id,
+            "organisation_name": org["name"],
+            "access_state": payload["access_state"],
+            "message": "Exit access is no longer available.",
+            "reason": payload["reason"],
+        }), 403
+
+    conn.close()
+    return jsonify({
+        "organisation_id": organisation_id,
+        "organisation_name": org["name"],
+        "access_state": payload["access_state"],
+        "message": "Subscription is cancelled. Billing has stopped. Limited exit access is available during the operating data retention window.",
+        "normal_access_allowed": False,
+        "billing_stopped": True,
+        "operating_data_delete_after": payload["subscription"]["operating_data_delete_after"],
+        "historical_data_delete_after": payload["subscription"]["historical_data_delete_after"],
+        "allowed_exit_actions": payload["allowed_exit_actions"],
+        "blocked_operational_actions": payload["blocked_operational_actions"],
+    }), 200
+
+# === UNSUBSCRIBED ORG ACCESS GUARD V0.1 END ===
+
 
 # === SUBSCRIPTION GUARD V0.1 END ===
 
