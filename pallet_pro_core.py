@@ -9053,6 +9053,106 @@ def get_billing_export_run(billing_export_run_id):
 
 # === BILLING EXPORT FINALISE V0.2 END ===
 
+# === THIRD PARTY BILLER PAYLOAD V0.1 START ===
+
+@app.get("/global-admin/billing-export-runs/<billing_export_run_id>/third-party-payload")
+def get_third_party_biller_payload(billing_export_run_id):
+    import json
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+    ensure_billing_export_snapshot_tables(conn)
+
+    run = conn.execute(
+        """
+        SELECT *
+        FROM billing_export_runs
+        WHERE billing_export_run_id = ?
+        """,
+        (billing_export_run_id,)
+    ).fetchone()
+
+    if not run:
+        conn.close()
+        return jsonify({"error": "Billing export run not found"}), 404
+
+    if run["export_status"] != "FINALISED":
+        conn.close()
+        return jsonify({
+            "error": "Only finalised billing exports can be sent to the third-party biller",
+            "export_status": run["export_status"],
+        }), 400
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM billing_export_line_items
+        WHERE billing_export_run_id = ?
+        ORDER BY organisation_name ASC
+        """,
+        (billing_export_run_id,)
+    ).fetchall()
+
+    payload_items = []
+
+    for row in rows:
+        line = json.loads(row["line_item_json"])
+
+        payload_items.append({
+            "external_customer_reference": row["organisation_id"],
+            "customer_name": row["organisation_name"],
+            "billing_export_run_id": billing_export_run_id,
+            "billing_period_start": line.get("billing_period_start"),
+            "billing_period_end": line.get("billing_period_end"),
+            "currency": row["currency"],
+            "subtotal_cents": row["subtotal_cents"],
+            "gst_cents": row["gst_cents"],
+            "total_cents": row["total_cents"],
+            "amount_cents": row["amount_cents"],
+            "line_items": [
+                {
+                    "description": "Subscription subtotal",
+                    "amount_cents": row["subscription_subtotal_cents"],
+                },
+                {
+                    "description": "Temporary user access fees",
+                    "quantity": row["temporary_user_count"],
+                    "amount_cents": row["temporary_user_fee_cents"],
+                    "temporary_user_access_ids": line.get("temporary_user_access_ids", []),
+                },
+                {
+                    "description": "GST",
+                    "gst_rate_percent": row["gst_rate_percent"],
+                    "amount_cents": row["gst_cents"],
+                },
+            ],
+            "billing_instruction": row["billing_instruction"],
+        })
+
+    total_amount_cents = sum(int(item["amount_cents"]) for item in payload_items)
+
+    conn.close()
+
+    return jsonify({
+        "payload_type": "THIRD_PARTY_BILLER_EXPORT",
+        "billing_export_run_id": billing_export_run_id,
+        "export_status": run["export_status"],
+        "export_type": run["export_type"],
+        "billing_period_start": run["billing_period_start"],
+        "billing_period_end": run["billing_period_end"],
+        "created_at": run["created_at"],
+        "created_by_display_name": run["created_by_display_name"],
+        "organisation_count": len(payload_items),
+        "total_amount_cents": total_amount_cents,
+        "currency": "AUD",
+        "items": payload_items,
+        "privacy_rule": "This payload contains billing/accounting data only. It does not include operational pallet transaction data.",
+    }), 200
+
+# === THIRD PARTY BILLER PAYLOAD V0.1 END ===
+
+
+
 
 
 @app.post("/organisations/<organisation_id>/unsubscribe")
