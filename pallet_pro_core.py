@@ -12252,6 +12252,110 @@ def heartbeat_user_session(session_id):
 
 # === SESSION HEARTBEAT V0.1 END ===
 
+# === SESSION EXPIRY SWEEP V0.1 START ===
+
+@app.post("/global-admin/session-expiry-sweep")
+def sweep_expired_sessions():
+    from datetime import datetime, timedelta
+
+    body = request.get_json(silent=True) or {}
+
+    inactive_minutes = body.get("inactive_minutes", 480)
+    swept_by_display_name = (body.get("swept_by_display_name") or "Global Admin").strip()
+    confirmation_text = (body.get("confirmation_text") or "").strip()
+
+    required_confirmation = "SWEEP EXPIRED SESSIONS"
+
+    if confirmation_text != required_confirmation:
+        return jsonify({
+            "error": "Confirmation text is required before sweeping expired sessions",
+            "required_confirmation_text": required_confirmation,
+            "received_confirmation_text": confirmation_text,
+            "rule": "Session expiry sweep changes session state and must be deliberate.",
+        }), 400
+
+    try:
+        inactive_minutes = int(inactive_minutes)
+    except Exception:
+        return jsonify({"error": "inactive_minutes must be an integer"}), 400
+
+    if inactive_minutes < 1:
+        return jsonify({"error": "inactive_minutes must be at least 1"}), 400
+
+    conn = get_conn()
+    ensure_login_integrity_tables(conn)
+
+    cutoff = (datetime.fromisoformat(now_iso()) - timedelta(minutes=inactive_minutes)).isoformat()
+    ts = now_iso()
+
+    expired = conn.execute(
+        """
+        SELECT *
+        FROM user_sessions
+        WHERE session_status = 'ACTIVE'
+          AND last_seen_at < ?
+        ORDER BY last_seen_at ASC
+        """,
+        (cutoff,)
+    ).fetchall()
+
+    for session in expired:
+        conn.execute(
+            """
+            UPDATE user_sessions
+            SET session_status = ?,
+                logout_at = ?,
+                ended_reason = ?,
+                updated_at = ?
+            WHERE session_id = ?
+            """,
+            (
+                "ENDED",
+                ts,
+                "SESSION_EXPIRED_INACTIVITY_SWEEP",
+                ts,
+                session["session_id"],
+            )
+        )
+
+    audit_event(
+        conn,
+        entity_type="UserSession",
+        entity_id="session_expiry_sweep",
+        action="SWEEP_EXPIRED_SESSIONS",
+        summary=f"Session expiry sweep ended {len(expired)} inactive sessions after {inactive_minutes} minutes.",
+        organisation_id=None,
+    )
+
+    conn.commit()
+
+    ended_sessions = conn.execute(
+        """
+        SELECT *
+        FROM user_sessions
+        WHERE ended_reason = 'SESSION_EXPIRED_INACTIVITY_SWEEP'
+          AND logout_at = ?
+        ORDER BY logout_at DESC
+        """,
+        (ts,)
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "sweep_type": "SESSION_EXPIRY_SWEEP",
+        "inactive_minutes": inactive_minutes,
+        "cutoff_last_seen_before": cutoff,
+        "swept_by_display_name": swept_by_display_name,
+        "expired_session_count": len(ended_sessions),
+        "expired_sessions": [dict(row) for row in ended_sessions],
+        "rule": "Inactive active sessions are ended so Login Integrity Guard has an accurate live-session picture.",
+    }), 200
+
+# === SESSION EXPIRY SWEEP V0.1 END ===
+
+
+
 
 
 
