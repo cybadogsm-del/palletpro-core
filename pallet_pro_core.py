@@ -12470,6 +12470,125 @@ def sweep_expired_temporary_users():
 
 # === TEMPORARY USER EXPIRY SWEEP V0.1 END ===
 
+# === ACCESS OPERATIONS DASHBOARD V0.1 START ===
+
+@app.get("/global-admin/access-operations-dashboard")
+def get_access_operations_dashboard():
+    conn = get_conn()
+    ensure_user_access_tables(conn)
+    ensure_login_integrity_tables(conn)
+    ensure_login_integrity_action_tables(conn)
+    ensure_subscription_guard_tables(conn)
+
+    active_sessions = conn.execute(
+        """
+        SELECT
+            s.*,
+            u.display_name,
+            u.email,
+            u.role,
+            o.name AS organisation_name
+        FROM user_sessions s
+        LEFT JOIN user_accounts u ON u.user_id = s.user_id
+        LEFT JOIN organisations o ON o.organisation_id = s.organisation_id
+        WHERE s.session_status = 'ACTIVE'
+        ORDER BY s.last_seen_at DESC
+        LIMIT 50
+        """
+    ).fetchall()
+
+    open_login_actions = conn.execute(
+        """
+        SELECT
+            a.*,
+            e.risk_level,
+            e.risk_score,
+            e.event_type,
+            u.display_name,
+            u.email,
+            u.role,
+            o.name AS organisation_name
+        FROM login_integrity_admin_actions a
+        LEFT JOIN login_integrity_events e ON e.login_integrity_event_id = a.login_integrity_event_id
+        LEFT JOIN user_accounts u ON u.user_id = a.user_id
+        LEFT JOIN organisations o ON o.organisation_id = a.organisation_id
+        WHERE a.action_status = 'OPEN'
+        ORDER BY a.created_at ASC
+        LIMIT 50
+        """
+    ).fetchall()
+
+    temporary_access_summary = conn.execute(
+        """
+        SELECT
+            access_status,
+            COUNT(*) AS count,
+            COALESCE(SUM(fee_cents), 0) AS fee_cents_total
+        FROM temporary_user_access
+        GROUP BY access_status
+        ORDER BY access_status ASC
+        """
+    ).fetchall()
+
+    user_status_summary = conn.execute(
+        """
+        SELECT
+            role,
+            access_status,
+            COUNT(*) AS count
+        FROM user_accounts
+        GROUP BY role, access_status
+        ORDER BY role ASC, access_status ASC
+        """
+    ).fetchall()
+
+    retention_summary = conn.execute(
+        """
+        SELECT
+            job_type,
+            job_status,
+            COUNT(*) AS count
+        FROM data_retention_jobs
+        GROUP BY job_type, job_status
+        ORDER BY job_type ASC, job_status ASC
+        """
+    ).fetchall()
+
+    login_report_summary = conn.execute(
+        """
+        SELECT
+            risk_level,
+            review_status,
+            COUNT(*) AS count
+        FROM login_integrity_events
+        GROUP BY risk_level, review_status
+        ORDER BY risk_level ASC, review_status ASC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "dashboard_type": "GLOBAL_ADMIN_ACCESS_OPERATIONS_DASHBOARD",
+        "active_session_count": len(active_sessions),
+        "open_login_integrity_action_count": len(open_login_actions),
+        "active_sessions": [dict(row) for row in active_sessions],
+        "open_login_integrity_actions": [dict(row) for row in open_login_actions],
+        "temporary_access_summary": [dict(row) for row in temporary_access_summary],
+        "user_status_summary": [dict(row) for row in user_status_summary],
+        "retention_job_summary": [dict(row) for row in retention_summary],
+        "login_report_summary": [dict(row) for row in login_report_summary],
+        "rules": [
+            "Global Admin sees access operations across sessions, users, temporary access, retention jobs, and login integrity actions.",
+            "AI reports remain advisory only.",
+            "Global Admin decides the course of action.",
+        ],
+    }), 200
+
+# === ACCESS OPERATIONS DASHBOARD V0.1 END ===
+
+
+
 
 
 
