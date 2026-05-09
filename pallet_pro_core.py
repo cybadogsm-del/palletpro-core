@@ -9408,6 +9408,126 @@ def preview_due_data_retention_jobs():
 
 # === DATA RETENTION PREVIEW V0.1 END ===
 
+# === DATA RETENTION EXECUTE V0.1 START ===
+
+@app.post("/global-admin/data-retention-execute")
+def execute_due_data_retention_jobs():
+    body = request.get_json(silent=True) or {}
+    confirmation_text = (body.get("confirmation_text") or "").strip()
+    organisation_id = body.get("organisation_id")
+    as_of = body.get("as_of") or now_iso()
+    executed_by_display_name = (body.get("executed_by_display_name") or "Global Admin").strip()
+
+    required_confirmation = "DELETE OPERATING DATA"
+
+    if confirmation_text != required_confirmation:
+        return jsonify({
+            "error": "Confirmation text is required before deleting operating data",
+            "required_confirmation_text": required_confirmation,
+            "received_confirmation_text": confirmation_text,
+            "rule": "This is a destructive action. It will not run without the exact confirmation phrase.",
+        }), 400
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    sql = """
+        SELECT
+            j.*,
+            o.name AS organisation_name
+        FROM data_retention_jobs j
+        LEFT JOIN organisations o ON o.organisation_id = j.organisation_id
+        WHERE j.job_status = 'SCHEDULED'
+          AND j.job_type = 'DELETE_OPERATING_DATA'
+          AND j.scheduled_for <= ?
+    """
+    params = [as_of]
+
+    if organisation_id:
+        sql += " AND j.organisation_id = ?"
+        params.append(organisation_id)
+
+    sql += " ORDER BY j.scheduled_for ASC"
+
+    jobs = conn.execute(sql, params).fetchall()
+
+    executed_jobs = []
+
+    for job in jobs:
+        job_dict = dict(job)
+        org_id = job_dict["organisation_id"]
+
+        table_counts_before = {}
+        table_counts_deleted = {}
+        total_deleted = 0
+
+        for table in get_operating_data_tables_for_retention():
+            before_count = count_org_rows_for_table(conn, table, org_id)
+            table_counts_before[table] = before_count
+
+            if before_count == 0:
+                table_counts_deleted[table] = 0
+                continue
+
+            conn.execute(
+                f"DELETE FROM {table} WHERE organisation_id = ?",
+                (org_id,)
+            )
+
+            after_count = count_org_rows_for_table(conn, table, org_id)
+            deleted_count = before_count - after_count
+            table_counts_deleted[table] = deleted_count
+            total_deleted += deleted_count
+
+        completed_at = now_iso()
+
+        conn.execute(
+            """
+            UPDATE data_retention_jobs
+            SET job_status = ?,
+                completed_at = ?
+            WHERE data_retention_job_id = ?
+            """,
+            ("COMPLETED", completed_at, job_dict["data_retention_job_id"])
+        )
+
+        audit_event(
+            conn,
+            entity_type="DataRetentionJob",
+            entity_id=job_dict["data_retention_job_id"],
+            action="EXECUTE_DELETE_OPERATING_DATA",
+            summary=f"Operating data deletion executed for unsubscribed organisation. Rows deleted: {total_deleted}.",
+            organisation_id=org_id,
+        )
+
+        executed_jobs.append({
+            "data_retention_job_id": job_dict["data_retention_job_id"],
+            "organisation_id": org_id,
+            "organisation_name": job_dict.get("organisation_name"),
+            "job_type": job_dict["job_type"],
+            "job_status": "COMPLETED",
+            "completed_at": completed_at,
+            "rows_deleted_total": total_deleted,
+            "table_counts_before": table_counts_before,
+            "table_counts_deleted": table_counts_deleted,
+        })
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "execution_type": "DATA_RETENTION_DELETE_OPERATING_DATA",
+        "as_of": as_of,
+        "executed_by_display_name": executed_by_display_name,
+        "executed_job_count": len(executed_jobs),
+        "executed_jobs": executed_jobs,
+        "rule": "Only operating data is deleted by this endpoint. Historical organisation/account records are retained separately according to the 7-year retention rule.",
+    }), 200
+
+# === DATA RETENTION EXECUTE V0.1 END ===
+
+
+
 
 
 
