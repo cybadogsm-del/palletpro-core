@@ -9151,6 +9151,116 @@ def get_third_party_biller_payload(billing_export_run_id):
 
 # === THIRD PARTY BILLER PAYLOAD V0.1 END ===
 
+# === OPERATING DATA EXPORT V0.1 START ===
+
+def table_exists(conn, table_name):
+    row = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = ?
+        """,
+        (table_name,)
+    ).fetchone()
+    return row is not None
+
+
+def export_table_for_org(conn, table_name, organisation_id):
+    if not table_exists(conn, table_name):
+        return []
+
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+
+    if "organisation_id" not in cols:
+        return []
+
+    rows = conn.execute(
+        f"SELECT * FROM {table_name} WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+@app.get("/organisations/<organisation_id>/operating-data-export")
+def export_organisation_operating_data(organisation_id):
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    access = get_org_access_status_payload(conn, organisation_id)
+
+    if not access["normal_access_allowed"] and not access["exit_only_access_allowed"]:
+        conn.close()
+        return jsonify({
+            "error": "Operating data export is no longer available",
+            "organisation_id": organisation_id,
+            "access_state": access["access_state"],
+            "reason": access["reason"],
+        }), 403
+
+    export_tables = [
+        "depots",
+        "resources",
+        "partners",
+        "partner_addresses",
+        "transactions",
+        "ledger_entries",
+        "balance_projection",
+        "shared_transactions",
+        "shared_transaction_partner_addresses",
+        "temporary_user_access",
+        "pending_approval_entries",
+        "audit_events",
+    ]
+
+    exported_data = {}
+    counts = {}
+
+    for table in export_tables:
+        rows = export_table_for_org(conn, table, organisation_id)
+        exported_data[table] = rows
+        counts[table] = len(rows)
+
+    subscription = conn.execute(
+        """
+        SELECT *
+        FROM organisation_subscriptions
+        WHERE organisation_id = ?
+        """,
+        (organisation_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "export_type": "PALLET_PRO_OPERATING_DATA_EXPORT",
+        "organisation_id": organisation_id,
+        "organisation_name": org["name"],
+        "generated_at": now_iso(),
+        "access_state": access["access_state"],
+        "normal_access_allowed": access["normal_access_allowed"],
+        "exit_only_access_allowed": access["exit_only_access_allowed"],
+        "operating_data_delete_after": access["subscription"]["operating_data_delete_after"] if access["subscription"] else None,
+        "subscription": access["subscription"],
+        "counts": counts,
+        "data": exported_data,
+        "rule": "During the unsubscribe retention window, an organisation may export operating data before scheduled deletion.",
+    }), 200
+
+# === OPERATING DATA EXPORT V0.1 END ===
+
+
+
 
 
 
