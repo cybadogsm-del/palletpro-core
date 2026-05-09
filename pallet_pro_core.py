@@ -10838,6 +10838,577 @@ def get_transaction_submitter_display_snapshot(conn, submitted_by_user_id, fallb
 
 # === TRANSACTION USER ATTRIBUTION V0.1 END ===
 
+# === LOGIN INTEGRITY GUARD V0.1 START ===
+
+ONE_DEVICE_ROLES = {
+    "USER",
+    "TEMPORARY_USER",
+}
+
+MULTI_DEVICE_ALLOWED_ROLES = {
+    "ORG_ADMIN",
+    "GLOBAL_ADMIN",
+    "SUPER_GLOBAL_ADMIN",
+}
+
+
+def ensure_login_integrity_tables(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS user_sessions (
+        session_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        organisation_id TEXT,
+        role TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        device_label TEXT,
+        ip_address_hash TEXT,
+        user_agent_hash TEXT,
+        session_status TEXT NOT NULL,
+        login_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        logout_at TEXT,
+        ended_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS login_integrity_events (
+        login_integrity_event_id TEXT PRIMARY KEY,
+        organisation_id TEXT,
+        user_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        risk_level TEXT NOT NULL,
+        risk_score INTEGER NOT NULL,
+        summary TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        ai_report_summary TEXT NOT NULL,
+        review_status TEXT NOT NULL,
+        global_admin_only INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+
+def create_login_integrity_event(
+    conn,
+    organisation_id,
+    user_id,
+    event_type,
+    risk_level,
+    risk_score,
+    summary,
+    evidence,
+    ai_report_summary,
+):
+    import json
+
+    ensure_login_integrity_tables(conn)
+    ts = now_iso()
+
+    event_id = make_id("lie")
+
+    conn.execute(
+        """
+        INSERT INTO login_integrity_events (
+            login_integrity_event_id,
+            organisation_id,
+            user_id,
+            event_type,
+            risk_level,
+            risk_score,
+            summary,
+            evidence_json,
+            ai_report_summary,
+            review_status,
+            global_admin_only,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_id,
+            organisation_id,
+            user_id,
+            event_type,
+            risk_level,
+            risk_score,
+            summary,
+            json.dumps(evidence, sort_keys=True),
+            ai_report_summary,
+            "OPEN",
+            1,
+            ts,
+            ts,
+        )
+    )
+
+    return event_id
+
+
+def build_login_integrity_ai_report(event_type, role, active_session_count, ended_session_count, device_id, device_label):
+    if event_type == "ONE_DEVICE_RULE_PREVIOUS_SESSION_ENDED":
+        return (
+            "Login Integrity Guard detected a standard/temporary user logging in from a new device while another "
+            "session was active. The previous session was ended to preserve one-user-one-device integrity. "
+            "Global Admin should review only if this repeats or appears connected to shared login behaviour."
+        )
+
+    if event_type == "ADMIN_MULTI_DEVICE_ACTIVITY":
+        return (
+            "Login Integrity Guard detected multi-device activity for an admin role. This is allowed, but recorded "
+            "for Global Admin visibility because admin accounts have wider authority."
+        )
+
+    return (
+        "Login Integrity Guard created a report for Global Admin review. AI reports are advisory only. "
+        "Global Admin decides any action."
+    )
+
+
+@app.post("/sessions/login")
+def create_user_session():
+    body = request.get_json(silent=True) or {}
+
+    user_id = body.get("user_id")
+    device_id = (body.get("device_id") or "").strip()
+    device_label = (body.get("device_label") or "").strip() or None
+    ip_address_hash = (body.get("ip_address_hash") or "").strip() or None
+    user_agent_hash = (body.get("user_agent_hash") or "").strip() or None
+
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+
+    if not device_id:
+        return jsonify({"error": "device_id is required"}), 400
+
+    conn = get_conn()
+    ensure_user_access_tables(conn)
+    ensure_login_integrity_tables(conn)
+
+    user = get_user_account(conn, user_id)
+
+    if not user:
+        conn.close()
+        return jsonify({"error": "User not found"}), 404
+
+    policy = build_user_access_policy(conn, user)
+
+    if not policy["can_use_platform"]:
+        conn.close()
+        return jsonify({
+            "error": "User cannot log in",
+            "access_policy": policy,
+        }), 403
+
+    ts = now_iso()
+    role = user["role"]
+    organisation_id = user["organisation_id"]
+
+    existing_active_sessions = conn.execute(
+        """
+        SELECT *
+        FROM user_sessions
+        WHERE user_id = ?
+          AND session_status = 'ACTIVE'
+        ORDER BY login_at ASC
+        """,
+        (user_id,)
+    ).fetchall()
+
+    ended_sessions = []
+
+    if role in ONE_DEVICE_ROLES:
+        for session in existing_active_sessions:
+            if session["device_id"] != device_id:
+                conn.execute(
+                    """
+                    UPDATE user_sessions
+                    SET session_status = ?,
+                        logout_at = ?,
+                        ended_reason = ?,
+                        updated_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (
+                        "ENDED",
+                        ts,
+                        "ONE_DEVICE_RULE_NEW_LOGIN",
+                        ts,
+                        session["session_id"],
+                    )
+                )
+                ended_sessions.append(dict(session))
+
+        if ended_sessions:
+            create_login_integrity_event(
+                conn=conn,
+                organisation_id=organisation_id,
+                user_id=user_id,
+                event_type="ONE_DEVICE_RULE_PREVIOUS_SESSION_ENDED",
+                risk_level="MEDIUM",
+                risk_score=55,
+                summary="One-user-one-device rule ended previous active session for standard/temporary user.",
+                evidence={
+                    "role": role,
+                    "new_device_id": device_id,
+                    "new_device_label": device_label,
+                    "ended_session_ids": [s["session_id"] for s in ended_sessions],
+                    "ended_device_ids": [s["device_id"] for s in ended_sessions],
+                    "active_session_count_before_login": len(existing_active_sessions),
+                },
+                ai_report_summary=build_login_integrity_ai_report(
+                    "ONE_DEVICE_RULE_PREVIOUS_SESSION_ENDED",
+                    role,
+                    len(existing_active_sessions),
+                    len(ended_sessions),
+                    device_id,
+                    device_label,
+                ),
+            )
+
+    elif role in MULTI_DEVICE_ALLOWED_ROLES and len(existing_active_sessions) >= 1:
+        create_login_integrity_event(
+            conn=conn,
+            organisation_id=organisation_id,
+            user_id=user_id,
+            event_type="ADMIN_MULTI_DEVICE_ACTIVITY",
+            risk_level="LOW",
+            risk_score=20,
+            summary="Admin user logged in while another active session already existed.",
+            evidence={
+                "role": role,
+                "new_device_id": device_id,
+                "new_device_label": device_label,
+                "active_session_count_before_login": len(existing_active_sessions),
+                "existing_session_ids": [s["session_id"] for s in existing_active_sessions],
+            },
+            ai_report_summary=build_login_integrity_ai_report(
+                "ADMIN_MULTI_DEVICE_ACTIVITY",
+                role,
+                len(existing_active_sessions),
+                0,
+                device_id,
+                device_label,
+            ),
+        )
+
+    # Reuse same active session on same device when possible.
+    same_device_session = conn.execute(
+        """
+        SELECT *
+        FROM user_sessions
+        WHERE user_id = ?
+          AND device_id = ?
+          AND session_status = 'ACTIVE'
+        ORDER BY login_at DESC
+        LIMIT 1
+        """,
+        (user_id, device_id)
+    ).fetchone()
+
+    if same_device_session:
+        conn.execute(
+            """
+            UPDATE user_sessions
+            SET last_seen_at = ?,
+                updated_at = ?
+            WHERE session_id = ?
+            """,
+            (ts, ts, same_device_session["session_id"])
+        )
+
+        session_id = same_device_session["session_id"]
+    else:
+        session_id = make_id("sess")
+
+        conn.execute(
+            """
+            INSERT INTO user_sessions (
+                session_id,
+                user_id,
+                organisation_id,
+                role,
+                device_id,
+                device_label,
+                ip_address_hash,
+                user_agent_hash,
+                session_status,
+                login_at,
+                last_seen_at,
+                logout_at,
+                ended_reason,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                user_id,
+                organisation_id,
+                role,
+                device_id,
+                device_label,
+                ip_address_hash,
+                user_agent_hash,
+                "ACTIVE",
+                ts,
+                ts,
+                None,
+                None,
+                ts,
+                ts,
+            )
+        )
+
+    conn.commit()
+
+    session = conn.execute(
+        "SELECT * FROM user_sessions WHERE session_id = ?",
+        (session_id,)
+    ).fetchone()
+
+    active_sessions_now = conn.execute(
+        """
+        SELECT *
+        FROM user_sessions
+        WHERE user_id = ?
+          AND session_status = 'ACTIVE'
+        ORDER BY login_at DESC
+        """,
+        (user_id,)
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "session": dict(session),
+        "user": dict(user),
+        "access_policy": policy,
+        "one_device_rule_applies": role in ONE_DEVICE_ROLES,
+        "multi_device_allowed": role in MULTI_DEVICE_ALLOWED_ROLES,
+        "ended_previous_session_count": len(ended_sessions),
+        "active_session_count": len(active_sessions_now),
+        "rule": "Standard and temporary users are limited to one active device. Org/Admin roles may use multiple devices but are monitored.",
+    }), 201
+
+
+@app.post("/sessions/<session_id>/logout")
+def logout_user_session(session_id):
+    body = request.get_json(silent=True) or {}
+    ended_reason = (body.get("ended_reason") or "USER_LOGOUT").strip()
+
+    conn = get_conn()
+    ensure_login_integrity_tables(conn)
+
+    session = conn.execute(
+        "SELECT * FROM user_sessions WHERE session_id = ?",
+        (session_id,)
+    ).fetchone()
+
+    if not session:
+        conn.close()
+        return jsonify({"error": "Session not found"}), 404
+
+    ts = now_iso()
+
+    conn.execute(
+        """
+        UPDATE user_sessions
+        SET session_status = ?,
+            logout_at = ?,
+            ended_reason = ?,
+            updated_at = ?
+        WHERE session_id = ?
+        """,
+        (
+            "ENDED",
+            ts,
+            ended_reason,
+            ts,
+            session_id,
+        )
+    )
+
+    conn.commit()
+
+    updated = conn.execute(
+        "SELECT * FROM user_sessions WHERE session_id = ?",
+        (session_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "session": dict(updated),
+        "message": "Session ended.",
+    }), 200
+
+
+@app.get("/users/<user_id>/sessions")
+def list_user_sessions(user_id):
+    conn = get_conn()
+    ensure_login_integrity_tables(conn)
+    ensure_user_access_tables(conn)
+
+    user = get_user_account(conn, user_id)
+
+    if not user:
+        conn.close()
+        return jsonify({"error": "User not found"}), 404
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM user_sessions
+        WHERE user_id = ?
+        ORDER BY login_at DESC
+        """,
+        (user_id,)
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "user": dict(user),
+        "count": len(rows),
+        "items": [dict(row) for row in rows],
+    }), 200
+
+
+@app.get("/global-admin/login-integrity-reports")
+def list_login_integrity_reports():
+    organisation_id = request.args.get("organisation_id")
+    user_id = request.args.get("user_id")
+    review_status = request.args.get("review_status")
+    risk_level = request.args.get("risk_level")
+
+    conn = get_conn()
+    ensure_login_integrity_tables(conn)
+
+    sql = """
+        SELECT
+            e.*,
+            u.display_name,
+            u.email,
+            u.role,
+            o.name AS organisation_name
+        FROM login_integrity_events e
+        LEFT JOIN user_accounts u ON u.user_id = e.user_id
+        LEFT JOIN organisations o ON o.organisation_id = e.organisation_id
+        WHERE e.global_admin_only = 1
+    """
+    params = []
+
+    if organisation_id:
+        sql += " AND e.organisation_id = ?"
+        params.append(organisation_id)
+
+    if user_id:
+        sql += " AND e.user_id = ?"
+        params.append(user_id)
+
+    if review_status:
+        sql += " AND e.review_status = ?"
+        params.append(review_status)
+
+    if risk_level:
+        sql += " AND e.risk_level = ?"
+        params.append(risk_level)
+
+    sql += " ORDER BY e.created_at DESC"
+
+    rows = conn.execute(sql, params).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "report_type": "GLOBAL_ADMIN_LOGIN_INTEGRITY_REPORTS",
+        "count": len(rows),
+        "items": [dict(row) for row in rows],
+        "rule": "Login integrity reports are for Global Admin eyes only. AI reports are advisory. Global Admin decides any course of action.",
+    }), 200
+
+
+@app.post("/global-admin/login-integrity-reports/<login_integrity_event_id>/review")
+def review_login_integrity_report(login_integrity_event_id):
+    body = request.get_json(silent=True) or {}
+    review_status = (body.get("review_status") or "").strip().upper()
+    reviewed_by_display_name = (body.get("reviewed_by_display_name") or "Global Admin").strip()
+    review_notes = (body.get("review_notes") or "").strip() or None
+
+    allowed_statuses = {"OPEN", "MONITORING", "DISMISSED", "ACTION_REQUIRED", "RESOLVED"}
+
+    if review_status not in allowed_statuses:
+        return jsonify({
+            "error": "Invalid review_status",
+            "allowed_statuses": sorted(allowed_statuses),
+        }), 400
+
+    conn = get_conn()
+    ensure_login_integrity_tables(conn)
+
+    event = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_events
+        WHERE login_integrity_event_id = ?
+        """,
+        (login_integrity_event_id,)
+    ).fetchone()
+
+    if not event:
+        conn.close()
+        return jsonify({"error": "Login integrity report not found"}), 404
+
+    ts = now_iso()
+
+    summary_suffix = f" Reviewed by {reviewed_by_display_name}."
+    if review_notes:
+        summary_suffix += f" Notes: {review_notes}"
+
+    conn.execute(
+        """
+        UPDATE login_integrity_events
+        SET review_status = ?,
+            summary = summary || ?,
+            updated_at = ?
+        WHERE login_integrity_event_id = ?
+        """,
+        (
+            review_status,
+            summary_suffix,
+            ts,
+            login_integrity_event_id,
+        )
+    )
+
+    conn.commit()
+
+    updated = conn.execute(
+        """
+        SELECT *
+        FROM login_integrity_events
+        WHERE login_integrity_event_id = ?
+        """,
+        (login_integrity_event_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "login_integrity_report": dict(updated),
+        "reviewed_by_display_name": reviewed_by_display_name,
+        "review_notes": review_notes,
+        "rule": "Global Admin reviews and decides the course of action. AI does not automatically penalise users or organisations.",
+    }), 200
+
+# === LOGIN INTEGRITY GUARD V0.1 END ===
+
+
+
 
 
 
