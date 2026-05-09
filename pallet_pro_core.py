@@ -12587,6 +12587,99 @@ def get_access_operations_dashboard():
 
 # === ACCESS OPERATIONS DASHBOARD V0.1 END ===
 
+# === ACCESS OPERATIONS HEALTH CHECK V0.1 START ===
+
+@app.get("/global-admin/access-operations-health")
+def get_access_operations_health():
+    conn = get_conn()
+    ensure_user_access_tables(conn)
+    ensure_login_integrity_tables(conn)
+    ensure_login_integrity_action_tables(conn)
+    ensure_subscription_guard_tables(conn)
+
+    active_sessions_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM user_sessions WHERE session_status = 'ACTIVE'"
+    ).fetchone()["c"]
+
+    open_actions_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM login_integrity_admin_actions WHERE action_status = 'OPEN'"
+    ).fetchone()["c"]
+
+    open_reports_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM login_integrity_events WHERE review_status IN ('OPEN', 'ACTION_REQUIRED', 'MONITORING')"
+    ).fetchone()["c"]
+
+    expired_temp_access_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM temporary_user_access WHERE access_status = 'EXPIRED'"
+    ).fetchone()["c"]
+
+    active_temp_access_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM temporary_user_access WHERE access_status = 'ACTIVE'"
+    ).fetchone()["c"]
+
+    due_retention_jobs_count = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM data_retention_jobs
+        WHERE job_status = 'SCHEDULED'
+          AND scheduled_for <= ?
+        """,
+        (now_iso(),)
+    ).fetchone()["c"]
+
+    suspended_users_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM user_accounts WHERE access_status = 'SUSPENDED'"
+    ).fetchone()["c"]
+
+    expired_users_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM user_accounts WHERE access_status = 'EXPIRED'"
+    ).fetchone()["c"]
+
+    status = "GREEN"
+    reasons = []
+
+    if due_retention_jobs_count > 0:
+        status = "AMBER"
+        reasons.append("There are due data-retention jobs awaiting review/execution.")
+
+    if open_actions_count > 0:
+        status = "AMBER"
+        reasons.append("There are open login-integrity admin actions.")
+
+    if open_reports_count > 5:
+        status = "AMBER"
+        reasons.append("There are multiple open login-integrity reports.")
+
+    if due_retention_jobs_count > 10 or open_actions_count > 10:
+        status = "RED"
+        reasons.append("There is a high volume of due retention or login-integrity work.")
+
+    if not reasons:
+        reasons.append("Access operations are healthy.")
+
+    conn.close()
+
+    return jsonify({
+        "health_type": "GLOBAL_ADMIN_ACCESS_OPERATIONS_HEALTH",
+        "status": status,
+        "reasons": reasons,
+        "metrics": {
+            "active_sessions_count": active_sessions_count,
+            "open_login_integrity_action_count": open_actions_count,
+            "open_login_integrity_report_count": open_reports_count,
+            "active_temporary_access_count": active_temp_access_count,
+            "expired_temporary_access_count": expired_temp_access_count,
+            "due_retention_jobs_count": due_retention_jobs_count,
+            "suspended_users_count": suspended_users_count,
+            "expired_users_count": expired_users_count,
+        },
+        "rule": "This endpoint summarises access operations health for Global Admin triage.",
+    }), 200
+
+# === ACCESS OPERATIONS HEALTH CHECK V0.1 END ===
+
+
+
 
 
 
