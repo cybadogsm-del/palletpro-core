@@ -8337,5 +8337,544 @@ def get_pending_approval_detail(pending_entry_id):
     return jsonify(dict(row)), 200
 
 
+
+# === SUBSCRIPTION GUARD V0.1 START ===
+
+PRICING_PHILOSOPHY_STATEMENT = {
+    "title": "Pallet Pro Pricing Philosophy",
+    "statement": "Pallet Pro’s pricing philosophy is simple: keep powerful pallet management accessible to SMEs.",
+    "principles": [
+        "To protect that philosophy and the integrity of customer data, each user should have their own login.",
+        "Shared logins weaken the audit trail because Pallet Pro depends on knowing who, where, and when.",
+        "If multiple people use one login, the who is no longer provable.",
+        "Distribution centres and warehousing operations, including those operated by transport companies, require custom pricing.",
+        "Temporary users receive 28 days of access from the day after activation.",
+        "Temporary user fees are charged on the customer’s next billing cycle, while the access period is calculated from the temporary user’s activation date.",
+        "Pallet Pro must be easy to unsubscribe from, and unsubscribed organisations must not be included in future billing exports.",
+    ],
+}
+
+
+def ensure_subscription_guard_tables(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pricing_settings (
+        pricing_settings_id TEXT PRIMARY KEY,
+        temporary_user_access_fee_cents INTEGER NOT NULL,
+        temporary_access_days INTEGER NOT NULL,
+        gst_rate_percent REAL NOT NULL,
+        currency TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS pricing_plans (
+        pricing_plan_id TEXT PRIMARY KEY,
+        plan_name TEXT NOT NULL,
+        plan_type TEXT NOT NULL,
+        min_permanent_users INTEGER,
+        max_permanent_users INTEGER,
+        price_per_user_cents INTEGER,
+        package_price_cents INTEGER,
+        requires_custom_pricing INTEGER NOT NULL DEFAULT 0,
+        sort_order INTEGER NOT NULL,
+        notes TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS organisation_subscriptions (
+        organisation_id TEXT PRIMARY KEY,
+        subscription_mode TEXT NOT NULL,
+        subscription_status TEXT NOT NULL,
+        billing_status TEXT NOT NULL,
+        do_not_bill INTEGER NOT NULL DEFAULT 0,
+        billing_anniversary_day INTEGER,
+        pricing_plan_id TEXT,
+        custom_pricing_notes TEXT,
+        unsubscribed_at TEXT,
+        unsubscribed_by_display_name TEXT,
+        operating_data_delete_after TEXT,
+        historical_data_delete_after TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS temporary_user_access (
+        temporary_user_access_id TEXT PRIMARY KEY,
+        organisation_id TEXT NOT NULL,
+        user_display_name TEXT,
+        user_email TEXT,
+        access_status TEXT NOT NULL,
+        fee_cents INTEGER NOT NULL,
+        access_days INTEGER NOT NULL,
+        activated_at TEXT,
+        access_starts_at TEXT,
+        access_ends_at TEXT,
+        charged_on_next_billing_cycle INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS billing_export_runs (
+        billing_export_run_id TEXT PRIMARY KEY,
+        export_status TEXT NOT NULL,
+        export_type TEXT NOT NULL,
+        created_by_display_name TEXT,
+        billing_period_start TEXT,
+        billing_period_end TEXT,
+        organisation_count INTEGER NOT NULL,
+        do_not_bill_excluded_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS unsubscribe_events (
+        unsubscribe_event_id TEXT PRIMARY KEY,
+        organisation_id TEXT NOT NULL,
+        unsubscribed_by_display_name TEXT,
+        reason_text TEXT,
+        billing_stopped_at TEXT NOT NULL,
+        operating_data_delete_after TEXT NOT NULL,
+        historical_data_delete_after TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS data_retention_jobs (
+        data_retention_job_id TEXT PRIMARY KEY,
+        organisation_id TEXT NOT NULL,
+        job_type TEXT NOT NULL,
+        scheduled_for TEXT NOT NULL,
+        job_status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+    )
+    """)
+
+    ts = now_iso()
+
+    existing_settings = conn.execute(
+        "SELECT pricing_settings_id FROM pricing_settings LIMIT 1"
+    ).fetchone()
+
+    if not existing_settings:
+        conn.execute(
+            """
+            INSERT INTO pricing_settings (
+                pricing_settings_id,
+                temporary_user_access_fee_cents,
+                temporary_access_days,
+                gst_rate_percent,
+                currency,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "pricing_settings_default",
+                1000,
+                28,
+                10.0,
+                "AUD",
+                ts,
+                ts,
+            )
+        )
+
+    existing_plans = conn.execute(
+        "SELECT COUNT(*) AS c FROM pricing_plans"
+    ).fetchone()["c"]
+
+    if existing_plans == 0:
+        default_plans = [
+            ("plan_starter", "Starter", "STANDARD_PACKAGE", 1, 3, None, None, 0, 10, "Entry SME package."),
+            ("plan_small", "Small", "STANDARD_PACKAGE", 4, 10, None, None, 0, 20, "Growing SME package."),
+            ("plan_medium", "Medium", "STANDARD_PACKAGE", 11, 25, None, None, 0, 30, "Active SME operations."),
+            ("plan_large", "Large", "STANDARD_PACKAGE", 26, 50, None, None, 0, 40, "Larger SME operations."),
+            ("plan_custom_warehouse", "Distribution Centre / Warehousing Custom Pricing", "CUSTOM", None, None, None, None, 1, 90, "Distribution centres and warehousing operations, including those operated by transport companies, require custom pricing."),
+            ("plan_temp_user_access", "Temporary User Access Fee", "TEMPORARY_ACCESS_FEE", None, None, None, 1000, 0, 999, "Temporary users receive 28 days of access from the day after activation. Fee is charged on the customer's next billing cycle."),
+        ]
+
+        conn.executemany(
+            """
+            INSERT INTO pricing_plans (
+                pricing_plan_id,
+                plan_name,
+                plan_type,
+                min_permanent_users,
+                max_permanent_users,
+                price_per_user_cents,
+                package_price_cents,
+                requires_custom_pricing,
+                sort_order,
+                notes,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [row + (ts, ts) for row in default_plans]
+        )
+
+
+def get_or_create_subscription(conn, organisation_id):
+    ensure_subscription_guard_tables(conn)
+
+    sub = conn.execute(
+        "SELECT * FROM organisation_subscriptions WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if sub:
+        return sub
+
+    ts = now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO organisation_subscriptions (
+            organisation_id,
+            subscription_mode,
+            subscription_status,
+            billing_status,
+            do_not_bill,
+            billing_anniversary_day,
+            pricing_plan_id,
+            custom_pricing_notes,
+            unsubscribed_at,
+            unsubscribed_by_display_name,
+            operating_data_delete_after,
+            historical_data_delete_after,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            organisation_id,
+            "STANDARD",
+            "ACTIVE",
+            "BILLABLE",
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ts,
+            ts,
+        )
+    )
+
+    return conn.execute(
+        "SELECT * FROM organisation_subscriptions WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+
+@app.get("/pricing-philosophy")
+def get_pricing_philosophy():
+    return jsonify(PRICING_PHILOSOPHY_STATEMENT), 200
+
+
+@app.get("/pricing-table")
+def get_pricing_table():
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+    conn.commit()
+
+    settings = conn.execute(
+        "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
+    ).fetchone()
+
+    plans = conn.execute(
+        """
+        SELECT *
+        FROM pricing_plans
+        WHERE is_active = 1
+        ORDER BY sort_order ASC, plan_name ASC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    return jsonify({
+        "pricing_philosophy": PRICING_PHILOSOPHY_STATEMENT,
+        "settings": dict(settings) if settings else None,
+        "items": [dict(row) for row in plans],
+    }), 200
+
+
+@app.post("/global-admin/billing-export-preview")
+def billing_export_preview():
+    body = request.get_json(silent=True) or {}
+    billing_period_start = body.get("billing_period_start")
+    billing_period_end = body.get("billing_period_end")
+    created_by_display_name = (body.get("created_by_display_name") or "Global Admin").strip()
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    orgs = conn.execute(
+        """
+        SELECT
+            o.organisation_id,
+            o.name AS organisation_name,
+            COALESCE(s.subscription_mode, 'STANDARD') AS subscription_mode,
+            COALESCE(s.subscription_status, 'ACTIVE') AS subscription_status,
+            COALESCE(s.billing_status, 'BILLABLE') AS billing_status,
+            COALESCE(s.do_not_bill, 0) AS do_not_bill,
+            s.unsubscribed_at,
+            s.pricing_plan_id
+        FROM organisations o
+        LEFT JOIN organisation_subscriptions s
+            ON s.organisation_id = o.organisation_id
+        ORDER BY o.name ASC
+        """
+    ).fetchall()
+
+    export_items = []
+    excluded = []
+
+    for row in orgs:
+        d = dict(row)
+
+        if d["do_not_bill"] == 1 or d["subscription_status"] in ("CANCELLED", "UNSUBSCRIBED") or d["billing_status"] == "DO_NOT_BILL":
+            excluded.append({
+                "organisation_id": d["organisation_id"],
+                "organisation_name": d["organisation_name"],
+                "reason": "Organisation is marked do-not-bill / unsubscribed.",
+            })
+            continue
+
+        export_items.append({
+            "organisation_id": d["organisation_id"],
+            "organisation_name": d["organisation_name"],
+            "subscription_mode": d["subscription_mode"],
+            "subscription_status": d["subscription_status"],
+            "billing_status": d["billing_status"],
+            "pricing_plan_id": d["pricing_plan_id"],
+            "billing_period_start": billing_period_start,
+            "billing_period_end": billing_period_end,
+            "currency": "AUD",
+            "amount_cents": 0,
+            "gst_cents": 0,
+            "billing_instruction": "PREVIEW_ONLY",
+        })
+
+    run_id = make_id("bexp")
+    ts = now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO billing_export_runs (
+            billing_export_run_id,
+            export_status,
+            export_type,
+            created_by_display_name,
+            billing_period_start,
+            billing_period_end,
+            organisation_count,
+            do_not_bill_excluded_count,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            "PREVIEW",
+            "THIRD_PARTY_BILLER",
+            created_by_display_name,
+            billing_period_start,
+            billing_period_end,
+            len(export_items),
+            len(excluded),
+            ts,
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "billing_export_run_id": run_id,
+        "export_status": "PREVIEW",
+        "export_type": "THIRD_PARTY_BILLER",
+        "organisation_count": len(export_items),
+        "do_not_bill_excluded_count": len(excluded),
+        "items": export_items,
+        "excluded": excluded,
+        "rule": "Organisations marked unsubscribed or do-not-bill must not be exported for billing.",
+    }), 200
+
+
+@app.post("/organisations/<organisation_id>/unsubscribe")
+def unsubscribe_organisation(organisation_id):
+    from datetime import datetime, timedelta
+
+    body = request.get_json(silent=True) or {}
+    unsubscribed_by_display_name = (body.get("unsubscribed_by_display_name") or "Org Admin").strip()
+    reason_text = (body.get("reason_text") or "").strip() or None
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    ts = now_iso()
+    now_dt = datetime.fromisoformat(ts)
+    operating_delete_after = (now_dt + timedelta(days=7)).isoformat()
+    historical_delete_after = (now_dt + timedelta(days=365 * 7)).isoformat()
+
+    get_or_create_subscription(conn, organisation_id)
+
+    conn.execute(
+        """
+        UPDATE organisation_subscriptions
+        SET subscription_mode = ?,
+            subscription_status = ?,
+            billing_status = ?,
+            do_not_bill = ?,
+            unsubscribed_at = ?,
+            unsubscribed_by_display_name = ?,
+            operating_data_delete_after = ?,
+            historical_data_delete_after = ?,
+            updated_at = ?
+        WHERE organisation_id = ?
+        """,
+        (
+            "CANCELLED",
+            "CANCELLED",
+            "DO_NOT_BILL",
+            1,
+            ts,
+            unsubscribed_by_display_name,
+            operating_delete_after,
+            historical_delete_after,
+            ts,
+            organisation_id,
+        )
+    )
+
+    unsubscribe_event_id = make_id("unsub")
+    conn.execute(
+        """
+        INSERT INTO unsubscribe_events (
+            unsubscribe_event_id,
+            organisation_id,
+            unsubscribed_by_display_name,
+            reason_text,
+            billing_stopped_at,
+            operating_data_delete_after,
+            historical_data_delete_after,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            unsubscribe_event_id,
+            organisation_id,
+            unsubscribed_by_display_name,
+            reason_text,
+            ts,
+            operating_delete_after,
+            historical_delete_after,
+            ts,
+        )
+    )
+
+    conn.execute(
+        """
+        INSERT INTO data_retention_jobs (
+            data_retention_job_id,
+            organisation_id,
+            job_type,
+            scheduled_for,
+            job_status,
+            created_at,
+            completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            make_id("ret"),
+            organisation_id,
+            "DELETE_OPERATING_DATA",
+            operating_delete_after,
+            "SCHEDULED",
+            ts,
+            None,
+        )
+    )
+
+    conn.execute(
+        """
+        INSERT INTO data_retention_jobs (
+            data_retention_job_id,
+            organisation_id,
+            job_type,
+            scheduled_for,
+            job_status,
+            created_at,
+            completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            make_id("ret"),
+            organisation_id,
+            "DELETE_HISTORICAL_ACCOUNT_DATA",
+            historical_delete_after,
+            "SCHEDULED",
+            ts,
+            None,
+        )
+    )
+
+    audit_event(
+        conn,
+        entity_type="OrganisationSubscription",
+        entity_id=organisation_id,
+        action="UNSUBSCRIBE",
+        summary="Organisation unsubscribed. Billing stopped immediately and data retention jobs scheduled.",
+        organisation_id=organisation_id,
+    )
+
+    conn.commit()
+
+    sub = conn.execute(
+        "SELECT * FROM organisation_subscriptions WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "organisation_id": organisation_id,
+        "organisation_name": org["name"],
+        "unsubscribe_event_id": unsubscribe_event_id,
+        "subscription": dict(sub),
+        "billing_rule": "This organisation is marked DO_NOT_BILL and must not be included in future billing exports.",
+        "operating_data_rule": "Operating data is retained for 7 days after unsubscribe, then scheduled for deletion.",
+        "historical_data_rule": "Minimal historical organisation and billing records are retained for 7 years, then scheduled for deletion.",
+    }), 200
+
+# === SUBSCRIPTION GUARD V0.1 END ===
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
