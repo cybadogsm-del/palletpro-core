@@ -7563,6 +7563,115 @@ def create_opening_balance():
     }), 201
 
 
+
+# === REGULAR TRANSACTION PARTNER ADDRESS HELPERS START ===
+
+def ensure_transaction_partner_columns(conn):
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+
+    if "partner_id" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN partner_id TEXT")
+
+    if "partner_address_id" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN partner_address_id TEXT")
+
+
+def get_partner_address_for_transaction(conn, partner_address_id, partner_id, organisation_id):
+    if not partner_address_id or not partner_id or not organisation_id:
+        return None
+
+    ensure_partner_address_tables(conn)
+
+    row = conn.execute(
+        """
+        SELECT *
+        FROM partner_addresses
+        WHERE partner_address_id = ?
+          AND partner_id = ?
+          AND organisation_id = ?
+          AND is_active = 1
+        """,
+        (partner_address_id, partner_id, organisation_id)
+    ).fetchone()
+
+    return dict(row) if row else None
+
+
+def get_default_partner_address_for_transaction(conn, partner_id, organisation_id, direction):
+    if not partner_id or not organisation_id:
+        return None
+
+    ensure_partner_address_tables(conn)
+    direction = (direction or "").strip().upper()
+
+    if direction == "OUT":
+        row = conn.execute(
+            """
+            SELECT *
+            FROM partner_addresses
+            WHERE partner_id = ?
+              AND organisation_id = ?
+              AND is_active = 1
+              AND is_default_dispatch_site = 1
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (partner_id, organisation_id)
+        ).fetchone()
+        if row:
+            return dict(row)
+
+    if direction == "IN":
+        row = conn.execute(
+            """
+            SELECT *
+            FROM partner_addresses
+            WHERE partner_id = ?
+              AND organisation_id = ?
+              AND is_active = 1
+              AND is_default_receiving_site = 1
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (partner_id, organisation_id)
+        ).fetchone()
+        if row:
+            return dict(row)
+
+    row = conn.execute(
+        """
+        SELECT *
+        FROM partner_addresses
+        WHERE partner_id = ?
+          AND organisation_id = ?
+          AND is_active = 1
+        ORDER BY is_primary DESC, updated_at DESC
+        LIMIT 1
+        """,
+        (partner_id, organisation_id)
+    ).fetchone()
+
+    return dict(row) if row else None
+
+
+def build_transaction_payload(conn, txn_row):
+    d = dict(txn_row)
+    d["partner_address"] = None
+
+    if d.get("partner_id") and d.get("partner_address_id"):
+        d["partner_address"] = get_partner_address_for_transaction(
+            conn,
+            d["partner_address_id"],
+            d["partner_id"],
+            d["organisation_id"],
+        )
+
+    return d
+
+
+# === REGULAR TRANSACTION PARTNER ADDRESS HELPERS END ===
+
+
 @app.post("/transactions")
 def create_transaction():
     body = request.get_json(silent=True) or {}
@@ -7574,6 +7683,8 @@ def create_transaction():
     quantity = body.get("quantity")
     direction = (body.get("direction") or "").strip().upper()
     submitted_by_display_name = (body.get("submitted_by_display_name") or "Unknown User").strip()
+    partner_id = body.get("partner_id")
+    partner_address_id = body.get("partner_address_id")
 
     if not organisation_id:
         return jsonify({"error": "organisation_id is required"}), 400
@@ -7583,12 +7694,20 @@ def create_transaction():
         return jsonify({"error": "transaction_type is required"}), 400
     if not resource_id:
         return jsonify({"error": "resource_id is required"}), 400
-    if not isinstance(quantity, int) or quantity <= 0:
+
+    try:
+        quantity = int(quantity)
+    except Exception:
+        return jsonify({"error": "quantity must be an integer greater than zero"}), 400
+
+    if quantity <= 0:
         return jsonify({"error": "quantity must be an integer greater than zero"}), 400
     if direction not in ["IN", "OUT"]:
         return jsonify({"error": "direction must be IN or OUT"}), 400
 
     conn = get_conn()
+    ensure_transaction_partner_columns(conn)
+    ensure_partner_address_tables(conn)
 
     org = conn.execute(
         "SELECT * FROM organisations WHERE organisation_id = ?",
@@ -7599,54 +7718,79 @@ def create_transaction():
         return jsonify({"error": "Organisation not found"}), 404
 
     depot = conn.execute(
-        "SELECT * FROM depots WHERE depot_id = ?",
-        (depot_id,)
+        "SELECT * FROM depots WHERE depot_id = ? AND organisation_id = ?",
+        (depot_id, organisation_id)
     ).fetchone()
     if not depot:
         conn.close()
         return jsonify({"error": "Depot not found"}), 404
 
     resource = conn.execute(
-        "SELECT * FROM resources WHERE resource_id = ?",
-        (resource_id,)
+        "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ?",
+        (resource_id, organisation_id)
     ).fetchone()
     if not resource:
         conn.close()
         return jsonify({"error": "Resource not found"}), 404
 
+    partner = None
+    partner_address = None
+
+    if partner_id:
+        partner = conn.execute(
+            """
+            SELECT *
+            FROM partners
+            WHERE partner_id = ?
+              AND organisation_id = ?
+              AND is_active = 1
+            """,
+            (partner_id, organisation_id)
+        ).fetchone()
+
+        if not partner:
+            conn.close()
+            return jsonify({"error": "Partner not found for this organisation"}), 404
+
+        if partner_address_id:
+            partner_address = get_partner_address_for_transaction(conn, partner_address_id, partner_id, organisation_id)
+            if not partner_address:
+                conn.close()
+                return jsonify({"error": "Partner address not found for this partner"}), 404
+        else:
+            partner_address = get_default_partner_address_for_transaction(conn, partner_id, organisation_id, direction)
+            partner_address_id = partner_address["partner_address_id"] if partner_address else None
+
     transaction_id = make_id("txn")
+    created_at = now_iso()
+
+    insert_sql = """
+        INSERT INTO transactions (
+            transaction_id,
+            organisation_id,
+            depot_id,
+            transaction_type,
+            resource_id,
+            quantity,
+            direction,
+            status,
+            approval_reason_code,
+            approval_reason_text,
+            partner_id,
+            partner_address_id,
+            created_at,
+            posted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
 
     if depot["opening_balance_used"] == 0:
         conn.execute(
-            """
-            INSERT INTO transactions (
-                transaction_id,
-                organisation_id,
-                depot_id,
-                transaction_type,
-                resource_id,
-                quantity,
-                direction,
-                status,
-                approval_reason_code,
-                approval_reason_text,
-                created_at,
-                posted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            insert_sql,
             (
-                transaction_id,
-                organisation_id,
-                depot_id,
-                transaction_type,
-                resource_id,
-                quantity,
-                direction,
-                "PENDING_APPROVAL",
-                "NIL_OPENING_BALANCE",
-                "Opening balance has not been set for this entity.",
-                now_iso(),
-                None
+                transaction_id, organisation_id, depot_id, transaction_type, resource_id,
+                quantity, direction, "PENDING_APPROVAL", "NIL_OPENING_BALANCE",
+                "Opening balance has not been set for this entity.", partner_id,
+                partner_address_id, created_at, None
             )
         )
 
@@ -7686,52 +7830,43 @@ def create_transaction():
 
         return jsonify({
             "transaction_id": transaction_id,
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "depot_name": depot["name"],
+            "transaction_type": transaction_type,
+            "resource_id": resource_id,
+            "resource_name": resource["name"],
+            "quantity": quantity,
+            "direction": direction,
             "status": "PENDING_APPROVAL",
             "approval_reason_code": "NIL_OPENING_BALANCE",
             "approval_reason_text": "Opening balance has not been set for this entity.",
             "pending_entry_id": pending_entry_id,
+            "partner_id": partner_id,
+            "partner_name": partner["name"] if partner else None,
+            "partner_address_id": partner_address_id,
+            "partner_address": partner_address,
             "message": "Opening balance has not been set for this entity. This transaction cannot be processed automatically and has been sent to your Org Admin for approval."
         }), 201
 
     conn.execute(
-        """
-        INSERT INTO transactions (
-            transaction_id,
-            organisation_id,
-            depot_id,
-            transaction_type,
-            resource_id,
-            quantity,
-            direction,
-            status,
-            approval_reason_code,
-            approval_reason_text,
-            created_at,
-            posted_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
+        insert_sql,
         (
-            transaction_id,
-            organisation_id,
-            depot_id,
-            transaction_type,
-            resource_id,
-            quantity,
-            direction,
-            "DRAFT",
-            None,
-            None,
-            now_iso(),
-            None
+            transaction_id, organisation_id, depot_id, transaction_type, resource_id,
+            quantity, direction, "DRAFT", None, None, partner_id,
+            partner_address_id, created_at, None
         )
     )
+
+    partner_suffix = f" for partner {partner['name']}" if partner else ""
+    site_suffix = f" at site {partner_address['label']}" if partner_address else ""
 
     audit_event(
         conn,
         entity_type="Transaction",
         entity_id=transaction_id,
         action="CREATE",
-        summary=f"Created transaction: {transaction_type} {quantity} {direction}",
+        summary=f"Created transaction: {transaction_type} {quantity} {direction}{partner_suffix}{site_suffix}",
         organisation_id=organisation_id
     )
 
@@ -7742,11 +7877,134 @@ def create_transaction():
         "transaction_id": transaction_id,
         "organisation_id": organisation_id,
         "depot_id": depot_id,
+        "depot_name": depot["name"],
+        "transaction_type": transaction_type,
         "resource_id": resource_id,
+        "resource_name": resource["name"],
         "quantity": quantity,
         "direction": direction,
-        "status": "DRAFT"
+        "status": "DRAFT",
+        "partner_id": partner_id,
+        "partner_name": partner["name"] if partner else None,
+        "partner_address_id": partner_address_id,
+        "partner_address": partner_address
     }), 201
+
+
+@app.get("/organisations/<organisation_id>/transactions")
+def list_transactions(organisation_id):
+    status = request.args.get("status")
+    direction = (request.args.get("direction") or "").strip().upper() or None
+
+    conn = get_conn()
+    ensure_transaction_partner_columns(conn)
+    ensure_partner_address_tables(conn)
+
+    sql = """
+        SELECT
+            t.transaction_id,
+            t.organisation_id,
+            o.name AS organisation_name,
+            t.depot_id,
+            d.name AS depot_name,
+            t.transaction_type,
+            t.resource_id,
+            r.name AS resource_name,
+            r.unit_type,
+            t.quantity,
+            t.direction,
+            t.status,
+            t.approval_reason_code,
+            t.approval_reason_text,
+            t.partner_id,
+            p.name AS partner_name,
+            t.partner_address_id,
+            t.created_at,
+            t.posted_at
+        FROM transactions t
+        LEFT JOIN organisations o ON o.organisation_id = t.organisation_id
+        LEFT JOIN depots d ON d.depot_id = t.depot_id
+        LEFT JOIN resources r ON r.resource_id = t.resource_id
+        LEFT JOIN partners p ON p.partner_id = t.partner_id
+        WHERE t.organisation_id = ?
+    """
+    params = [organisation_id]
+
+    if status:
+        sql += " AND t.status = ?"
+        params.append(status)
+
+    if direction:
+        sql += " AND t.direction = ?"
+        params.append(direction)
+
+    sql += " ORDER BY t.created_at DESC"
+
+    rows = conn.execute(sql, params).fetchall()
+    items = [build_transaction_payload(conn, row) for row in rows]
+
+    conn.close()
+
+    return jsonify({
+        "organisation_id": organisation_id,
+        "count": len(items),
+        "items": items
+    }), 200
+
+
+@app.get("/transactions/<transaction_id>")
+def get_transaction(transaction_id):
+    organisation_id = request.args.get("organisation_id")
+
+    conn = get_conn()
+    ensure_transaction_partner_columns(conn)
+    ensure_partner_address_tables(conn)
+
+    row = conn.execute(
+        """
+        SELECT
+            t.transaction_id,
+            t.organisation_id,
+            o.name AS organisation_name,
+            t.depot_id,
+            d.name AS depot_name,
+            t.transaction_type,
+            t.resource_id,
+            r.name AS resource_name,
+            r.unit_type,
+            t.quantity,
+            t.direction,
+            t.status,
+            t.approval_reason_code,
+            t.approval_reason_text,
+            t.partner_id,
+            p.name AS partner_name,
+            t.partner_address_id,
+            t.created_at,
+            t.posted_at
+        FROM transactions t
+        LEFT JOIN organisations o ON o.organisation_id = t.organisation_id
+        LEFT JOIN depots d ON d.depot_id = t.depot_id
+        LEFT JOIN resources r ON r.resource_id = t.resource_id
+        LEFT JOIN partners p ON p.partner_id = t.partner_id
+        WHERE t.transaction_id = ?
+        """,
+        (transaction_id,)
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        return jsonify({"error": "Transaction not found"}), 404
+
+    d = build_transaction_payload(conn, row)
+
+    if organisation_id and d["organisation_id"] != organisation_id:
+        conn.close()
+        return jsonify({"error": "Organisation does not own this transaction"}), 403
+
+    conn.close()
+
+    return jsonify(d), 200
 
 
 @app.post("/transactions/<transaction_id>/post")
