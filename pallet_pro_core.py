@@ -9526,6 +9526,128 @@ def execute_due_data_retention_jobs():
 
 # === DATA RETENTION EXECUTE V0.1 END ===
 
+# === REACTIVATION GUARD V0.1 START ===
+
+@app.post("/organisations/<organisation_id>/reactivate")
+def reactivate_organisation(organisation_id):
+    body = request.get_json(silent=True) or {}
+    reactivated_by_display_name = (body.get("reactivated_by_display_name") or "Org Admin").strip()
+    reason_text = (body.get("reason_text") or "").strip() or None
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    sub = get_subscription_for_access_guard(conn, organisation_id)
+
+    if not sub:
+        conn.close()
+        return jsonify({
+            "error": "Organisation has no subscription cancellation record",
+            "organisation_id": organisation_id,
+        }), 400
+
+    access = classify_org_access_state(sub)
+
+    if access["access_state"] == "ACTIVE":
+        conn.close()
+        return jsonify({
+            "organisation_id": organisation_id,
+            "organisation_name": org["name"],
+            "subscription_status": sub["subscription_status"],
+            "message": "Organisation is already active.",
+        }), 200
+
+    if access["access_state"] != "CANCELLED_WITHIN_RETENTION":
+        conn.close()
+        return jsonify({
+            "error": "Organisation cannot be reactivated through the simple reactivation flow",
+            "organisation_id": organisation_id,
+            "access_state": access["access_state"],
+            "reason": "The operating data retention window has ended or exit access is no longer available.",
+        }), 409
+
+    ts = now_iso()
+
+    conn.execute(
+        """
+        UPDATE organisation_subscriptions
+        SET subscription_mode = ?,
+            subscription_status = ?,
+            billing_status = ?,
+            do_not_bill = ?,
+            unsubscribed_at = NULL,
+            unsubscribed_by_display_name = NULL,
+            operating_data_delete_after = NULL,
+            historical_data_delete_after = NULL,
+            updated_at = ?
+        WHERE organisation_id = ?
+        """,
+        (
+            "STANDARD",
+            "ACTIVE",
+            "BILLABLE",
+            0,
+            ts,
+            organisation_id,
+        )
+    )
+
+    conn.execute(
+        """
+        UPDATE data_retention_jobs
+        SET job_status = ?,
+            completed_at = ?
+        WHERE organisation_id = ?
+          AND job_status = 'SCHEDULED'
+        """,
+        (
+            "CANCELLED",
+            ts,
+            organisation_id,
+        )
+    )
+
+    audit_event(
+        conn,
+        entity_type="OrganisationSubscription",
+        entity_id=organisation_id,
+        action="REACTIVATE",
+        summary="Organisation reactivated within retention window. Billing restored and scheduled retention jobs cancelled.",
+        organisation_id=organisation_id,
+    )
+
+    conn.commit()
+
+    sub2 = conn.execute(
+        "SELECT * FROM organisation_subscriptions WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    conn.close()
+
+    return jsonify({
+        "organisation_id": organisation_id,
+        "organisation_name": org["name"],
+        "subscription": dict(sub2),
+        "reactivated_by_display_name": reactivated_by_display_name,
+        "reason_text": reason_text,
+        "billing_rule": "Organisation is active and billable again from reactivation.",
+        "data_retention_rule": "Scheduled deletion jobs were cancelled because the organisation reactivated within the retention window.",
+    }), 200
+
+# === REACTIVATION GUARD V0.1 END ===
+
+
+
 
 
 
