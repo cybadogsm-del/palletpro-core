@@ -13272,6 +13272,114 @@ def get_org_admin_transaction_summary(organisation_id):
 
 # === TRANSACTION REPORTING SUMMARY V0.1 END ===
 
+# === ORG TRANSACTION CATEGORY REPORT V0.1 START ===
+
+@app.get("/organisations/<organisation_id>/transaction-category-report")
+def org_transaction_category_report(organisation_id):
+    conn = get_conn()
+
+    ensure_transaction_partner_columns(conn)
+    ensure_partner_address_tables(conn)
+    ensure_transaction_user_attribution_columns(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?",
+        (organisation_id,)
+    ).fetchone()
+
+    if not org:
+        conn.close()
+        return jsonify({
+            "error": "Organisation not found"
+        }), 404
+
+    date_from = request.args.get("date_from")
+    date_to = request.args.get("date_to")
+
+    where = ["t.organisation_id = ?"]
+    params = [organisation_id]
+
+    if date_from:
+        where.append("t.created_at >= ?")
+        params.append(date_from)
+
+    if date_to:
+        where.append("t.created_at <= ?")
+        params.append(date_to)
+
+    where_sql = " AND ".join(where)
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            COALESCE(t.transaction_type, 'UNKNOWN') AS transaction_type,
+            COALESCE(t.direction, 'UNKNOWN') AS direction,
+            COALESCE(r.resource_type, 'UNKNOWN') AS resource_type,
+            COALESCE(r.name, 'UNKNOWN') AS resource_name,
+            COALESCE(d.name, 'UNKNOWN') AS depot_name,
+            COALESCE(p.name, 'UNKNOWN') AS partner_name,
+            COALESCE(t.submitted_by_user_id, 'UNKNOWN') AS submitted_by_user_id,
+            COALESCE(t.submitted_by_display_name, 'Unknown User') AS submitted_by_display_name,
+            COUNT(*) AS transaction_count,
+            COALESCE(SUM(t.quantity), 0) AS total_quantity,
+            MIN(t.created_at) AS first_transaction_at,
+            MAX(t.created_at) AS last_transaction_at
+        FROM transactions t
+        LEFT JOIN resources r ON r.resource_id = t.resource_id
+        LEFT JOIN depots d ON d.depot_id = t.depot_id
+        LEFT JOIN partners p ON p.partner_id = t.partner_id
+        WHERE {where_sql}
+        GROUP BY
+            t.transaction_type,
+            t.direction,
+            r.resource_type,
+            r.name,
+            d.name,
+            p.name,
+            t.submitted_by_user_id,
+            t.submitted_by_display_name
+        ORDER BY
+            transaction_count DESC,
+            total_quantity DESC,
+            resource_name ASC
+        """,
+        params,
+    ).fetchall()
+
+    total_transactions = conn.execute(
+        f"""
+        SELECT COUNT(*) AS c
+        FROM transactions t
+        WHERE {where_sql}
+        """,
+        params,
+    ).fetchone()["c"]
+
+    conn.close()
+
+    return jsonify({
+        "report_type": "ORG_TRANSACTION_CATEGORY_REPORT",
+        "organisation_id": organisation_id,
+        "organisation_name": org["name"],
+        "filters": {
+            "date_from": date_from,
+            "date_to": date_to,
+        },
+        "total_transactions": total_transactions,
+        "category_report_count": len(rows),
+        "items": [dict(row) for row in rows],
+        "rules": [
+            "Org Admin reporting is organisation-scoped only.",
+            "This report exists to provide operational truth by category, type, resource, depot, partner, and user attribution.",
+            "Shared logins weaken accountability.",
+            "Who, Where, When remains core truth."
+        ]
+    }), 200
+
+# === ORG TRANSACTION CATEGORY REPORT V0.1 END ===
+
+
+
 
 
 
