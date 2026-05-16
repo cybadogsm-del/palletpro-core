@@ -484,6 +484,39 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(quantities["LOSCAM Pallet"], 80)
         self.assertNotIn("Plain Pallet", quantities)
 
+    def test_resource_ledger_routes(self):
+        organisation_id = self.create_organisation("Ledger Org")
+        depot_id = self._create_depot(organisation_id, "Ledger Depot")
+        category_id = self._create_category(organisation_id, "Ledger Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "CHEP Pallet")
+
+        self.client.post("/opening-balances", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "resource_id": resource_id,
+            "quantity": 100,
+        })
+
+        depot_ledger = self.client.get(
+            f"/organisations/{organisation_id}/depots/{depot_id}/resources/{resource_id}/ledger"
+        )
+        self.assertEqual(depot_ledger.status_code, 200)
+        dl = depot_ledger.get_json()
+        self.assertEqual(dl["report_type"], "RESOURCE_DEPOT_LEDGER")
+        self.assertEqual(dl["current_balance"], 100)
+        self.assertEqual(dl["entry_count"], 1)
+        self.assertEqual(dl["entries"][0]["running_balance"], 100)
+        self.assertEqual(dl["entries"][0]["transaction_type"], "OpeningBalance")
+
+        org_ledger = self.client.get(
+            f"/organisations/{organisation_id}/resources/{resource_id}/ledger"
+        )
+        self.assertEqual(org_ledger.status_code, 200)
+        ol = org_ledger.get_json()
+        self.assertEqual(ol["report_type"], "RESOURCE_ORG_LEDGER")
+        self.assertEqual(ol["total_balance_across_depots"], 100)
+        self.assertEqual(ol["by_depot"][0]["current_balance"], 100)
+
     def test_stocktake_list_and_global_summary(self):
         resp = self.client.get("/global-admin/stocktake-summary")
         self.assertEqual(resp.status_code, 200)
