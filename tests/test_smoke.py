@@ -161,6 +161,87 @@ class PalletProSmokeTests(unittest.TestCase):
         )
 
 
+    def _create_user(self, organisation_id, display_name, role="USER"):
+        resp = self.client.post("/global-admin/users", json={
+            "organisation_id": organisation_id,
+            "display_name": display_name,
+            "role": role,
+            "access_status": "ACTIVE",
+            "created_by_display_name": "Test",
+            "confirmation_text": "CREATE USER",
+        })
+        self.assertEqual(resp.status_code, 201)
+        return resp.get_json()["user"]["user_id"]
+
+    def test_admin_handover_full_lifecycle(self):
+        organisation_id = self.create_organisation("Handover Org")
+
+        self._create_user(organisation_id, "Alice Admin", role="ORG_ADMIN")
+        incoming_user_id = self._create_user(organisation_id, "Bob Incoming", role="USER")
+
+        initiate = self.client.post(
+            f"/organisations/{organisation_id}/admin-handover",
+            json={
+                "incoming_admin_user_id": incoming_user_id,
+                "overlap_days": 7,
+                "initiated_by_display_name": "Alice Admin",
+            },
+        )
+        self.assertEqual(initiate.status_code, 201)
+        payload = initiate.get_json()
+        self.assertEqual(payload["status"], "ACTIVE")
+        self.assertEqual(payload["overlap_days"], 7)
+        handover_id = payload["handover_id"]
+
+        view = self.client.get(f"/organisations/{organisation_id}/admin-handover")
+        self.assertEqual(view.status_code, 200)
+        self.assertIsNotNone(view.get_json()["active_handover"])
+
+        complete = self.client.post(
+            f"/organisations/{organisation_id}/admin-handover/{handover_id}/complete",
+            json={"completed_by_display_name": "Bob Incoming"},
+        )
+        self.assertEqual(complete.status_code, 200)
+        self.assertEqual(complete.get_json()["status"], "COMPLETED")
+
+    def test_admin_handover_cancel(self):
+        organisation_id = self.create_organisation("Cancel Handover Org")
+
+        self._create_user(organisation_id, "Carol Admin", role="ORG_ADMIN")
+        incoming_user_id = self._create_user(organisation_id, "Dave Incoming", role="USER")
+
+        initiate = self.client.post(
+            f"/organisations/{organisation_id}/admin-handover",
+            json={"incoming_admin_user_id": incoming_user_id, "initiated_by_display_name": "Carol Admin"},
+        )
+        self.assertEqual(initiate.status_code, 201)
+        handover_id = initiate.get_json()["handover_id"]
+
+        cancel = self.client.post(
+            f"/organisations/{organisation_id}/admin-handover/{handover_id}/cancel",
+            json={"cancelled_by_display_name": "Carol Admin"},
+        )
+        self.assertEqual(cancel.status_code, 200)
+        self.assertEqual(cancel.get_json()["status"], "CANCELLED")
+
+    def test_admin_handover_expiry_sweep(self):
+        response = self.client.post("/global-admin/admin-handover-expiry-sweep")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["sweep_type"], "ADMIN_HANDOVER_EXPIRY_SWEEP")
+        self.assertIn("completed_count", payload)
+
+    def test_emergency_appoint_admin(self):
+        organisation_id = self.create_organisation("Emergency Appoint Org")
+        user_id = self._create_user(organisation_id, "Eve Emergency", role="USER")
+
+        response = self.client.post(
+            f"/global-admin/organisations/{organisation_id}/appoint-admin",
+            json={"user_id": user_id, "appointed_by_display_name": "Global Admin"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["new_role"], "ORG_ADMIN")
+
     def test_module_flags_list_route_is_registered(self):
         response = self.client.get("/global-admin/module-flags")
         self.assertEqual(response.status_code, 200)

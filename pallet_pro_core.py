@@ -14,6 +14,7 @@ from modules.subscription_access import (
     require_active_org_access,
     ORG_SELF_SERVE_USER_LIMIT,
 )
+from modules.admin_handover import ensure_admin_handover_tables, register_admin_handover_routes
 from modules.error_logging import ensure_error_logging_tables, log_error_event, register_error_logging_routes
 from modules.feature_flags import register_feature_flag_routes
 from modules.system_routes import register_system_routes
@@ -754,6 +755,9 @@ def init_db():
         c.execute("ALTER TABLE pending_approval_entries ADD COLUMN rejection_reason_code TEXT")
     if "rejection_reason_text" not in pending_cols:
         c.execute("ALTER TABLE pending_approval_entries ADD COLUMN rejection_reason_text TEXT")
+
+    ensure_error_logging_tables(conn)
+    ensure_admin_handover_tables(conn)
 
     conn.commit()
     conn.close()
@@ -12548,6 +12552,7 @@ def list_access_operations_metrics_snapshots():
 
 # === ACCESS OPERATIONS METRICS SNAPSHOT V0.1 END ===
 
+register_admin_handover_routes(app)
 register_feature_flag_routes(app)
 register_error_logging_routes(app)
 register_system_routes(app)
