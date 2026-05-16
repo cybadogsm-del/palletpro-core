@@ -16,13 +16,18 @@ FLASK_DEBUG=1 python pallet_pro_core.py
 PALLET_PRO_DB=my.db FLASK_DEBUG=1 python pallet_pro_core.py
 ```
 
-**Run the server (production):**
+**Run the server (production, bare metal):**
 ```bash
-gunicorn wsgi:app --workers 4 --bind 0.0.0.0:8000
-# or with a custom DB path:
-PALLET_PRO_DB=/data/pallet_pro.db gunicorn wsgi:app --workers 4 --bind 0.0.0.0:8000
+gunicorn wsgi:app --config gunicorn.conf.py
 ```
-Worker count should be `(2 × CPU cores) + 1`. Debug is off by default — only enabled when `FLASK_DEBUG=1`.
+Worker count defaults to `(2 × CPU cores) + 1`. Override with `GUNICORN_WORKERS=N`. Debug is off by default — only enabled when `FLASK_DEBUG=1`.
+
+**Run with Docker:**
+```bash
+cp .env.example .env   # fill in PALLET_PRO_MASTER_KEY
+docker compose up --build
+```
+The SQLite database is stored in a named Docker volume (`palletpro_data`). The DB file is never baked into the image.
 
 **Run all tests:**
 ```bash

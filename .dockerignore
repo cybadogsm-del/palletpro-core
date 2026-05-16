@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+*~
+.venv/
+node_modules/
+server.log
+tests/

@@ -1,0 +1,13 @@
+services:
+  palletpro-core:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - palletpro_data:/data
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  palletpro_data:
