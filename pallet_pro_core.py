@@ -7292,6 +7292,7 @@ def create_opening_balance():
         return jsonify({"error": "quantity must be an integer greater than or equal to zero"}), 400
 
     conn = get_conn()
+    ensure_transaction_numbering_tables(conn)
 
     depot = conn.execute(
         "SELECT * FROM depots WHERE depot_id = ? AND organisation_id = ?",
@@ -7316,6 +7317,7 @@ def create_opening_balance():
     transaction_id = make_id("txn")
     ledger_entry_id = make_id("led")
     created_at = now_iso()
+    ob_reference_number, ob_org_seq = generate_transaction_reference(conn, organisation_id)
 
     conn.execute(
         """
@@ -7331,8 +7333,10 @@ def create_opening_balance():
             approval_reason_code,
             approval_reason_text,
             created_at,
-            posted_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            posted_at,
+            reference_number,
+            org_sequence_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             transaction_id,
@@ -7346,7 +7350,9 @@ def create_opening_balance():
             None,
             None,
             created_at,
-            created_at
+            created_at,
+            ob_reference_number,
+            ob_org_seq
         )
     )
 
@@ -7569,6 +7575,7 @@ def create_transaction():
     ensure_transaction_partner_columns(conn)
     ensure_partner_address_tables(conn)
     ensure_transaction_user_attribution_columns(conn)
+    ensure_transaction_numbering_tables(conn)
 
     access_error = require_active_org_access(conn, organisation_id)
     if access_error:
@@ -7640,6 +7647,7 @@ def create_transaction():
 
     transaction_id = make_id("txn")
     created_at = now_iso()
+    reference_number, org_sequence_number = generate_transaction_reference(conn, organisation_id)
 
     insert_sql = """
         INSERT INTO transactions (
@@ -7658,8 +7666,10 @@ def create_transaction():
             submitted_by_user_id,
             submitted_by_display_name,
             created_at,
-            posted_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            posted_at,
+            reference_number,
+            org_sequence_number
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     if depot["opening_balance_used"] == 0:
@@ -7669,7 +7679,7 @@ def create_transaction():
                 transaction_id, organisation_id, depot_id, transaction_type, resource_id,
                 quantity, direction, "PENDING_APPROVAL", "NIL_OPENING_BALANCE",
                 "Opening balance has not been set for this entity.", partner_id,
-                partner_address_id, created_at, None
+                partner_address_id, created_at, None, reference_number, org_sequence_number
             )
         )
 
@@ -7727,6 +7737,8 @@ def create_transaction():
             "partner_address": partner_address,
             "submitted_by_user_id": submitted_by_user_id,
             "submitted_by_display_name": submitted_by_display_name,
+            "reference_number": reference_number,
+            "org_sequence_number": org_sequence_number,
             "message": "Opening balance has not been set for this entity. This transaction cannot be processed automatically and has been sent to your Org Admin for approval."
         }), 201
 
@@ -7735,7 +7747,7 @@ def create_transaction():
         (
             transaction_id, organisation_id, depot_id, transaction_type, resource_id,
             quantity, direction, "DRAFT", None, None, partner_id,
-            partner_address_id, created_at, None
+            partner_address_id, created_at, None, reference_number, org_sequence_number
         )
     )
 
@@ -7770,7 +7782,9 @@ def create_transaction():
         "partner_address_id": partner_address_id,
         "partner_address": partner_address,
         "submitted_by_user_id": submitted_by_user_id,
-        "submitted_by_display_name": submitted_by_display_name
+        "submitted_by_display_name": submitted_by_display_name,
+        "reference_number": reference_number,
+        "org_sequence_number": org_sequence_number
     }), 201
 
 
@@ -7778,10 +7792,12 @@ def create_transaction():
 def list_transactions(organisation_id):
     status = request.args.get("status")
     direction = (request.args.get("direction") or "").strip().upper() or None
+    reference_number_filter = (request.args.get("reference_number") or "").strip() or None
 
     conn = get_conn()
     ensure_transaction_partner_columns(conn)
     ensure_partner_address_tables(conn)
+    ensure_transaction_numbering_tables(conn)
 
     sql = """
         SELECT
@@ -7805,7 +7821,9 @@ def list_transactions(organisation_id):
             t.submitted_by_user_id,
             t.submitted_by_display_name,
             t.created_at,
-            t.posted_at
+            t.posted_at,
+            t.reference_number,
+            t.org_sequence_number
         FROM transactions t
         LEFT JOIN organisations o ON o.organisation_id = t.organisation_id
         LEFT JOIN depots d ON d.depot_id = t.depot_id
@@ -7823,7 +7841,11 @@ def list_transactions(organisation_id):
         sql += " AND t.direction = ?"
         params.append(direction)
 
-    sql += " ORDER BY t.created_at DESC"
+    if reference_number_filter:
+        sql += " AND t.reference_number = ?"
+        params.append(reference_number_filter)
+
+    sql += " ORDER BY t.org_sequence_number ASC, t.created_at DESC"
 
     rows = conn.execute(sql, params).fetchall()
     items = [build_transaction_payload(conn, row) for row in rows]
@@ -7868,7 +7890,9 @@ def get_transaction(transaction_id):
             t.submitted_by_user_id,
             t.submitted_by_display_name,
             t.created_at,
-            t.posted_at
+            t.posted_at,
+            t.reference_number,
+            t.org_sequence_number
         FROM transactions t
         LEFT JOIN organisations o ON o.organisation_id = t.organisation_id
         LEFT JOIN depots d ON d.depot_id = t.depot_id
@@ -10185,6 +10209,53 @@ def ensure_transaction_user_attribution_columns(conn):
         conn.execute("ALTER TABLE transactions ADD COLUMN submitted_by_display_name TEXT")
 
 
+# === TRANSACTION NUMBERING V0.1 START ===
+
+def ensure_transaction_numbering_tables(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS transaction_sequences (
+        sequence_key TEXT PRIMARY KEY,
+        next_value INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL
+    )
+    """)
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+    if "reference_number" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN reference_number TEXT")
+    if "org_sequence_number" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN org_sequence_number INTEGER")
+
+
+def generate_transaction_reference(conn, organisation_id):
+    from datetime import datetime, UTC
+    year = datetime.now(UTC).year
+
+    def next_seq(key):
+        row = conn.execute(
+            "SELECT next_value FROM transaction_sequences WHERE sequence_key = ?",
+            (key,)
+        ).fetchone()
+        if row:
+            val = row["next_value"]
+            conn.execute(
+                "UPDATE transaction_sequences SET next_value = ?, updated_at = ? WHERE sequence_key = ?",
+                (val + 1, now_iso(), key)
+            )
+        else:
+            val = 1
+            conn.execute(
+                "INSERT INTO transaction_sequences (sequence_key, next_value, updated_at) VALUES (?, ?, ?)",
+                (key, 2, now_iso())
+            )
+        return val
+
+    global_seq = next_seq(f"global_{year}")
+    org_seq = next_seq(f"org_{organisation_id}")
+    return f"PP-{year}-{global_seq:06d}", org_seq
+
+# === TRANSACTION NUMBERING V0.1 END ===
+
+
 def get_transaction_submitter_display_snapshot(conn, submitted_by_user_id, fallback_display_name):
     fallback_display_name = (fallback_display_name or "Unknown User").strip() or "Unknown User"
 
@@ -12443,6 +12514,7 @@ register_transaction_reporting_routes(
     ensure_transaction_partner_columns=ensure_transaction_partner_columns,
     ensure_partner_address_tables=ensure_partner_address_tables,
     ensure_transaction_user_attribution_columns=ensure_transaction_user_attribution_columns,
+    ensure_transaction_numbering_tables=ensure_transaction_numbering_tables,
 )
 
 

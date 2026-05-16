@@ -307,10 +307,12 @@ def register_transaction_reporting_routes(
     ensure_transaction_partner_columns,
     ensure_partner_address_tables,
     ensure_transaction_user_attribution_columns,
+    ensure_transaction_numbering_tables,
 ):
     def prepare_transaction_reporting(conn, include_user_attribution=False):
         ensure_transaction_partner_columns(conn)
         ensure_partner_address_tables(conn)
+        ensure_transaction_numbering_tables(conn)
         if include_user_attribution:
             ensure_transaction_user_attribution_columns(conn)
 
