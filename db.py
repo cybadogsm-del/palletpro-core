@@ -8,8 +8,10 @@ DB = os.environ.get("PALLET_PRO_DB", "pallet_pro.db")
 
 
 def get_conn():
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB, timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 

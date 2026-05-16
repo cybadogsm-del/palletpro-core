@@ -9,13 +9,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pip install -e ".[test]"
 ```
 
-**Run the server:**
+**Run the server (development):**
 ```bash
-python pallet_pro_core.py
+FLASK_DEBUG=1 python pallet_pro_core.py
 # or with a custom DB path:
-PALLET_PRO_DB=my.db python pallet_pro_core.py
+PALLET_PRO_DB=my.db FLASK_DEBUG=1 python pallet_pro_core.py
 ```
-Server starts on `0.0.0.0:8000`.
+
+**Run the server (production):**
+```bash
+gunicorn wsgi:app --workers 4 --bind 0.0.0.0:8000
+# or with a custom DB path:
+PALLET_PRO_DB=/data/pallet_pro.db gunicorn wsgi:app --workers 4 --bind 0.0.0.0:8000
+```
+Worker count should be `(2 × CPU cores) + 1`. Debug is off by default — only enabled when `FLASK_DEBUG=1`.
 
 **Run all tests:**
 ```bash

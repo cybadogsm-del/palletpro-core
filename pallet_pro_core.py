@@ -1,3 +1,5 @@
+import os
+
 from flask import Flask, request, jsonify
 from audit import audit_event
 from db import DB, get_conn, make_id, now_iso
@@ -13019,4 +13021,5 @@ def get_organisation_exit_dashboard(organisation_id):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=8000, debug=debug)
