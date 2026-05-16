@@ -566,6 +566,97 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(payload["alert_type"], "GLOBAL_ADMIN_ERROR_ALERTS")
         self.assertFalse(payload["has_unreviewed_alerts"])
 
+    def test_user_cap_self_serve_and_enforcement(self):
+        org_id = self.create_organisation("CapTestOrg")
+
+        # 76+ must be rejected for self-serve
+        r = self.client.post(
+            f"/organisations/{org_id}/subscription/select-users",
+            json={"selected_user_count": 76, "changed_by_display_name": "Admin"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("self_serve_limit", r.get_json())
+
+        # Set cap to 2 via self-serve
+        r = self.client.post(
+            f"/organisations/{org_id}/subscription/select-users",
+            json={"selected_user_count": 2, "changed_by_display_name": "Admin"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["selected_user_count"], 2)
+
+        # Create user 1 — should succeed
+        r = self.client.post(
+            "/global-admin/users",
+            json={
+                "organisation_id": org_id,
+                "display_name": "Cap User 1",
+                "role": "USER",
+                "confirmation_text": "CREATE USER",
+            },
+        )
+        self.assertEqual(r.status_code, 201)
+
+        # Create user 2 — should succeed (hits cap exactly)
+        r = self.client.post(
+            "/global-admin/users",
+            json={
+                "organisation_id": org_id,
+                "display_name": "Cap User 2",
+                "role": "USER",
+                "confirmation_text": "CREATE USER",
+            },
+        )
+        self.assertEqual(r.status_code, 201)
+
+        # Create user 3 — should be blocked
+        r = self.client.post(
+            "/global-admin/users",
+            json={
+                "organisation_id": org_id,
+                "display_name": "Cap User 3",
+                "role": "USER",
+                "confirmation_text": "CREATE USER",
+            },
+        )
+        self.assertEqual(r.status_code, 403)
+        payload = r.get_json()
+        self.assertEqual(payload["error"], "USER_CAP_REACHED")
+        self.assertIn("dialog", payload)
+
+    def test_global_admin_can_set_user_count_above_75(self):
+        org_id = self.create_organisation("LargeCapOrg")
+
+        r = self.client.post(
+            f"/global-admin/organisations/{org_id}/set-user-count",
+            json={"selected_user_count": 120, "changed_by_display_name": "Global Admin"},
+        )
+        self.assertEqual(r.status_code, 200)
+        payload = r.get_json()
+        self.assertEqual(payload["selected_user_count"], 120)
+        self.assertTrue(payload["is_custom_plan"])
+
+    def test_cannot_set_user_count_below_active_users(self):
+        org_id = self.create_organisation("ActiveCapOrg")
+
+        # Create one user
+        self.client.post(
+            "/global-admin/users",
+            json={
+                "organisation_id": org_id,
+                "display_name": "Active User",
+                "role": "USER",
+                "confirmation_text": "CREATE USER",
+            },
+        )
+
+        # Try to cap below existing active count
+        r = self.client.post(
+            f"/organisations/{org_id}/subscription/select-users",
+            json={"selected_user_count": 0, "changed_by_display_name": "Admin"},
+        )
+        self.assertEqual(r.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

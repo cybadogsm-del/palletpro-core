@@ -758,9 +758,11 @@ def init_db():
     if "rejection_reason_text" not in pending_cols:
         c.execute("ALTER TABLE pending_approval_entries ADD COLUMN rejection_reason_text TEXT")
 
+    ensure_subscription_guard_tables(conn)
     ensure_error_logging_tables(conn)
     ensure_admin_handover_tables(conn)
     ensure_stocktake_tables(conn)
+    ensure_org_user_cap_column(conn)
 
     conn.commit()
     conn.close()
