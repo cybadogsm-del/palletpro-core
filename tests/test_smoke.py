@@ -4,16 +4,21 @@ import sys
 import unittest
 
 
+_TEST_MASTER_KEY = "test-master-key-smoke-suite-abc123"
+
+
 class PalletProSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.db_path = os.path.abspath("test_pallet_pro.db")
         os.environ["PALLET_PRO_DB"] = cls.db_path
+        os.environ["PALLET_PRO_MASTER_KEY"] = _TEST_MASTER_KEY
 
         for module_name in (
             "pallet_pro_core",
             "audit",
             "db",
+            "modules.auth",
             "modules.system_routes",
             "modules.subscription_access",
             "modules.transaction_reporting",
@@ -22,6 +27,7 @@ class PalletProSmokeTests(unittest.TestCase):
 
         cls.core = importlib.import_module("pallet_pro_core")
         cls.client = cls.core.app.test_client()
+        cls.client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {_TEST_MASTER_KEY}"
 
     @classmethod
     def tearDownClass(cls):
@@ -656,6 +662,113 @@ class PalletProSmokeTests(unittest.TestCase):
             json={"selected_user_count": 0, "changed_by_display_name": "Admin"},
         )
         self.assertEqual(r.status_code, 400)
+
+    def test_unauthenticated_request_is_rejected(self):
+        # Make a request with no auth header
+        r = self.core.app.test_client().get("/organisations/anything")
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.get_json()["error"], "AUTHENTICATION_REQUIRED")
+
+    def test_invalid_api_key_is_rejected(self):
+        client = self.core.app.test_client()
+        client.environ_base["HTTP_AUTHORIZATION"] = "Bearer ppk_thisisnotavalidkey00000000000000000000000000000000000000000000000"
+        r = client.get("/health")
+        # /health is exempt — should pass even with garbage key
+        self.assertEqual(r.status_code, 200)
+        # but a real route should reject it
+        r = client.get("/organisations/anything")
+        self.assertEqual(r.status_code, 401)
+
+    def test_org_user_cannot_access_global_admin_routes(self):
+        org_id = self.create_organisation("AuthTestOrg")
+
+        # Create a regular user
+        r = self.client.post(
+            "/global-admin/users",
+            json={
+                "organisation_id": org_id,
+                "display_name": "Regular User",
+                "role": "USER",
+                "confirmation_text": "CREATE USER",
+            },
+        )
+        self.assertEqual(r.status_code, 201)
+        user_id = r.get_json()["user"]["user_id"]
+
+        # Issue an API key for that user
+        r = self.client.post("/auth/keys", json={"user_id": user_id, "label": "test"})
+        self.assertEqual(r.status_code, 201)
+        user_key = r.get_json()["api_key"]
+
+        # Use the user key to hit a global-admin route
+        user_client = self.core.app.test_client()
+        user_client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {user_key}"
+        r = user_client.get("/global-admin/pricing-dashboard")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.get_json()["error"], "INSUFFICIENT_ROLE")
+
+    def test_org_user_cannot_access_other_org(self):
+        org_a = self.create_organisation("OrgIsoA")
+        org_b = self.create_organisation("OrgIsoB")
+
+        r = self.client.post(
+            "/global-admin/users",
+            json={
+                "organisation_id": org_a,
+                "display_name": "Org A User",
+                "role": "USER",
+                "confirmation_text": "CREATE USER",
+            },
+        )
+        self.assertEqual(r.status_code, 201)
+        user_id = r.get_json()["user"]["user_id"]
+
+        r = self.client.post("/auth/keys", json={"user_id": user_id, "label": "test"})
+        self.assertEqual(r.status_code, 201)
+        user_key = r.get_json()["api_key"]
+
+        user_client = self.core.app.test_client()
+        user_client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {user_key}"
+
+        # Can access own org
+        r = user_client.get(f"/organisations/{org_a}/stock-position")
+        self.assertEqual(r.status_code, 200)
+
+        # Cannot access another org
+        r = user_client.get(f"/organisations/{org_b}/stock-position")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.get_json()["error"], "ORG_ACCESS_DENIED")
+
+    def test_api_key_issue_list_revoke(self):
+        org_id = self.create_organisation("KeyLifecycleOrg")
+        user_id = self._create_user(org_id, "Key Test User", "USER")
+
+        # Issue a key for a real user via the master key
+        r = self.client.post("/auth/keys", json={"user_id": user_id, "label": "smoke test key"})
+        self.assertEqual(r.status_code, 201)
+        payload = r.get_json()
+        self.assertIn("api_key", payload)
+        self.assertTrue(payload["api_key"].startswith("ppk_"))
+        key_id = payload["api_key_id"]
+
+        # List keys for that user
+        r = self.client.get(f"/auth/keys?user_id={user_id}")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["count"], 1)
+
+        # Revoke it
+        r = self.client.post(f"/auth/keys/{key_id}/revoke")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.get_json()["revoked"])
+
+    def test_bootstrap_blocked_when_users_exist(self):
+        # The test DB already has users created in earlier tests
+        r = self.client.post(
+            "/auth/bootstrap",
+            json={"display_name": "Late Bootstrap Attempt"},
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json()["error"], "BOOTSTRAP_UNAVAILABLE")
 
 
 if __name__ == "__main__":

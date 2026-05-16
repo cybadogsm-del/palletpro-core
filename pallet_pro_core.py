@@ -17,6 +17,7 @@ from modules.subscription_access import (
     ORG_SELF_SERVE_USER_LIMIT,
 )
 from modules.admin_handover import ensure_admin_handover_tables, register_admin_handover_routes
+from modules.auth import ensure_api_key_tables, register_auth_middleware, register_auth_routes
 from modules.stocktake import ensure_stocktake_tables, register_stocktake_routes
 from modules.error_logging import ensure_error_logging_tables, log_error_event, register_error_logging_routes
 from modules.feature_flags import register_feature_flag_routes
@@ -761,6 +762,7 @@ def init_db():
         c.execute("ALTER TABLE pending_approval_entries ADD COLUMN rejection_reason_text TEXT")
 
     ensure_subscription_guard_tables(conn)
+    ensure_api_key_tables(conn)
     ensure_error_logging_tables(conn)
     ensure_admin_handover_tables(conn)
     ensure_stocktake_tables(conn)
@@ -12577,6 +12579,8 @@ def list_access_operations_metrics_snapshots():
 
 # === ACCESS OPERATIONS METRICS SNAPSHOT V0.1 END ===
 
+register_auth_middleware(app)
+register_auth_routes(app)
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
 register_stock_position_routes(app)
