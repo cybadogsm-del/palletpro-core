@@ -172,18 +172,24 @@ def register_stocktake_routes(
                 "active_stocktake_id": active["stocktake_id"],
             }), 409
 
-        # Snapshot balance_projection for this depot, grouped by resource type
+        # Snapshot every active resource the org uses, with balance at this depot (0 if none)
         balances = conn.execute(
             """
-            SELECT bp.resource_id, bp.current_quantity,
-                   r.name AS resource_name, r.resource_type, r.unit_type
-            FROM balance_projection bp
-            JOIN resources r ON r.resource_id = bp.resource_id
-            WHERE bp.organisation_id = ? AND bp.depot_id = ?
+            SELECT r.resource_id,
+                   r.name AS resource_name,
+                   r.resource_type,
+                   r.unit_type,
+                   COALESCE(bp.current_quantity, 0) AS current_quantity
+            FROM resources r
+            LEFT JOIN balance_projection bp
+                ON bp.resource_id = r.resource_id
+               AND bp.organisation_id = ?
+               AND bp.depot_id = ?
+            WHERE r.organisation_id = ?
               AND r.is_active = 1
             ORDER BY r.resource_type ASC, r.name ASC
             """,
-            (organisation_id, depot_id),
+            (organisation_id, depot_id, organisation_id),
         ).fetchall()
 
         stocktake_id = make_id("stk")
