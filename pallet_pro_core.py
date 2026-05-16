@@ -15,6 +15,7 @@ from modules.subscription_access import (
     ORG_SELF_SERVE_USER_LIMIT,
 )
 from modules.admin_handover import ensure_admin_handover_tables, register_admin_handover_routes
+from modules.stocktake import ensure_stocktake_tables, register_stocktake_routes
 from modules.error_logging import ensure_error_logging_tables, log_error_event, register_error_logging_routes
 from modules.feature_flags import register_feature_flag_routes
 from modules.system_routes import register_system_routes
@@ -758,6 +759,7 @@ def init_db():
 
     ensure_error_logging_tables(conn)
     ensure_admin_handover_tables(conn)
+    ensure_stocktake_tables(conn)
 
     conn.commit()
     conn.close()
@@ -12554,6 +12556,14 @@ def list_access_operations_metrics_snapshots():
 
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
+register_stocktake_routes(
+    app,
+    post_transaction_to_ledger=post_transaction_to_ledger,
+    generate_transaction_reference=generate_transaction_reference,
+    ensure_transaction_numbering_tables=ensure_transaction_numbering_tables,
+    ensure_transaction_partner_columns=ensure_transaction_partner_columns,
+    ensure_transaction_user_attribution_columns=ensure_transaction_user_attribution_columns,
+)
 register_error_logging_routes(app)
 register_system_routes(app)
 register_subscription_routes(app)

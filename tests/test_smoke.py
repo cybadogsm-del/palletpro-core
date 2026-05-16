@@ -242,6 +242,134 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["new_role"], "ORG_ADMIN")
 
+    def _create_depot(self, organisation_id, name):
+        resp = self.client.post(
+            "/depots",
+            json={"organisation_id": organisation_id, "name": name},
+        )
+        self.assertEqual(resp.status_code, 201)
+        return resp.get_json()["depot_id"]
+
+    def test_stocktake_initiate_with_no_balances(self):
+        organisation_id = self.create_organisation("Stocktake Empty Org")
+        depot_id = self._create_depot(organisation_id, "Depot A")
+
+        resp = self.client.post(
+            f"/organisations/{organisation_id}/stocktake",
+            json={"depot_id": depot_id, "initiated_by_display_name": "Alice"},
+        )
+        self.assertEqual(resp.status_code, 201)
+        payload = resp.get_json()
+        self.assertEqual(payload["status"], "IN_PROGRESS")
+        self.assertEqual(payload["total_lines"], 0)
+
+    def _create_category(self, organisation_id, name):
+        req = self.client.post("/category-requests", json={
+            "organisation_id": organisation_id,
+            "requested_name": name,
+            "submitted_by_display_name": "Test",
+        })
+        self.assertEqual(req.status_code, 201)
+        cat_req_id = req.get_json()["category_request_id"]
+        approve = self.client.post(f"/category-requests/{cat_req_id}/approve")
+        self.assertEqual(approve.status_code, 200)
+        return approve.get_json()["category_id"]
+
+    def _create_resource(self, organisation_id, category_id, name):
+        resp = self.client.post("/resources", json={
+            "organisation_id": organisation_id,
+            "category_id": category_id,
+            "name": name,
+            "resource_type": "PALLET",
+            "unit_type": "UNIT",
+        })
+        self.assertEqual(resp.status_code, 201)
+        return resp.get_json()["resource_id"]
+
+    def test_stocktake_full_lifecycle_with_variance(self):
+        organisation_id = self.create_organisation("Stocktake Full Org")
+        depot_id = self._create_depot(organisation_id, "Main Depot")
+        category_id = self._create_category(organisation_id, "Pallets")
+        resource_id = self._create_resource(organisation_id, category_id, "Test Pallet")
+
+        ob_resp = self.client.post("/opening-balances", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "resource_id": resource_id,
+            "quantity": 50,
+        })
+        self.assertIn(ob_resp.status_code, (200, 201))
+
+        resp = self.client.post(
+            f"/organisations/{organisation_id}/stocktake",
+            json={"depot_id": depot_id, "initiated_by_display_name": "Alice"},
+        )
+        self.assertEqual(resp.status_code, 201)
+        stocktake_id = resp.get_json()["stocktake_id"]
+        self.assertEqual(resp.get_json()["total_lines"], 1)
+
+        detail = self.client.get(f"/organisations/{organisation_id}/stocktake/{stocktake_id}")
+        self.assertEqual(detail.status_code, 200)
+        lines = detail.get_json()["lines"]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["expected_quantity"], 50)
+        line_id = lines[0]["stocktake_line_id"]
+
+        count_resp = self.client.patch(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/lines/{line_id}",
+            json={"counted_quantity": 45, "counted_by_display_name": "Bob"},
+        )
+        self.assertEqual(count_resp.status_code, 200)
+        self.assertEqual(count_resp.get_json()["variance"], -5)
+
+        report = self.client.get(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/variance-report"
+        )
+        self.assertEqual(report.status_code, 200)
+        self.assertEqual(report.get_json()["summary"]["variance_line_count"], 1)
+
+        submit = self.client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/submit",
+            json={"submitted_by_display_name": "Bob"},
+        )
+        self.assertEqual(submit.status_code, 200)
+        self.assertEqual(submit.get_json()["status"], "PENDING_REVIEW")
+
+        post_resp = self.client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/post",
+            json={"posted_by_display_name": "Alice"},
+        )
+        self.assertEqual(post_resp.status_code, 200)
+        payload = post_resp.get_json()
+        self.assertEqual(payload["status"], "POSTED")
+        self.assertEqual(payload["adjustments_posted"], 1)
+        self.assertEqual(payload["adjustment_transactions"][0]["direction"], "OUT")
+        self.assertEqual(payload["adjustment_transactions"][0]["quantity"], 5)
+
+    def test_stocktake_cancel(self):
+        organisation_id = self.create_organisation("Stocktake Cancel Org")
+        depot_id = self._create_depot(organisation_id, "Depot Cancel")
+
+        resp = self.client.post(
+            f"/organisations/{organisation_id}/stocktake",
+            json={"depot_id": depot_id, "initiated_by_display_name": "Alice"},
+        )
+        stocktake_id = resp.get_json()["stocktake_id"]
+
+        cancel = self.client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/cancel",
+            json={"cancelled_by_display_name": "Alice"},
+        )
+        self.assertEqual(cancel.status_code, 200)
+        self.assertEqual(cancel.get_json()["status"], "CANCELLED")
+
+    def test_stocktake_list_and_global_summary(self):
+        resp = self.client.get("/global-admin/stocktake-summary")
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertEqual(payload["summary_type"], "GLOBAL_ADMIN_STOCKTAKE_SUMMARY")
+        self.assertIn("total_sessions", payload)
+
     def test_module_flags_list_route_is_registered(self):
         response = self.client.get("/global-admin/module-flags")
         self.assertEqual(response.status_code, 200)
