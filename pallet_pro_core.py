@@ -15,6 +15,7 @@ from modules.subscription_access import (
     ORG_SELF_SERVE_USER_LIMIT,
 )
 from modules.error_logging import ensure_error_logging_tables, log_error_event, register_error_logging_routes
+from modules.feature_flags import register_feature_flag_routes
 from modules.system_routes import register_system_routes
 from modules.transaction_reporting import register_transaction_reporting_routes
 
@@ -12547,6 +12548,7 @@ def list_access_operations_metrics_snapshots():
 
 # === ACCESS OPERATIONS METRICS SNAPSHOT V0.1 END ===
 
+register_feature_flag_routes(app)
 register_error_logging_routes(app)
 register_system_routes(app)
 register_subscription_routes(app)

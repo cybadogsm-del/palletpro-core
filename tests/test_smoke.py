@@ -161,6 +161,34 @@ class PalletProSmokeTests(unittest.TestCase):
         )
 
 
+    def test_module_flags_list_route_is_registered(self):
+        response = self.client.get("/global-admin/module-flags")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["dashboard_type"], "GLOBAL_ADMIN_MODULE_FLAGS")
+        self.assertIn("items", payload)
+        self.assertGreater(payload["total_modules"], 0)
+
+    def test_module_flags_disable_and_enable(self):
+        response = self.client.post(
+            "/global-admin/module-flags/partners/disable",
+            json={"reason": "smoke test", "disabled_by_display_name": "Test Admin"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.get_json()["is_enabled"])
+
+        response = self.client.post(
+            "/global-admin/module-flags/partners/enable",
+            json={"enabled_by_display_name": "Test Admin"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["is_enabled"])
+
+    def test_module_flags_always_on_cannot_be_disabled(self):
+        response = self.client.post("/global-admin/module-flags/system/disable")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("error", response.get_json())
+
     def test_error_log_routes_are_registered(self):
         response = self.client.get("/global-admin/error-log")
         self.assertEqual(response.status_code, 200)
