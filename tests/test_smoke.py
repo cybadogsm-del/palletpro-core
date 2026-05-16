@@ -436,6 +436,54 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(cancel.status_code, 200)
         self.assertEqual(cancel.get_json()["status"], "CANCELLED")
 
+    def test_stock_position_org_and_depot(self):
+        organisation_id = self.create_organisation("Stock Position Org")
+        depot_id = self._create_depot(organisation_id, "Stock Depot")
+        category_id = self._create_category(organisation_id, "Stock Cat")
+
+        chep_id = self._create_resource(organisation_id, category_id, "CHEP Pallet")
+        loscam_id = self._create_resource(organisation_id, category_id, "LOSCAM Pallet")
+        self._create_resource(organisation_id, category_id, "Plain Pallet")  # no balance
+
+        self.client.post("/opening-balances", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "resource_id": chep_id,
+            "quantity": 120,
+        })
+        self.client.post("/opening-balances", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "resource_id": loscam_id,
+            "quantity": 80,
+        })
+
+        # Org-wide: only CHEP and LOSCAM appear (Plain has zero balance)
+        org_resp = self.client.get(f"/organisations/{organisation_id}/stock-position")
+        self.assertEqual(org_resp.status_code, 200)
+        payload = org_resp.get_json()
+        self.assertEqual(payload["report_type"], "ORG_STOCK_POSITION")
+        self.assertEqual(payload["summary"]["total_resources_with_stock"], 2)
+        self.assertIn("PALLET", payload["by_resource_type"])
+        names = [i["resource_name"] for i in payload["by_resource_type"]["PALLET"]]
+        self.assertIn("CHEP Pallet", names)
+        self.assertIn("LOSCAM Pallet", names)
+        self.assertNotIn("Plain Pallet", names)
+
+        # Depot-level
+        depot_resp = self.client.get(
+            f"/organisations/{organisation_id}/depots/{depot_id}/stock-position"
+        )
+        self.assertEqual(depot_resp.status_code, 200)
+        dp = depot_resp.get_json()
+        self.assertEqual(dp["report_type"], "DEPOT_STOCK_POSITION")
+        self.assertEqual(dp["summary"]["total_resources_with_stock"], 2)
+        pallet_items = dp["by_resource_type"]["PALLET"]
+        quantities = {i["resource_name"]: i["quantity"] for i in pallet_items}
+        self.assertEqual(quantities["CHEP Pallet"], 120)
+        self.assertEqual(quantities["LOSCAM Pallet"], 80)
+        self.assertNotIn("Plain Pallet", quantities)
+
     def test_stocktake_list_and_global_summary(self):
         resp = self.client.get("/global-admin/stocktake-summary")
         self.assertEqual(resp.status_code, 200)

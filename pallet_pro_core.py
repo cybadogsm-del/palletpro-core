@@ -18,6 +18,7 @@ from modules.admin_handover import ensure_admin_handover_tables, register_admin_
 from modules.stocktake import ensure_stocktake_tables, register_stocktake_routes
 from modules.error_logging import ensure_error_logging_tables, log_error_event, register_error_logging_routes
 from modules.feature_flags import register_feature_flag_routes
+from modules.stock_position import register_stock_position_routes
 from modules.system_routes import register_system_routes
 from modules.transaction_reporting import register_transaction_reporting_routes
 
@@ -7313,10 +7314,6 @@ def create_opening_balance():
         conn.close()
         return jsonify({"error": "Depot not found"}), 404
 
-    if depot["opening_balance_used"] == 1:
-        conn.close()
-        return jsonify({"error": "Opening balance has already been used for this depot"}), 400
-
     resource = conn.execute(
         "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ?",
         (resource_id, organisation_id)
@@ -7324,6 +7321,28 @@ def create_opening_balance():
     if not resource:
         conn.close()
         return jsonify({"error": "Resource not found"}), 404
+
+    existing_ob = conn.execute(
+        """
+        SELECT transaction_id FROM transactions
+        WHERE depot_id = ? AND resource_id = ? AND transaction_type = 'OpeningBalance'
+        LIMIT 1
+        """,
+        (depot_id, resource_id)
+    ).fetchone()
+    if existing_ob:
+        conn.close()
+        return jsonify({
+            "error": "OPENING_BALANCE_ALREADY_SET",
+            "message": (
+                f"An opening balance has already been entered for "
+                f"'{resource['name']}' at this depot. "
+                "Use a regular transaction to adjust the balance."
+            ),
+            "resource_id": resource_id,
+            "resource_name": resource["name"],
+            "existing_transaction_id": existing_ob["transaction_id"],
+        }), 400
 
     transaction_id = make_id("txn")
     ledger_entry_id = make_id("led")
@@ -12556,6 +12575,7 @@ def list_access_operations_metrics_snapshots():
 
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
+register_stock_position_routes(app)
 register_stocktake_routes(
     app,
     post_transaction_to_ledger=post_transaction_to_ledger,
