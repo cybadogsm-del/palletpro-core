@@ -3,6 +3,8 @@ from audit import audit_event
 from db import DB, get_conn, make_id, now_iso
 from modules.subscription_access import (
     classify_org_access_state,
+    count_active_permanent_users,
+    ensure_org_user_cap_column,
     ensure_subscription_guard_tables,
     ensure_temporary_user_billing_columns,
     get_or_create_subscription,
@@ -10,6 +12,7 @@ from modules.subscription_access import (
     get_subscription_for_access_guard,
     register_subscription_routes,
     require_active_org_access,
+    ORG_SELF_SERVE_USER_LIMIT,
 )
 from modules.system_routes import register_system_routes
 from modules.transaction_reporting import register_transaction_reporting_routes
@@ -9912,6 +9915,7 @@ def create_user_account():
     conn = get_conn()
     ensure_user_access_tables(conn)
     ensure_subscription_guard_tables(conn)
+    ensure_org_user_cap_column(conn)
 
     if organisation_id:
         org = conn.execute(
@@ -9922,6 +9926,42 @@ def create_user_account():
         if not org:
             conn.close()
             return jsonify({"error": "Organisation not found"}), 404
+
+        if role in ("ORG_ADMIN", "USER"):
+            sub = conn.execute(
+                "SELECT selected_user_count FROM organisation_subscriptions WHERE organisation_id = ?",
+                (organisation_id,)
+            ).fetchone()
+            cap = sub["selected_user_count"] if sub and sub["selected_user_count"] is not None else None
+            if cap is not None:
+                active_count = count_active_permanent_users(conn, organisation_id)
+                if active_count >= cap:
+                    conn.close()
+                    can_self_serve = cap < ORG_SELF_SERVE_USER_LIMIT
+                    return jsonify({
+                        "error": "USER_CAP_REACHED",
+                        "dialog": {
+                            "title": "User limit reached",
+                            "message": (
+                                f"This organisation has {active_count} active user{'s' if active_count != 1 else ''} "
+                                f"and is currently set to a limit of {cap}. "
+                                + (
+                                    f"You can increase your user count up to {ORG_SELF_SERVE_USER_LIMIT} from your subscription page."
+                                    if can_self_serve else
+                                    "Your plan has a custom user limit set by Pallet Pro. Please contact Pallet Pro to increase it."
+                                )
+                            ),
+                            "primary_action": {
+                                "label": "Go to Subscription",
+                                "route": f"/organisations/{organisation_id}/subscription-dashboard",
+                                "action_type": "NAVIGATE",
+                            },
+                        },
+                        "current_active_users": active_count,
+                        "selected_user_count": cap,
+                        "self_serve_limit": ORG_SELF_SERVE_USER_LIMIT,
+                        "can_self_serve_increase": can_self_serve,
+                    }), 403
 
     if temporary_user_access_id:
         temp = conn.execute(
@@ -12577,6 +12617,132 @@ register_transaction_reporting_routes(
 
 
 
+
+
+# === USER CAP SELF-SERVE V0.1 START ===
+
+@app.post("/organisations/<organisation_id>/subscription/select-users")
+def org_select_user_count(organisation_id):
+    body = request.get_json(silent=True) or {}
+    selected_user_count = body.get("selected_user_count")
+    changed_by_display_name = (body.get("changed_by_display_name") or "Org Admin").strip()
+
+    if not isinstance(selected_user_count, int) or selected_user_count < 1:
+        return jsonify({"error": "selected_user_count must be an integer of 1 or more"}), 400
+
+    if selected_user_count > ORG_SELF_SERVE_USER_LIMIT:
+        return jsonify({
+            "error": f"Self-serve user selection is limited to {ORG_SELF_SERVE_USER_LIMIT} users.",
+            "message": f"For {ORG_SELF_SERVE_USER_LIMIT + 1}+ users, contact Pallet Pro for a tailored plan.",
+            "requested": selected_user_count,
+            "self_serve_limit": ORG_SELF_SERVE_USER_LIMIT,
+        }), 400
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+    ensure_org_user_cap_column(conn)
+    ensure_user_access_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?", (organisation_id,)
+    ).fetchone()
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    active_count = count_active_permanent_users(conn, organisation_id)
+    if selected_user_count < active_count:
+        conn.close()
+        return jsonify({
+            "error": "Cannot set user count below current active user count",
+            "current_active_users": active_count,
+            "requested_user_count": selected_user_count,
+        }), 400
+
+    sub = get_or_create_subscription(conn, organisation_id)
+    conn.execute(
+        "UPDATE organisation_subscriptions SET selected_user_count = ?, updated_at = ? WHERE organisation_id = ?",
+        (selected_user_count, now_iso(), organisation_id)
+    )
+
+    audit_event(
+        conn,
+        entity_type="OrganisationSubscription",
+        entity_id=organisation_id,
+        action="SELECT_USER_COUNT",
+        summary=f"Org selected {selected_user_count} user(s). Changed by {changed_by_display_name}.",
+        organisation_id=organisation_id,
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "organisation_id": organisation_id,
+        "selected_user_count": selected_user_count,
+        "self_serve_limit": ORG_SELF_SERVE_USER_LIMIT,
+        "current_active_users": active_count,
+        "message": f"User count set to {selected_user_count}. This is your billing quantity and user cap.",
+    }), 200
+
+
+@app.post("/global-admin/organisations/<organisation_id>/set-user-count")
+def global_admin_set_user_count(organisation_id):
+    body = request.get_json(silent=True) or {}
+    selected_user_count = body.get("selected_user_count")
+    changed_by_display_name = (body.get("changed_by_display_name") or "Global Admin").strip()
+
+    if not isinstance(selected_user_count, int) or selected_user_count < 1:
+        return jsonify({"error": "selected_user_count must be an integer of 1 or more"}), 400
+
+    conn = get_conn()
+    ensure_subscription_guard_tables(conn)
+    ensure_org_user_cap_column(conn)
+    ensure_user_access_tables(conn)
+
+    org = conn.execute(
+        "SELECT * FROM organisations WHERE organisation_id = ?", (organisation_id,)
+    ).fetchone()
+    if not org:
+        conn.close()
+        return jsonify({"error": "Organisation not found"}), 404
+
+    active_count = count_active_permanent_users(conn, organisation_id)
+    if selected_user_count < active_count:
+        conn.close()
+        return jsonify({
+            "error": "Cannot set user count below current active user count",
+            "current_active_users": active_count,
+            "requested_user_count": selected_user_count,
+        }), 400
+
+    get_or_create_subscription(conn, organisation_id)
+    conn.execute(
+        "UPDATE organisation_subscriptions SET selected_user_count = ?, updated_at = ? WHERE organisation_id = ?",
+        (selected_user_count, now_iso(), organisation_id)
+    )
+
+    audit_event(
+        conn,
+        entity_type="OrganisationSubscription",
+        entity_id=organisation_id,
+        action="GLOBAL_ADMIN_SET_USER_COUNT",
+        summary=f"Global Admin set user count to {selected_user_count} for org {organisation_id}. Changed by {changed_by_display_name}.",
+        organisation_id=organisation_id,
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "organisation_id": organisation_id,
+        "selected_user_count": selected_user_count,
+        "current_active_users": active_count,
+        "is_custom_plan": selected_user_count > ORG_SELF_SERVE_USER_LIMIT,
+        "message": f"User count set to {selected_user_count} by Global Admin.",
+    }), 200
+
+# === USER CAP SELF-SERVE V0.1 END ===
 
 
 @app.post("/organisations/<organisation_id>/unsubscribe")

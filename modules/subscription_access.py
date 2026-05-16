@@ -249,6 +249,29 @@ def get_or_create_subscription(conn, organisation_id):
     ).fetchone()
 
 
+def ensure_org_user_cap_column(conn):
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(organisation_subscriptions)").fetchall()}
+    if "selected_user_count" not in cols:
+        conn.execute("ALTER TABLE organisation_subscriptions ADD COLUMN selected_user_count INTEGER")
+
+
+ORG_SELF_SERVE_USER_LIMIT = 75
+
+
+def count_active_permanent_users(conn, organisation_id):
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM user_accounts
+        WHERE organisation_id = ?
+          AND access_status = 'ACTIVE'
+          AND role IN ('ORG_ADMIN', 'USER')
+        """,
+        (organisation_id,)
+    ).fetchone()
+    return row["cnt"] if row else 0
+
+
 def ensure_temporary_user_billing_columns(conn):
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(temporary_user_access)").fetchall()}
 
