@@ -161,5 +161,20 @@ class PalletProSmokeTests(unittest.TestCase):
         )
 
 
+    def test_error_log_routes_are_registered(self):
+        response = self.client.get("/global-admin/error-log")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["log_type"], "GLOBAL_ADMIN_ERROR_LOG")
+        self.assertEqual(payload["count"], 0)
+
+    def test_error_alerts_route_is_registered(self):
+        response = self.client.get("/global-admin/error-alerts")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["alert_type"], "GLOBAL_ADMIN_ERROR_ALERTS")
+        self.assertFalse(payload["has_unreviewed_alerts"])
+
+
 if __name__ == "__main__":
     unittest.main()
