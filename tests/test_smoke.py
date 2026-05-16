@@ -334,6 +334,28 @@ class PalletProSmokeTests(unittest.TestCase):
         )
         self.assertEqual(submit.status_code, 200)
         self.assertEqual(submit.get_json()["status"], "PENDING_REVIEW")
+        self.assertEqual(submit.get_json()["variance_lines"], 1)
+
+        # Posting without review should be blocked
+        blocked = self.client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/post",
+            json={"posted_by_display_name": "Alice"},
+        )
+        self.assertEqual(blocked.status_code, 400)
+        self.assertEqual(blocked.get_json()["error"], "REVIEW_INCOMPLETE")
+
+        # Bulk-accept all variance lines
+        bulk = self.client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/bulk-accept",
+            json={"reviewed_by_display_name": "Alice"},
+        )
+        self.assertEqual(bulk.status_code, 200)
+        self.assertEqual(bulk.get_json()["accepted_count"], 1)
+
+        # Check lines are grouped by resource type in detail view
+        detail = self.client.get(f"/organisations/{organisation_id}/stocktake/{stocktake_id}")
+        self.assertIn("lines_by_resource_type", detail.get_json())
+        self.assertIn("PALLET", detail.get_json()["lines_by_resource_type"])
 
         post_resp = self.client.post(
             f"/organisations/{organisation_id}/stocktake/{stocktake_id}/post",
@@ -345,6 +367,57 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(payload["adjustments_posted"], 1)
         self.assertEqual(payload["adjustment_transactions"][0]["direction"], "OUT")
         self.assertEqual(payload["adjustment_transactions"][0]["quantity"], 5)
+
+    def test_stocktake_individual_accept_and_reject(self):
+        organisation_id = self.create_organisation("Stocktake Review Org")
+        depot_id = self._create_depot(organisation_id, "Review Depot")
+        category_id = self._create_category(organisation_id, "Review Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "Review Pallet")
+
+        self.client.post("/opening-balances", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "resource_id": resource_id,
+            "quantity": 100,
+        })
+
+        resp = self.client.post(
+            f"/organisations/{organisation_id}/stocktake",
+            json={"depot_id": depot_id, "initiated_by_display_name": "Alice"},
+        )
+        stocktake_id = resp.get_json()["stocktake_id"]
+
+        lines = self.client.get(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}"
+        ).get_json()["lines"]
+        line_id = lines[0]["stocktake_line_id"]
+
+        self.client.patch(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/lines/{line_id}",
+            json={"counted_quantity": 90, "counted_by_display_name": "Bob"},
+        )
+
+        self.client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/submit",
+            json={"submitted_by_display_name": "Bob"},
+        )
+
+        # Reject the individual line
+        reject = self.client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/lines/{line_id}/reject",
+            json={"reviewed_by_display_name": "Alice", "rejection_reason": "Counting error"},
+        )
+        self.assertEqual(reject.status_code, 200)
+        self.assertEqual(reject.get_json()["review_status"], "REJECTED")
+
+        # Post — no adjustments since the only variance was rejected
+        post_resp = self.client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/post",
+            json={"posted_by_display_name": "Alice"},
+        )
+        self.assertEqual(post_resp.status_code, 200)
+        self.assertEqual(post_resp.get_json()["adjustments_posted"], 0)
+        self.assertEqual(post_resp.get_json()["rejected_lines"], 1)
 
     def test_stocktake_cancel(self):
         organisation_id = self.create_organisation("Stocktake Cancel Org")

@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 from flask import jsonify, request
 
 from audit import audit_event
@@ -44,9 +46,19 @@ def ensure_stocktake_tables(conn):
         count_notes TEXT,
         counted_by_display_name TEXT,
         counted_at TEXT,
-        adjustment_transaction_id TEXT
+        adjustment_transaction_id TEXT,
+        review_status TEXT,
+        reviewed_by_display_name TEXT,
+        reviewed_at TEXT,
+        rejection_reason TEXT
     )
     """)
+
+    # Migration: add review columns to existing tables
+    line_cols = {r["name"] for r in conn.execute("PRAGMA table_info(stocktake_lines)").fetchall()}
+    for col in ("review_status", "reviewed_by_display_name", "reviewed_at", "rejection_reason"):
+        if col not in line_cols:
+            conn.execute(f"ALTER TABLE stocktake_lines ADD COLUMN {col} TEXT")
 
 
 def _get_depot(conn, depot_id, organisation_id):
@@ -65,9 +77,20 @@ def _get_stocktake(conn, stocktake_id, organisation_id):
 
 def _get_lines(conn, stocktake_id):
     return conn.execute(
-        "SELECT * FROM stocktake_lines WHERE stocktake_id = ? ORDER BY resource_name ASC",
+        """
+        SELECT * FROM stocktake_lines
+        WHERE stocktake_id = ?
+        ORDER BY resource_type ASC, resource_name ASC
+        """,
         (stocktake_id,)
     ).fetchall()
+
+
+def _group_lines_by_resource_type(lines):
+    groups = defaultdict(list)
+    for line in lines:
+        groups[line["resource_type"]].append(dict(line))
+    return dict(groups)
 
 
 def _update_session_counts(conn, stocktake_id):
@@ -81,7 +104,7 @@ def _update_session_counts(conn, stocktake_id):
         SET total_lines = ?, lines_counted = ?, variance_lines = ?
         WHERE stocktake_id = ?
         """,
-        (total, counted, variances, stocktake_id)
+        (total, counted, variances, stocktake_id),
     )
 
 
@@ -125,9 +148,10 @@ def register_stocktake_routes(
         active = conn.execute(
             """
             SELECT stocktake_id FROM stocktake_sessions
-            WHERE organisation_id = ? AND depot_id = ? AND status = 'IN_PROGRESS'
+            WHERE organisation_id = ? AND depot_id = ?
+              AND status IN ('IN_PROGRESS', 'PENDING_REVIEW')
             """,
-            (organisation_id, depot_id)
+            (organisation_id, depot_id),
         ).fetchone()
         if active:
             conn.close()
@@ -148,7 +172,7 @@ def register_stocktake_routes(
                 "active_stocktake_id": active["stocktake_id"],
             }), 409
 
-        # Snapshot balance_projection for this depot
+        # Snapshot balance_projection for this depot, grouped by resource type
         balances = conn.execute(
             """
             SELECT bp.resource_id, bp.current_quantity,
@@ -157,9 +181,9 @@ def register_stocktake_routes(
             JOIN resources r ON r.resource_id = bp.resource_id
             WHERE bp.organisation_id = ? AND bp.depot_id = ?
               AND r.is_active = 1
-            ORDER BY r.name ASC
+            ORDER BY r.resource_type ASC, r.name ASC
             """,
-            (organisation_id, depot_id)
+            (organisation_id, depot_id),
         ).fetchall()
 
         stocktake_id = make_id("stk")
@@ -176,7 +200,7 @@ def register_stocktake_routes(
             (
                 stocktake_id, organisation_id, depot_id, depot["name"],
                 snapshot_at, initiated_by, notes, len(balances), snapshot_at,
-            )
+            ),
         )
 
         for bal in balances:
@@ -192,8 +216,10 @@ def register_stocktake_routes(
                     bal["resource_id"], bal["resource_name"],
                     bal["resource_type"], bal["unit_type"],
                     bal["current_quantity"],
-                )
+                ),
             )
+
+        resource_types = sorted({bal["resource_type"] for bal in balances})
 
         audit_event(
             conn,
@@ -202,7 +228,8 @@ def register_stocktake_routes(
             action="INITIATE",
             summary=(
                 f"Stocktake initiated for depot '{depot['name']}' in org {organisation_id} "
-                f"by {initiated_by}. {len(balances)} line(s) snapshotted."
+                f"by {initiated_by}. {len(balances)} line(s) across "
+                f"{len(resource_types)} resource type(s): {', '.join(resource_types) or 'none'}."
             ),
         )
 
@@ -218,10 +245,12 @@ def register_stocktake_routes(
             "snapshot_taken_at": snapshot_at,
             "initiated_by_display_name": initiated_by,
             "total_lines": len(balances),
+            "resource_types": resource_types,
             "notes": notes,
             "message": (
-                f"Stocktake started for depot '{depot['name']}' with {len(balances)} resource line(s). "
-                "Record counts for each line, then submit for review."
+                f"Stocktake started for depot '{depot['name']}' with {len(balances)} "
+                f"line(s) across {len(resource_types)} resource type(s). "
+                "Record a physical count for each line, then submit for review."
             ),
         }), 201
 
@@ -267,9 +296,15 @@ def register_stocktake_routes(
         lines = _get_lines(conn, stocktake_id)
         conn.close()
 
+        line_dicts = [dict(l) for l in lines]
+        pending_review = [l for l in line_dicts if l.get("review_status") == "PENDING_REVIEW"]
+
         return jsonify({
             **dict(session),
-            "lines": [dict(l) for l in lines],
+            "lines": line_dicts,
+            "lines_by_resource_type": _group_lines_by_resource_type(lines),
+            "lines_pending_review": len(pending_review),
+            "review_complete": len(pending_review) == 0 and session["status"] == "PENDING_REVIEW",
         }), 200
 
     @app.patch("/organisations/<organisation_id>/stocktake/<stocktake_id>/lines/<stocktake_line_id>")
@@ -301,8 +336,8 @@ def register_stocktake_routes(
                 "dialog": {
                     "title": "Stocktake is not editable",
                     "message": (
-                        f"This stocktake is currently '{session['status']}' and cannot be edited. "
-                        "Only IN_PROGRESS stocktakes can have counts recorded."
+                        f"This stocktake is '{session['status']}' and can no longer be edited. "
+                        "Counts can only be recorded while the stocktake is IN_PROGRESS."
                     ),
                     "primary_action": {
                         "label": "View Stocktake",
@@ -314,7 +349,7 @@ def register_stocktake_routes(
 
         line = conn.execute(
             "SELECT * FROM stocktake_lines WHERE stocktake_line_id = ? AND stocktake_id = ?",
-            (stocktake_line_id, stocktake_id)
+            (stocktake_line_id, stocktake_id),
         ).fetchone()
         if not line:
             conn.close()
@@ -327,10 +362,11 @@ def register_stocktake_routes(
             """
             UPDATE stocktake_lines
             SET counted_quantity = ?, variance = ?, count_notes = ?,
-                counted_by_display_name = ?, counted_at = ?
+                counted_by_display_name = ?, counted_at = ?,
+                review_status = NULL
             WHERE stocktake_line_id = ?
             """,
-            (counted_quantity, variance, count_notes, counted_by, counted_at, stocktake_line_id)
+            (counted_quantity, variance, count_notes, counted_by, counted_at, stocktake_line_id),
         )
 
         _update_session_counts(conn, stocktake_id)
@@ -341,9 +377,10 @@ def register_stocktake_routes(
             entity_id=stocktake_line_id,
             action="COUNT_RECORDED",
             summary=(
-                f"Count recorded for resource '{line['resource_name']}' in stocktake {stocktake_id}: "
-                f"expected={line['expected_quantity']}, counted={counted_quantity}, variance={variance:+d}. "
-                f"By {counted_by}."
+                f"Count recorded for '{line['resource_name']}' ({line['resource_type']}) "
+                f"in stocktake {stocktake_id}: "
+                f"expected={line['expected_quantity']}, counted={counted_quantity}, "
+                f"variance={variance:+d}. By {counted_by}."
             ),
         )
 
@@ -355,6 +392,7 @@ def register_stocktake_routes(
             "stocktake_id": stocktake_id,
             "resource_id": line["resource_id"],
             "resource_name": line["resource_name"],
+            "resource_type": line["resource_type"],
             "expected_quantity": line["expected_quantity"],
             "counted_quantity": counted_quantity,
             "variance": variance,
@@ -396,7 +434,7 @@ def register_stocktake_routes(
                     "title": "Not all lines have been counted",
                     "message": (
                         f"{len(uncounted)} of {len(lines)} resource line(s) still need a count. "
-                        "Record a count for every line before submitting for review."
+                        "Record a physical count for every line before submitting for review."
                     ),
                     "primary_action": {
                         "label": "Continue Counting",
@@ -405,20 +443,40 @@ def register_stocktake_routes(
                     },
                 },
                 "uncounted_line_ids": [l["stocktake_line_id"] for l in uncounted],
-                "uncounted_resources": [l["resource_name"] for l in uncounted],
+                "uncounted_resources": [
+                    {"name": l["resource_name"], "type": l["resource_type"]}
+                    for l in uncounted
+                ],
             }), 400
 
         submitted_at = now_iso()
+
+        # Auto-accept zero-variance lines; flag variance lines for admin review
+        for line in lines:
+            if line["variance"] == 0:
+                conn.execute(
+                    "UPDATE stocktake_lines SET review_status = 'ACCEPTED' WHERE stocktake_line_id = ?",
+                    (line["stocktake_line_id"],),
+                )
+            else:
+                conn.execute(
+                    "UPDATE stocktake_lines SET review_status = 'PENDING_REVIEW' WHERE stocktake_line_id = ?",
+                    (line["stocktake_line_id"],),
+                )
+
         conn.execute(
             """
             UPDATE stocktake_sessions
             SET status = 'PENDING_REVIEW', submitted_by_display_name = ?, submitted_at = ?
             WHERE stocktake_id = ?
             """,
-            (submitted_by, submitted_at, stocktake_id)
+            (submitted_by, submitted_at, stocktake_id),
         )
 
-        variance_count = sum(1 for l in lines if l["variance"] != 0)
+        variance_lines = [l for l in lines if l["variance"] != 0]
+        by_type = defaultdict(int)
+        for l in variance_lines:
+            by_type[l["resource_type"]] += 1
 
         audit_event(
             conn,
@@ -427,7 +485,7 @@ def register_stocktake_routes(
             action="SUBMIT",
             summary=(
                 f"Stocktake {stocktake_id} submitted for review by {submitted_by}. "
-                f"{len(lines)} line(s), {variance_count} variance(s) found."
+                f"{len(lines)} line(s), {len(variance_lines)} variance(s) pending admin decision."
             ),
         )
 
@@ -440,10 +498,250 @@ def register_stocktake_routes(
             "submitted_by_display_name": submitted_by,
             "submitted_at": submitted_at,
             "total_lines": len(lines),
-            "variance_lines": variance_count,
+            "variance_lines": len(variance_lines),
+            "variance_by_resource_type": dict(by_type),
             "message": (
-                f"Stocktake submitted. {variance_count} variance(s) will be posted as "
-                "adjustment transactions when approved."
+                f"Stocktake submitted. {len(variance_lines)} variance(s) are awaiting your decision. "
+                "Accept or reject each counted quantity, or use bulk-accept to approve all at once."
+            ),
+        }), 200
+
+    @app.post("/organisations/<organisation_id>/stocktake/<stocktake_id>/lines/<stocktake_line_id>/accept")
+    def accept_stocktake_line(organisation_id, stocktake_id, stocktake_line_id):
+        body = request.get_json(silent=True) or {}
+        reviewed_by = (body.get("reviewed_by_display_name") or "").strip()
+
+        if not reviewed_by:
+            return jsonify({"error": "reviewed_by_display_name is required"}), 400
+
+        conn = _get_conn()
+        ensure_stocktake_tables(conn)
+
+        session = _get_stocktake(conn, stocktake_id, organisation_id)
+        if not session:
+            conn.close()
+            return jsonify({"error": "Stocktake not found"}), 404
+
+        if session["status"] != "PENDING_REVIEW":
+            conn.close()
+            return jsonify({
+                "error": "Line review is only available when stocktake is PENDING_REVIEW",
+                "current_status": session["status"],
+            }), 400
+
+        line = conn.execute(
+            "SELECT * FROM stocktake_lines WHERE stocktake_line_id = ? AND stocktake_id = ?",
+            (stocktake_line_id, stocktake_id),
+        ).fetchone()
+        if not line:
+            conn.close()
+            return jsonify({"error": "Stocktake line not found"}), 404
+
+        if line["review_status"] != "PENDING_REVIEW":
+            conn.close()
+            return jsonify({
+                "error": "Line is not pending review",
+                "current_review_status": line["review_status"],
+            }), 400
+
+        reviewed_at = now_iso()
+        conn.execute(
+            """
+            UPDATE stocktake_lines
+            SET review_status = 'ACCEPTED', reviewed_by_display_name = ?,
+                reviewed_at = ?, rejection_reason = NULL
+            WHERE stocktake_line_id = ?
+            """,
+            (reviewed_by, reviewed_at, stocktake_line_id),
+        )
+
+        audit_event(
+            conn,
+            entity_type="StocktakeLine",
+            entity_id=stocktake_line_id,
+            action="ACCEPT",
+            summary=(
+                f"Counted qty {line['counted_quantity']} accepted for "
+                f"'{line['resource_name']}' ({line['resource_type']}) "
+                f"(variance {line['variance']:+d}) by {reviewed_by}."
+            ),
+        )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "stocktake_line_id": stocktake_line_id,
+            "resource_name": line["resource_name"],
+            "resource_type": line["resource_type"],
+            "expected_quantity": line["expected_quantity"],
+            "counted_quantity": line["counted_quantity"],
+            "variance": line["variance"],
+            "review_status": "ACCEPTED",
+            "reviewed_by_display_name": reviewed_by,
+            "reviewed_at": reviewed_at,
+            "message": (
+                f"Accepted. A {abs(line['variance'])}-unit "
+                f"{'increase' if line['variance'] > 0 else 'decrease'} adjustment will be "
+                "applied to the balance when this stocktake is posted."
+            ),
+        }), 200
+
+    @app.post("/organisations/<organisation_id>/stocktake/<stocktake_id>/lines/<stocktake_line_id>/reject")
+    def reject_stocktake_line(organisation_id, stocktake_id, stocktake_line_id):
+        body = request.get_json(silent=True) or {}
+        reviewed_by = (body.get("reviewed_by_display_name") or "").strip()
+        rejection_reason = (body.get("rejection_reason") or "").strip() or None
+
+        if not reviewed_by:
+            return jsonify({"error": "reviewed_by_display_name is required"}), 400
+
+        conn = _get_conn()
+        ensure_stocktake_tables(conn)
+
+        session = _get_stocktake(conn, stocktake_id, organisation_id)
+        if not session:
+            conn.close()
+            return jsonify({"error": "Stocktake not found"}), 404
+
+        if session["status"] != "PENDING_REVIEW":
+            conn.close()
+            return jsonify({
+                "error": "Line review is only available when stocktake is PENDING_REVIEW",
+                "current_status": session["status"],
+            }), 400
+
+        line = conn.execute(
+            "SELECT * FROM stocktake_lines WHERE stocktake_line_id = ? AND stocktake_id = ?",
+            (stocktake_line_id, stocktake_id),
+        ).fetchone()
+        if not line:
+            conn.close()
+            return jsonify({"error": "Stocktake line not found"}), 404
+
+        if line["review_status"] != "PENDING_REVIEW":
+            conn.close()
+            return jsonify({
+                "error": "Line is not pending review",
+                "current_review_status": line["review_status"],
+            }), 400
+
+        reviewed_at = now_iso()
+        conn.execute(
+            """
+            UPDATE stocktake_lines
+            SET review_status = 'REJECTED', reviewed_by_display_name = ?,
+                reviewed_at = ?, rejection_reason = ?
+            WHERE stocktake_line_id = ?
+            """,
+            (reviewed_by, reviewed_at, rejection_reason, stocktake_line_id),
+        )
+
+        audit_event(
+            conn,
+            entity_type="StocktakeLine",
+            entity_id=stocktake_line_id,
+            action="REJECT",
+            summary=(
+                f"Counted qty {line['counted_quantity']} rejected for "
+                f"'{line['resource_name']}' ({line['resource_type']}) "
+                f"(variance {line['variance']:+d}) by {reviewed_by}. "
+                f"Reason: {rejection_reason or 'not specified'}."
+            ),
+        )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "stocktake_line_id": stocktake_line_id,
+            "resource_name": line["resource_name"],
+            "resource_type": line["resource_type"],
+            "expected_quantity": line["expected_quantity"],
+            "counted_quantity": line["counted_quantity"],
+            "variance": line["variance"],
+            "review_status": "REJECTED",
+            "reviewed_by_display_name": reviewed_by,
+            "reviewed_at": reviewed_at,
+            "rejection_reason": rejection_reason,
+            "message": "Rejected. The balance for this resource will not be adjusted.",
+        }), 200
+
+    @app.post("/organisations/<organisation_id>/stocktake/<stocktake_id>/bulk-accept")
+    def bulk_accept_stocktake_lines(organisation_id, stocktake_id):
+        body = request.get_json(silent=True) or {}
+        reviewed_by = (body.get("reviewed_by_display_name") or "").strip()
+
+        if not reviewed_by:
+            return jsonify({"error": "reviewed_by_display_name is required"}), 400
+
+        conn = _get_conn()
+        ensure_stocktake_tables(conn)
+
+        session = _get_stocktake(conn, stocktake_id, organisation_id)
+        if not session:
+            conn.close()
+            return jsonify({"error": "Stocktake not found"}), 404
+
+        if session["status"] != "PENDING_REVIEW":
+            conn.close()
+            return jsonify({
+                "error": "Bulk accept is only available when stocktake is PENDING_REVIEW",
+                "current_status": session["status"],
+            }), 400
+
+        pending_lines = conn.execute(
+            """
+            SELECT * FROM stocktake_lines
+            WHERE stocktake_id = ? AND review_status = 'PENDING_REVIEW'
+            """,
+            (stocktake_id,),
+        ).fetchall()
+
+        if not pending_lines:
+            conn.close()
+            return jsonify({
+                "error": "No lines are pending review",
+                "message": "All variance lines have already been reviewed.",
+            }), 400
+
+        reviewed_at = now_iso()
+        conn.execute(
+            """
+            UPDATE stocktake_lines
+            SET review_status = 'ACCEPTED', reviewed_by_display_name = ?, reviewed_at = ?
+            WHERE stocktake_id = ? AND review_status = 'PENDING_REVIEW'
+            """,
+            (reviewed_by, reviewed_at, stocktake_id),
+        )
+
+        by_type = defaultdict(int)
+        for l in pending_lines:
+            by_type[l["resource_type"]] += 1
+
+        audit_event(
+            conn,
+            entity_type="StocktakeSession",
+            entity_id=stocktake_id,
+            action="BULK_ACCEPT",
+            summary=(
+                f"Bulk-accepted {len(pending_lines)} variance line(s) in stocktake {stocktake_id} "
+                f"by {reviewed_by}."
+            ),
+        )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "stocktake_id": stocktake_id,
+            "accepted_count": len(pending_lines),
+            "accepted_by_resource_type": dict(by_type),
+            "reviewed_by_display_name": reviewed_by,
+            "reviewed_at": reviewed_at,
+            "message": (
+                f"{len(pending_lines)} variance line(s) accepted. "
+                "You can now post the stocktake to apply all adjustments."
             ),
         }), 200
 
@@ -460,12 +758,19 @@ def register_stocktake_routes(
         lines = _get_lines(conn, stocktake_id)
         conn.close()
 
-        variance_lines = [
-            dict(l) for l in lines
-            if l["variance"] is not None and l["variance"] != 0
-        ]
-        zero_variance = sum(1 for l in lines if l["variance"] == 0)
-        uncounted = sum(1 for l in lines if l["counted_quantity"] is None)
+        all_lines = [dict(l) for l in lines]
+        variance_lines = [l for l in all_lines if l.get("variance") is not None and l["variance"] != 0]
+        zero_variance = sum(1 for l in all_lines if l.get("variance") == 0)
+        uncounted = sum(1 for l in all_lines if l["counted_quantity"] is None)
+
+        pending_review = [l for l in variance_lines if l.get("review_status") == "PENDING_REVIEW"]
+        accepted = [l for l in variance_lines if l.get("review_status") == "ACCEPTED"]
+        rejected = [l for l in variance_lines if l.get("review_status") == "REJECTED"]
+
+        # Group variance lines by resource type
+        variance_by_type = defaultdict(list)
+        for l in variance_lines:
+            variance_by_type[l["resource_type"]].append(l)
 
         return jsonify({
             "stocktake_id": stocktake_id,
@@ -475,13 +780,17 @@ def register_stocktake_routes(
             "status": session["status"],
             "report_type": "STOCKTAKE_VARIANCE_REPORT",
             "summary": {
-                "total_lines": len(lines),
-                "counted_lines": len(lines) - uncounted,
+                "total_lines": len(all_lines),
+                "counted_lines": len(all_lines) - uncounted,
                 "uncounted_lines": uncounted,
                 "zero_variance_lines": zero_variance,
                 "variance_line_count": len(variance_lines),
+                "pending_review_count": len(pending_review),
+                "accepted_count": len(accepted),
+                "rejected_count": len(rejected),
             },
             "variance_lines": variance_lines,
+            "variance_by_resource_type": {k: v for k, v in variance_by_type.items()},
         }), 200
 
     @app.post("/organisations/<organisation_id>/stocktake/<stocktake_id>/post")
@@ -503,15 +812,15 @@ def register_stocktake_routes(
             conn.close()
             return jsonify({"error": "Stocktake not found"}), 404
 
-        if session["status"] not in ("IN_PROGRESS", "PENDING_REVIEW"):
+        if session["status"] != "PENDING_REVIEW":
             conn.close()
             return jsonify({
-                "error": "Stocktake cannot be posted",
+                "error": "Stocktake must be PENDING_REVIEW before posting",
                 "current_status": session["status"],
-                "allowed_statuses": ["IN_PROGRESS", "PENDING_REVIEW"],
             }), 400
 
-        lines = _get_lines(conn, stocktake_id)
+        lines = [dict(l) for l in _get_lines(conn, stocktake_id)]
+
         uncounted = [l for l in lines if l["counted_quantity"] is None]
         if uncounted:
             conn.close()
@@ -520,11 +829,11 @@ def register_stocktake_routes(
                 "dialog": {
                     "title": "Not all lines have been counted",
                     "message": (
-                        f"{len(uncounted)} of {len(lines)} line(s) have no count recorded. "
+                        f"{len(uncounted)} line(s) have no count recorded. "
                         "All lines must be counted before posting."
                     ),
                     "primary_action": {
-                        "label": "Continue Counting",
+                        "label": "View Stocktake",
                         "route": f"/organisations/{organisation_id}/stocktake/{stocktake_id}",
                         "action_type": "NAVIGATE",
                     },
@@ -532,11 +841,33 @@ def register_stocktake_routes(
                 "uncounted_line_ids": [l["stocktake_line_id"] for l in uncounted],
             }), 400
 
+        still_pending = [l for l in lines if l.get("review_status") == "PENDING_REVIEW"]
+        if still_pending:
+            conn.close()
+            return jsonify({
+                "error": "REVIEW_INCOMPLETE",
+                "dialog": {
+                    "title": "Review not complete",
+                    "message": (
+                        f"{len(still_pending)} variance line(s) still need your decision. "
+                        "Accept or reject each counted quantity, or use bulk-accept to approve all at once."
+                    ),
+                    "primary_action": {
+                        "label": "Review Variances",
+                        "route": f"/organisations/{organisation_id}/stocktake/{stocktake_id}/variance-report",
+                        "action_type": "NAVIGATE",
+                    },
+                },
+                "pending_review_count": len(still_pending),
+                "pending_line_ids": [l["stocktake_line_id"] for l in still_pending],
+            }), 400
+
         posted_at = now_iso()
-        adjustment_txn_ids = []
+        adjustment_txns = []
 
         for line in lines:
-            if line["variance"] == 0:
+            # Only post adjustments for accepted non-zero variances
+            if line.get("review_status") != "ACCEPTED" or line["variance"] == 0:
                 continue
 
             direction = "IN" if line["variance"] > 0 else "OUT"
@@ -558,32 +889,34 @@ def register_stocktake_routes(
                     txn_id, organisation_id, session["depot_id"],
                     line["resource_id"], qty, direction,
                     posted_by, ref_number, org_seq, posted_at,
-                )
+                ),
             )
 
-            txn = {
+            post_transaction_to_ledger(conn, {
                 "transaction_id": txn_id,
                 "organisation_id": organisation_id,
                 "depot_id": session["depot_id"],
                 "resource_id": line["resource_id"],
                 "quantity": qty,
                 "direction": direction,
-            }
-            post_transaction_to_ledger(conn, txn)
+            })
 
             conn.execute(
                 "UPDATE stocktake_lines SET adjustment_transaction_id = ? WHERE stocktake_line_id = ?",
-                (txn_id, line["stocktake_line_id"])
+                (txn_id, line["stocktake_line_id"]),
             )
 
-            adjustment_txn_ids.append({
+            adjustment_txns.append({
                 "transaction_id": txn_id,
                 "reference_number": ref_number,
                 "resource_name": line["resource_name"],
+                "resource_type": line["resource_type"],
                 "direction": direction,
                 "quantity": qty,
                 "variance": line["variance"],
             })
+
+        rejected_lines = [l for l in lines if l.get("review_status") == "REJECTED"]
 
         conn.execute(
             """
@@ -591,7 +924,7 @@ def register_stocktake_routes(
             SET status = 'POSTED', posted_by_display_name = ?, posted_at = ?
             WHERE stocktake_id = ?
             """,
-            (posted_by, posted_at, stocktake_id)
+            (posted_by, posted_at, stocktake_id),
         )
 
         _update_session_counts(conn, stocktake_id)
@@ -603,7 +936,8 @@ def register_stocktake_routes(
             action="POST",
             summary=(
                 f"Stocktake {stocktake_id} posted by {posted_by}. "
-                f"{len(adjustment_txn_ids)} adjustment transaction(s) created."
+                f"{len(adjustment_txns)} adjustment(s) applied, "
+                f"{len(rejected_lines)} variance(s) rejected (no adjustment)."
             ),
         )
 
@@ -616,11 +950,12 @@ def register_stocktake_routes(
             "posted_by_display_name": posted_by,
             "posted_at": posted_at,
             "total_lines": len(lines),
-            "adjustments_posted": len(adjustment_txn_ids),
-            "adjustment_transactions": adjustment_txn_ids,
+            "adjustments_posted": len(adjustment_txns),
+            "rejected_lines": len(rejected_lines),
+            "adjustment_transactions": adjustment_txns,
             "message": (
-                f"Stocktake posted. {len(adjustment_txn_ids)} adjustment transaction(s) "
-                "applied to balance."
+                f"Stocktake posted. {len(adjustment_txns)} adjustment(s) applied to balance. "
+                + (f"{len(rejected_lines)} variance(s) were rejected and not adjusted." if rejected_lines else "")
             ),
         }), 200
 
@@ -647,8 +982,8 @@ def register_stocktake_routes(
                 "dialog": {
                     "title": "Cannot cancel a posted stocktake",
                     "message": (
-                        "This stocktake has already been posted and adjustment transactions have been applied. "
-                        "To correct an error, create a new stocktake for this depot."
+                        "This stocktake has already been posted and adjustments have been applied. "
+                        "To correct the balance, start a new stocktake for this depot."
                     ),
                     "primary_action": {
                         "label": "Start New Stocktake",
@@ -669,7 +1004,7 @@ def register_stocktake_routes(
             SET status = 'CANCELLED', cancelled_at = ?, cancelled_by_display_name = ?
             WHERE stocktake_id = ?
             """,
-            (cancelled_at, cancelled_by, stocktake_id)
+            (cancelled_at, cancelled_by, stocktake_id),
         )
 
         audit_event(
