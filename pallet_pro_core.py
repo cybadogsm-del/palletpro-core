@@ -2435,6 +2435,36 @@ def reject_location_update_request(location_update_request_id):
     }), 200
 
 
+@app.get("/depots")
+def list_depots():
+    organisation_id = request.args.get("organisation_id")
+    is_active = request.args.get("is_active")
+
+    conn = get_conn()
+
+    sql = "SELECT depot_id, organisation_id, name, opening_balance_used, created_at FROM depots WHERE 1=1"
+    params = []
+
+    if organisation_id:
+        sql += " AND organisation_id = ?"
+        params.append(organisation_id)
+
+    if is_active is not None:
+        active_val = 1 if is_active.lower() in ("1", "true", "yes") else 0
+        sql += " AND is_active = ?"
+        params.append(active_val)
+
+    sql += " ORDER BY name ASC"
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    return jsonify({
+        "count": len(rows),
+        "depots": [dict(r) for r in rows],
+    }), 200
+
+
 @app.post("/depots")
 def create_depot():
     body = request.get_json(silent=True) or {}
