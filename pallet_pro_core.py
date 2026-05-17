@@ -12989,6 +12989,7 @@ from modules.password_auth import register_password_auth_routes
 from modules.webauthn_auth import register_webauthn_routes
 from modules.tcr import register_tcr_routes
 from modules.resource_loss import register_resource_loss_routes
+from modules.offline_batch import register_offline_batch_routes
 
 register_auth_middleware(app)
 register_auth_routes(app)
@@ -13009,6 +13010,16 @@ register_resource_loss_routes(
     ensure_transaction_numbering_tables=ensure_transaction_numbering_tables,
     ensure_transaction_partner_columns=ensure_transaction_partner_columns,
     ensure_transaction_user_attribution_columns=ensure_transaction_user_attribution_columns,
+)
+register_offline_batch_routes(
+    app,
+    post_transaction_to_ledger=post_transaction_to_ledger,
+    generate_transaction_reference=generate_transaction_reference,
+    ensure_transaction_numbering_tables=ensure_transaction_numbering_tables,
+    ensure_transaction_partner_columns=ensure_transaction_partner_columns,
+    ensure_partner_address_tables=ensure_partner_address_tables,
+    ensure_transaction_user_attribution_columns=ensure_transaction_user_attribution_columns,
+    create_pending_entry=create_pending_entry,
 )
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
