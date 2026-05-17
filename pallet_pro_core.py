@@ -8581,6 +8581,18 @@ def resolve_transaction_entity(transaction_id):
     conn.commit()
     conn.close()
 
+    if txn["submitted_by_user_id"]:
+        send_push_to_user(
+            txn["submitted_by_user_id"],
+            title="Your transaction is complete",
+            body=(
+                f"The missing entity has been added and your transaction "
+                f"#{txn.get('reference_number') or transaction_id} has been posted."
+            ),
+            url=f"/transactions/{transaction_id}",
+            tag=f"resolve-{transaction_id}",
+        )
+
     return jsonify({
         "transaction_id": transaction_id,
         "status": "POSTED",
@@ -13217,6 +13229,7 @@ from modules.offline_batch import register_offline_batch_routes
 from modules.referral import register_referral_routes
 from modules.org_branding import register_org_branding_routes
 from modules.help_text import register_help_text_routes
+from modules.web_push import register_web_push_routes, send_push_to_user
 
 register_auth_middleware(app)
 register_auth_routes(app)
@@ -13251,6 +13264,7 @@ register_offline_batch_routes(
 register_referral_routes(app)
 register_org_branding_routes(app)
 register_help_text_routes(app)
+register_web_push_routes(app)
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
 register_stock_position_routes(app)
