@@ -11,7 +11,7 @@ from flask import g, jsonify, request
 
 from audit import audit_event
 from db import get_conn, make_id, now_iso
-from modules.web_push import send_push_to_user
+from modules.notifications import notify_user
 
 _VALID_TCR_STATUSES = {"PENDING", "APPROVED", "REJECTED"}
 _ORG_ADMIN_ROLES = {"ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
@@ -475,15 +475,18 @@ def register_tcr_routes(
         conn.close()
 
         if tcr["requested_by_user_id"]:
-            send_push_to_user(
-                tcr["requested_by_user_id"],
+            notify_user(
+                user_id=tcr["requested_by_user_id"],
+                notification_type="TCR_APPROVED",
                 title="Correction approved",
                 body=(
                     f"Your correction request has been approved by {current_user['display_name']}."
                     + (f" {review_notes}" if review_notes else "")
                 ),
                 url=f"/transactions/{tcr['transaction_id']}",
-                tag=f"tcr-{tcr_id}",
+                entity_type="TransactionCorrectionRequest",
+                entity_id=tcr_id,
+                organisation_id=txn["organisation_id"],
             )
 
         return jsonify({
@@ -551,12 +554,15 @@ def register_tcr_routes(
         conn.close()
 
         if tcr["requested_by_user_id"]:
-            send_push_to_user(
-                tcr["requested_by_user_id"],
+            notify_user(
+                user_id=tcr["requested_by_user_id"],
+                notification_type="TCR_REJECTED",
                 title="Correction request declined",
                 body=f"Your correction request was not approved. Reason: {review_notes}",
                 url=f"/transactions/{tcr['transaction_id']}",
-                tag=f"tcr-{tcr_id}",
+                entity_type="TransactionCorrectionRequest",
+                entity_id=tcr_id,
+                organisation_id=tcr["organisation_id"],
             )
 
         return jsonify({

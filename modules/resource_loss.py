@@ -11,7 +11,7 @@ from flask import g, jsonify, request
 
 from audit import audit_event
 from db import get_conn, make_id, now_iso
-from modules.web_push import send_push_to_user
+from modules.notifications import notify_user
 
 _LOSS_TYPES = {"DAMAGED", "STOLEN", "LOST", "DESTROYED", "OTHER"}
 _VALID_STATUSES = {"PENDING_REVIEW", "CONFIRMED", "REJECTED"}
@@ -406,15 +406,18 @@ def register_resource_loss_routes(
 
         if loss["reported_by_user_id"]:
             resource_label = resource["name"] if resource else "equipment"
-            send_push_to_user(
-                loss["reported_by_user_id"],
+            notify_user(
+                user_id=loss["reported_by_user_id"],
+                notification_type="LOSS_CONFIRMED",
                 title="Loss report confirmed",
                 body=(
                     f"Your loss report for {loss['quantity']} × {resource_label} "
                     f"has been confirmed. Balance updated."
                 ),
                 url=f"/resource-losses/{loss_id}",
-                tag=f"loss-{loss_id}",
+                entity_type="ResourceLoss",
+                entity_id=loss_id,
+                organisation_id=loss["organisation_id"],
             )
 
         return jsonify({
@@ -482,12 +485,15 @@ def register_resource_loss_routes(
         conn.close()
 
         if loss["reported_by_user_id"]:
-            send_push_to_user(
-                loss["reported_by_user_id"],
+            notify_user(
+                user_id=loss["reported_by_user_id"],
+                notification_type="LOSS_REJECTED",
                 title="Loss report not approved",
                 body=f"Your loss report was not approved. Reason: {review_notes}",
                 url=f"/resource-losses/{loss_id}",
-                tag=f"loss-{loss_id}",
+                entity_type="ResourceLoss",
+                entity_id=loss_id,
+                organisation_id=loss["organisation_id"],
             )
 
         return jsonify({

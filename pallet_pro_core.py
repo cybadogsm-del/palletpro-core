@@ -8582,15 +8582,18 @@ def resolve_transaction_entity(transaction_id):
     conn.close()
 
     if txn["submitted_by_user_id"]:
-        send_push_to_user(
-            txn["submitted_by_user_id"],
+        notify_user(
+            user_id=txn["submitted_by_user_id"],
+            notification_type="ENTITY_RESOLVED",
             title="Your transaction is complete",
             body=(
                 f"The missing entity has been added and your transaction "
                 f"#{txn.get('reference_number') or transaction_id} has been posted."
             ),
             url=f"/transactions/{transaction_id}",
-            tag=f"resolve-{transaction_id}",
+            entity_type="Transaction",
+            entity_id=transaction_id,
+            organisation_id=organisation_id,
         )
 
     return jsonify({
@@ -13229,7 +13232,8 @@ from modules.offline_batch import register_offline_batch_routes
 from modules.referral import register_referral_routes
 from modules.org_branding import register_org_branding_routes
 from modules.help_text import register_help_text_routes
-from modules.web_push import register_web_push_routes, send_push_to_user
+from modules.web_push import register_web_push_routes
+from modules.notifications import register_notification_routes, notify_user
 
 register_auth_middleware(app)
 register_auth_routes(app)
@@ -13265,6 +13269,7 @@ register_referral_routes(app)
 register_org_branding_routes(app)
 register_help_text_routes(app)
 register_web_push_routes(app)
+register_notification_routes(app)
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
 register_stock_position_routes(app)
