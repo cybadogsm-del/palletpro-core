@@ -12988,12 +12988,21 @@ def list_access_operations_metrics_snapshots():
 from modules.password_auth import register_password_auth_routes
 from modules.webauthn_auth import register_webauthn_routes
 from modules.tcr import register_tcr_routes
+from modules.resource_loss import register_resource_loss_routes
 
 register_auth_middleware(app)
 register_auth_routes(app)
 register_password_auth_routes(app)
 register_webauthn_routes(app)
 register_tcr_routes(
+    app,
+    post_transaction_to_ledger=post_transaction_to_ledger,
+    generate_transaction_reference=generate_transaction_reference,
+    ensure_transaction_numbering_tables=ensure_transaction_numbering_tables,
+    ensure_transaction_partner_columns=ensure_transaction_partner_columns,
+    ensure_transaction_user_attribution_columns=ensure_transaction_user_attribution_columns,
+)
+register_resource_loss_routes(
     app,
     post_transaction_to_ledger=post_transaction_to_ledger,
     generate_transaction_reference=generate_transaction_reference,
