@@ -9,7 +9,19 @@ from db import get_conn, make_id, now_iso
 
 MASTER_KEY = os.environ.get("PALLET_PRO_MASTER_KEY")
 
-_EXEMPT_PATHS = {"/health", "/", "/pricing-table", "/pricing-philosophy", "/auth/bootstrap"}
+_EXEMPT_PATHS = {
+    "/health",
+    "/",
+    "/pricing-table",
+    "/pricing-philosophy",
+    "/auth/bootstrap",
+    "/sessions/login",
+    "/auth/set-password",
+    "/auth/forgot-password",
+    "/auth/reset-password",
+    "/auth/webauthn/authenticate/begin",
+    "/auth/webauthn/authenticate/complete",
+}
 _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
 
 
@@ -84,6 +96,40 @@ def _lookup_key(conn, raw_key):
     return None
 
 
+def _lookup_session(conn, session_id):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS user_sessions (
+        session_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, organisation_id TEXT,
+        role TEXT NOT NULL, device_id TEXT NOT NULL, device_label TEXT,
+        ip_address_hash TEXT, user_agent_hash TEXT, session_status TEXT NOT NULL,
+        login_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, logout_at TEXT,
+        ended_reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""")
+    now = now_iso()
+    row = conn.execute(
+        """SELECT s.session_id, s.user_id, s.organisation_id, s.role,
+                  u.display_name, u.access_status
+           FROM user_sessions s
+           JOIN user_accounts u ON u.user_id = s.user_id
+           WHERE s.session_id = ? AND s.session_status = 'ACTIVE'""",
+        (session_id,),
+    ).fetchone()
+    if row:
+        conn.execute(
+            "UPDATE user_sessions SET last_seen_at = ?, updated_at = ? WHERE session_id = ?",
+            (now, now, session_id),
+        )
+        conn.commit()
+        return {
+            "user_id": row["user_id"],
+            "role": row["role"],
+            "user_org_id": row["organisation_id"],
+            "access_status": row["access_status"],
+            "display_name": row["display_name"],
+        }
+    return None
+
+
 def register_auth_middleware(app):
     @app.before_request
     def enforce_auth():
@@ -113,13 +159,18 @@ def register_auth_middleware(app):
 
         conn = get_conn()
         ensure_api_key_tables(conn)
-        user = _lookup_key(conn, raw_key)
+
+        if raw_key.startswith("sess_"):
+            user = _lookup_session(conn, raw_key)
+        else:
+            user = _lookup_key(conn, raw_key)
+
         conn.close()
 
         if not user:
             return jsonify({
                 "error": "INVALID_API_KEY",
-                "message": "The provided API key is invalid, expired, or revoked.",
+                "message": "The provided API key or session token is invalid, expired, or revoked.",
             }), 401
 
         if user["access_status"] != "ACTIVE":

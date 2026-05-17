@@ -5,6 +5,7 @@ requires-python = ">=3.11"
 dependencies = [
     "Flask>=3.1",
     "gunicorn>=22.0",
+    "webauthn>=2.0.0",
 ]
 
 [project.optional-dependencies]

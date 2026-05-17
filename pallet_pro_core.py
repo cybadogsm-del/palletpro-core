@@ -2584,6 +2584,142 @@ def get_depot_profile(depot_id):
     }), 200
 
 
+def _ensure_depot_update_columns(conn):
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(depots)")}
+    if "is_active" not in cols:
+        conn.execute("ALTER TABLE depots ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+    if "updated_at" not in cols:
+        conn.execute("ALTER TABLE depots ADD COLUMN updated_at TEXT")
+    conn.commit()
+
+
+@app.patch("/depots/<depot_id>")
+def update_depot(depot_id):
+    body = request.get_json(silent=True) or {}
+    new_name = (body.get("name") or "").strip() or None
+
+    if not new_name:
+        return jsonify({"error": "name is required"}), 400
+
+    conn = get_conn()
+    _ensure_depot_update_columns(conn)
+
+    depot = conn.execute(
+        "SELECT * FROM depots WHERE depot_id = ?", (depot_id,)
+    ).fetchone()
+
+    if not depot:
+        conn.close()
+        return jsonify({"error": "Depot not found"}), 404
+
+    old_name = depot["name"]
+    ts = now_iso()
+
+    conn.execute(
+        "UPDATE depots SET name = ?, updated_at = ? WHERE depot_id = ?",
+        (new_name, ts, depot_id),
+    )
+
+    audit_event(
+        conn,
+        entity_type="Depot",
+        entity_id=depot_id,
+        action="UPDATE",
+        summary=f"Depot name updated from '{old_name}' to '{new_name}'.",
+        organisation_id=depot["organisation_id"],
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "depot_id": depot_id,
+        "organisation_id": depot["organisation_id"],
+        "name": new_name,
+        "updated_at": ts,
+    }), 200
+
+
+@app.post("/depots/<depot_id>/deactivate")
+def deactivate_depot(depot_id):
+    conn = get_conn()
+    _ensure_depot_update_columns(conn)
+
+    depot = conn.execute(
+        "SELECT * FROM depots WHERE depot_id = ?", (depot_id,)
+    ).fetchone()
+
+    if not depot:
+        conn.close()
+        return jsonify({"error": "Depot not found"}), 404
+
+    depot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(depots)")}
+    if "is_active" in depot_cols and depot["is_active"] == 0:
+        conn.close()
+        return jsonify({"error": "Depot is already inactive"}), 409
+
+    ts = now_iso()
+    conn.execute(
+        "UPDATE depots SET is_active = 0, updated_at = ? WHERE depot_id = ?",
+        (ts, depot_id),
+    )
+
+    audit_event(
+        conn,
+        entity_type="Depot",
+        entity_id=depot_id,
+        action="DEACTIVATE",
+        summary=f"Depot '{depot['name']}' deactivated.",
+        organisation_id=depot["organisation_id"],
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "depot_id": depot_id,
+        "name": depot["name"],
+        "is_active": False,
+    }), 200
+
+
+@app.post("/depots/<depot_id>/reactivate")
+def reactivate_depot(depot_id):
+    conn = get_conn()
+    _ensure_depot_update_columns(conn)
+
+    depot = conn.execute(
+        "SELECT * FROM depots WHERE depot_id = ?", (depot_id,)
+    ).fetchone()
+
+    if not depot:
+        conn.close()
+        return jsonify({"error": "Depot not found"}), 404
+
+    ts = now_iso()
+    conn.execute(
+        "UPDATE depots SET is_active = 1, updated_at = ? WHERE depot_id = ?",
+        (ts, depot_id),
+    )
+
+    audit_event(
+        conn,
+        entity_type="Depot",
+        entity_id=depot_id,
+        action="REACTIVATE",
+        summary=f"Depot '{depot['name']}' reactivated.",
+        organisation_id=depot["organisation_id"],
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "depot_id": depot_id,
+        "name": depot["name"],
+        "is_active": True,
+    }), 200
+
 
 @app.get("/organisations/<organisation_id>/partner-module")
 def get_partner_module_overview(organisation_id):
@@ -3413,6 +3549,160 @@ def get_partner_profile(partner_id):
     d["default_receiving_partner_address"] = next((a for a in partner_addresses if a["is_default_receiving_site"]), None)
 
     return jsonify(d), 200
+
+
+@app.patch("/partners/<partner_id>")
+def update_partner(partner_id):
+    body = request.get_json(silent=True) or {}
+
+    conn = get_conn()
+    ensure_partner_connection_tables(conn)
+
+    partner = conn.execute(
+        "SELECT * FROM partners WHERE partner_id = ?", (partner_id,)
+    ).fetchone()
+
+    if not partner:
+        conn.close()
+        return jsonify({"error": "Partner not found"}), 404
+
+    new_name = (body.get("name") or "").strip() or partner["name"]
+    new_is_customer = body.get("is_customer")
+    new_is_supplier = body.get("is_supplier")
+
+    if new_is_customer is None:
+        new_is_customer = bool(partner["is_customer"])
+    else:
+        new_is_customer = bool(new_is_customer)
+
+    if new_is_supplier is None:
+        new_is_supplier = bool(partner["is_supplier"])
+    else:
+        new_is_supplier = bool(new_is_supplier)
+
+    changes = []
+    if new_name != partner["name"]:
+        changes.append(f"name '{partner['name']}' → '{new_name}'")
+    if new_is_customer != bool(partner["is_customer"]):
+        changes.append(f"is_customer → {new_is_customer}")
+    if new_is_supplier != bool(partner["is_supplier"]):
+        changes.append(f"is_supplier → {new_is_supplier}")
+
+    if not changes:
+        conn.close()
+        return jsonify({"message": "No changes made", "partner_id": partner_id}), 200
+
+    ts = now_iso()
+    conn.execute(
+        """UPDATE partners SET name = ?, is_customer = ?, is_supplier = ?, updated_at = ?
+           WHERE partner_id = ?""",
+        (new_name, 1 if new_is_customer else 0, 1 if new_is_supplier else 0, ts, partner_id),
+    )
+
+    audit_event(
+        conn,
+        entity_type="Partner",
+        entity_id=partner_id,
+        action="UPDATE",
+        summary=f"Partner updated: {'; '.join(changes)}.",
+        organisation_id=partner["organisation_id"],
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "partner_id": partner_id,
+        "organisation_id": partner["organisation_id"],
+        "name": new_name,
+        "is_customer": new_is_customer,
+        "is_supplier": new_is_supplier,
+        "updated_at": ts,
+    }), 200
+
+
+@app.post("/partners/<partner_id>/deactivate")
+def deactivate_partner(partner_id):
+    conn = get_conn()
+    ensure_partner_connection_tables(conn)
+
+    partner = conn.execute(
+        "SELECT * FROM partners WHERE partner_id = ?", (partner_id,)
+    ).fetchone()
+
+    if not partner:
+        conn.close()
+        return jsonify({"error": "Partner not found"}), 404
+
+    if not partner["is_active"]:
+        conn.close()
+        return jsonify({"error": "Partner is already inactive"}), 409
+
+    ts = now_iso()
+    conn.execute(
+        "UPDATE partners SET is_active = 0, updated_at = ? WHERE partner_id = ?",
+        (ts, partner_id),
+    )
+
+    audit_event(
+        conn,
+        entity_type="Partner",
+        entity_id=partner_id,
+        action="DEACTIVATE",
+        summary=f"Partner '{partner['name']}' deactivated.",
+        organisation_id=partner["organisation_id"],
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "partner_id": partner_id,
+        "name": partner["name"],
+        "is_active": False,
+    }), 200
+
+
+@app.post("/partners/<partner_id>/reactivate")
+def reactivate_partner(partner_id):
+    conn = get_conn()
+    ensure_partner_connection_tables(conn)
+
+    partner = conn.execute(
+        "SELECT * FROM partners WHERE partner_id = ?", (partner_id,)
+    ).fetchone()
+
+    if not partner:
+        conn.close()
+        return jsonify({"error": "Partner not found"}), 404
+
+    if partner["is_active"]:
+        conn.close()
+        return jsonify({"error": "Partner is already active"}), 409
+
+    ts = now_iso()
+    conn.execute(
+        "UPDATE partners SET is_active = 1, updated_at = ? WHERE partner_id = ?",
+        (ts, partner_id),
+    )
+
+    audit_event(
+        conn,
+        entity_type="Partner",
+        entity_id=partner_id,
+        action="REACTIVATE",
+        summary=f"Partner '{partner['name']}' reactivated.",
+        organisation_id=partner["organisation_id"],
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "partner_id": partner_id,
+        "name": partner["name"],
+        "is_active": True,
+    }), 200
 
 
 @app.post("/partners/<partner_id>/request-org-connection")
@@ -7144,6 +7434,93 @@ def create_resource():
     }), 201
 
 
+@app.patch("/resources/<resource_id>")
+def update_resource(resource_id):
+    body = request.get_json(silent=True) or {}
+
+    conn = get_conn()
+    ensure_resource_cleanup_columns(conn)
+
+    resource = conn.execute(
+        "SELECT * FROM resources WHERE resource_id = ?", (resource_id,)
+    ).fetchone()
+
+    if not resource:
+        conn.close()
+        return jsonify({"error": "Resource not found"}), 404
+
+    new_name = (body.get("name") or "").strip() or resource["name"]
+    new_resource_type = (body.get("resource_type") or "").strip() or resource["resource_type"]
+    new_unit_type = (body.get("unit_type") or "").strip() or resource["unit_type"]
+    new_category_id = body.get("category_id") or resource["category_id"]
+    new_brand_id = body.get("brand_id") if "brand_id" in body else resource["brand_id"]
+
+    if new_category_id != resource["category_id"]:
+        category = conn.execute(
+            "SELECT * FROM categories WHERE category_id = ? AND organisation_id = ?",
+            (new_category_id, resource["organisation_id"]),
+        ).fetchone()
+        if not category:
+            conn.close()
+            return jsonify({"error": "Category not found"}), 404
+
+    if new_brand_id and new_brand_id != resource["brand_id"]:
+        brand = conn.execute(
+            "SELECT * FROM brands WHERE brand_id = ? AND organisation_id = ?",
+            (new_brand_id, resource["organisation_id"]),
+        ).fetchone()
+        if not brand:
+            conn.close()
+            return jsonify({"error": "Brand not found"}), 404
+
+    changes = []
+    if new_name != resource["name"]:
+        changes.append(f"name '{resource['name']}' → '{new_name}'")
+    if new_resource_type != resource["resource_type"]:
+        changes.append(f"resource_type '{resource['resource_type']}' → '{new_resource_type}'")
+    if new_unit_type != resource["unit_type"]:
+        changes.append(f"unit_type '{resource['unit_type']}' → '{new_unit_type}'")
+    if new_category_id != resource["category_id"]:
+        changes.append(f"category_id → '{new_category_id}'")
+    if new_brand_id != resource["brand_id"]:
+        changes.append(f"brand_id → '{new_brand_id}'")
+
+    if not changes:
+        conn.close()
+        return jsonify({"message": "No changes made", "resource_id": resource_id}), 200
+
+    ts = now_iso()
+    conn.execute(
+        """UPDATE resources
+           SET name = ?, resource_type = ?, unit_type = ?, category_id = ?, brand_id = ?, updated_at = ?
+           WHERE resource_id = ?""",
+        (new_name, new_resource_type, new_unit_type, new_category_id, new_brand_id, ts, resource_id),
+    )
+
+    audit_event(
+        conn,
+        entity_type="Resource",
+        entity_id=resource_id,
+        action="UPDATE",
+        summary=f"Resource updated: {'; '.join(changes)}.",
+        organisation_id=resource["organisation_id"],
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "resource_id": resource_id,
+        "organisation_id": resource["organisation_id"],
+        "name": new_name,
+        "resource_type": new_resource_type,
+        "unit_type": new_unit_type,
+        "category_id": new_category_id,
+        "brand_id": new_brand_id,
+        "updated_at": ts,
+    }), 200
+
+
 @app.post("/resources/<resource_id>/classify")
 def classify_resource(resource_id):
     body = request.get_json(silent=True) or {}
@@ -9915,6 +10292,7 @@ def create_user_account():
     organisation_id = body.get("organisation_id")
     display_name = (body.get("display_name") or "").strip()
     email = (body.get("email") or "").strip() or None
+    mobile_number = (body.get("mobile_number") or "").strip() or None
     role = (body.get("role") or "").strip().upper()
     access_status = (body.get("access_status") or "ACTIVE").strip().upper()
     temporary_user_access_id = body.get("temporary_user_access_id")
@@ -10011,6 +10389,9 @@ def create_user_account():
             conn.close()
             return jsonify({"error": "Temporary user access record not found for this organisation"}), 404
 
+    from modules.password_auth import ensure_password_auth_columns, generate_setup_token
+    ensure_password_auth_columns(conn)
+
     user_id = make_id("usr")
     ts = now_iso()
 
@@ -10021,19 +10402,21 @@ def create_user_account():
             organisation_id,
             display_name,
             email,
+            mobile_number,
             role,
             access_status,
             temporary_user_access_id,
             created_by_display_name,
             created_at,
             updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
             organisation_id,
             display_name,
             email,
+            mobile_number,
             role,
             access_status,
             temporary_user_access_id,
@@ -10042,6 +10425,8 @@ def create_user_account():
             ts,
         )
     )
+
+    setup_token = generate_setup_token(conn, user_id)
 
     record_user_access_event(
         conn,
@@ -10071,6 +10456,8 @@ def create_user_account():
     return jsonify({
         "user": dict(user),
         "access_policy": policy,
+        "setup_token": setup_token,
+        "setup_token_note": "Share this token securely with the user. They must call POST /auth/set-password to activate their account. Expires in 7 days.",
         "rule": "User access is role-based and organisation-aware.",
     }), 201
 
@@ -10480,15 +10867,18 @@ def build_login_integrity_ai_report(event_type, role, active_session_count, ende
 def create_user_session():
     body = request.get_json(silent=True) or {}
 
-    user_id = body.get("user_id")
+    mobile_number = (body.get("mobile_number") or "").strip() or None
+    email = (body.get("email") or "").strip() or None
+    password = (body.get("password") or "").strip()
     device_id = (body.get("device_id") or "").strip()
     device_label = (body.get("device_label") or "").strip() or None
     ip_address_hash = (body.get("ip_address_hash") or "").strip() or None
     user_agent_hash = (body.get("user_agent_hash") or "").strip() or None
 
-    if not user_id:
-        return jsonify({"error": "user_id is required"}), 400
-
+    if not mobile_number and not email:
+        return jsonify({"error": "mobile_number or email is required"}), 400
+    if not password:
+        return jsonify({"error": "password is required"}), 400
     if not device_id:
         return jsonify({"error": "device_id is required"}), 400
 
@@ -10496,11 +10886,27 @@ def create_user_session():
     ensure_user_access_tables(conn)
     ensure_login_integrity_tables(conn)
 
-    user = get_user_account(conn, user_id)
+    from modules.password_auth import ensure_password_auth_columns, verify_password
+    ensure_password_auth_columns(conn)
 
-    if not user:
+    user = None
+    if mobile_number:
+        user = conn.execute(
+            "SELECT * FROM user_accounts WHERE mobile_number = ?", (mobile_number,)
+        ).fetchone()
+    if not user and email:
+        user = conn.execute(
+            "SELECT * FROM user_accounts WHERE email = ?", (email,)
+        ).fetchone()
+
+    # Use a constant-time response to avoid leaking whether the account exists
+    password_ok = verify_password(password, user["password_hash"] if user else None)
+
+    if not user or not password_ok:
         conn.close()
-        return jsonify({"error": "User not found"}), 404
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    user_id = user["user_id"]
 
     policy = build_user_access_policy(conn, user)
 
@@ -12579,8 +12985,13 @@ def list_access_operations_metrics_snapshots():
 
 # === ACCESS OPERATIONS METRICS SNAPSHOT V0.1 END ===
 
+from modules.password_auth import register_password_auth_routes
+from modules.webauthn_auth import register_webauthn_routes
+
 register_auth_middleware(app)
 register_auth_routes(app)
+register_password_auth_routes(app)
+register_webauthn_routes(app)
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
 register_stock_position_routes(app)
