@@ -13234,6 +13234,7 @@ from modules.org_branding import register_org_branding_routes
 from modules.help_text import register_help_text_routes
 from modules.web_push import register_web_push_routes
 from modules.notifications import register_notification_routes, notify_user
+from modules.resource_sample_photos import register_resource_sample_photo_routes
 
 register_auth_middleware(app)
 register_auth_routes(app)
@@ -13270,6 +13271,7 @@ register_org_branding_routes(app)
 register_help_text_routes(app)
 register_web_push_routes(app)
 register_notification_routes(app)
+register_resource_sample_photo_routes(app)
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
 register_stock_position_routes(app)
