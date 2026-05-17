@@ -761,6 +761,12 @@ def init_db():
     if "rejection_reason_text" not in pending_cols:
         c.execute("ALTER TABLE pending_approval_entries ADD COLUMN rejection_reason_text TEXT")
 
+    txn_cols = {row["name"] for row in c.execute("PRAGMA table_info(transactions)").fetchall()}
+    if "unresolved_entity_note" not in txn_cols:
+        c.execute("ALTER TABLE transactions ADD COLUMN unresolved_entity_note TEXT")
+    if "unresolved_entity_type" not in txn_cols:
+        c.execute("ALTER TABLE transactions ADD COLUMN unresolved_entity_type TEXT")
+
     ensure_subscription_guard_tables(conn)
     ensure_api_key_tables(conn)
     ensure_error_logging_tables(conn)
@@ -7964,6 +7970,8 @@ def create_transaction():
     submitted_by_user_id = body.get("submitted_by_user_id")
     partner_id = body.get("partner_id")
     partner_address_id = body.get("partner_address_id")
+    unresolved_entity_note = (body.get("unresolved_entity_note") or "").strip() or None
+    unresolved_entity_type = (body.get("unresolved_entity_type") or "").strip().upper() or None
 
     if not organisation_id:
         return jsonify({"error": "organisation_id is required"}), 400
@@ -7971,8 +7979,8 @@ def create_transaction():
         return jsonify({"error": "depot_id is required"}), 400
     if not transaction_type:
         return jsonify({"error": "transaction_type is required"}), 400
-    if not resource_id:
-        return jsonify({"error": "resource_id is required"}), 400
+    if not resource_id and not unresolved_entity_note:
+        return jsonify({"error": "resource_id is required (or provide unresolved_entity_note if entity is missing)"}), 400
 
     try:
         quantity = int(quantity)
@@ -8022,18 +8030,23 @@ def create_transaction():
         conn.close()
         return jsonify({"error": "Depot not found"}), 404
 
-    resource = conn.execute(
-        "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ?",
-        (resource_id, organisation_id)
-    ).fetchone()
-    if not resource:
-        conn.close()
-        return jsonify({"error": "Resource not found"}), 404
+    resource = None
+    if resource_id:
+        resource = conn.execute(
+            "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ?",
+            (resource_id, organisation_id)
+        ).fetchone()
+        if not resource and not unresolved_entity_note:
+            conn.close()
+            return jsonify({"error": "Resource not found"}), 404
+
+    if not resource_id and unresolved_entity_note:
+        resource_id = "UNRESOLVED"
 
     partner = None
     partner_address = None
 
-    if partner_id:
+    if partner_id and not unresolved_entity_note:
         partner = conn.execute(
             """
             SELECT *
@@ -8057,6 +8070,9 @@ def create_transaction():
         else:
             partner_address = get_default_partner_address_for_transaction(conn, partner_id, organisation_id, direction)
             partner_address_id = partner_address["partner_address_id"] if partner_address else None
+    elif partner_id and unresolved_entity_note:
+        # Partner ID provided but we're in unresolved mode — store it without strict validation
+        partner_address_id = None
 
     transaction_id = make_id("txn")
     created_at = now_iso()
@@ -8081,9 +8097,87 @@ def create_transaction():
             created_at,
             posted_at,
             reference_number,
-            org_sequence_number
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            org_sequence_number,
+            unresolved_entity_note,
+            unresolved_entity_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
+
+    resource_name = resource["name"] if resource else None
+
+    if unresolved_entity_note:
+        conn.execute(
+            insert_sql,
+            (
+                transaction_id, organisation_id, depot_id, transaction_type, resource_id,
+                quantity, direction, "PENDING_APPROVAL", "MISSING_ENTITY",
+                unresolved_entity_note, partner_id,
+                None, submitted_by_user_id, submitted_by_display_name,
+                created_at, None, reference_number, org_sequence_number,
+                unresolved_entity_note, unresolved_entity_type,
+            )
+        )
+
+        pending_entry_id = create_pending_entry(
+            conn=conn,
+            organisation_id=organisation_id,
+            entry_type="Transaction",
+            source_record_id=transaction_id,
+            source_module="Transactions",
+            submitted_by_display_name=submitted_by_display_name,
+            related_entity_type=unresolved_entity_type or "UNKNOWN",
+            related_entity_id=None,
+            related_entity_name=None,
+            reason_code="MISSING_ENTITY",
+            reason_text=unresolved_entity_note,
+            direct_action_type="ResolveEntity",
+            direct_action_target_id=transaction_id,
+            direct_action_label="Resolve Missing Entity",
+            can_approve_now=False,
+            can_reject_now=True,
+            resource_id=resource_id if resource_id != "UNRESOLVED" else None,
+            resource_name=resource_name,
+            status="AWAITING_FIX",
+        )
+
+        audit_event(
+            conn,
+            entity_type="Transaction",
+            entity_id=transaction_id,
+            action="PENDING_APPROVAL",
+            summary=(
+                f"{submitted_by_display_name} submitted transaction with unresolved entity: "
+                f"{unresolved_entity_note}"
+            ),
+            organisation_id=organisation_id,
+        )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "transaction_id": transaction_id,
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "depot_name": depot["name"],
+            "transaction_type": transaction_type,
+            "resource_id": resource_id,
+            "resource_name": resource_name,
+            "quantity": quantity,
+            "direction": direction,
+            "status": "PENDING_APPROVAL",
+            "approval_reason_code": "MISSING_ENTITY",
+            "approval_reason_text": unresolved_entity_note,
+            "unresolved_entity_note": unresolved_entity_note,
+            "unresolved_entity_type": unresolved_entity_type,
+            "pending_entry_id": pending_entry_id,
+            "partner_id": partner_id,
+            "submitted_by_user_id": submitted_by_user_id,
+            "submitted_by_display_name": submitted_by_display_name,
+            "reference_number": reference_number,
+            "org_sequence_number": org_sequence_number,
+            "message": "Transaction saved. Your Org Admin has been notified to resolve the missing entity and complete the transaction.",
+        }), 201
 
     if depot["opening_balance_used"] == 0:
         conn.execute(
@@ -8092,7 +8186,9 @@ def create_transaction():
                 transaction_id, organisation_id, depot_id, transaction_type, resource_id,
                 quantity, direction, "PENDING_APPROVAL", "NIL_OPENING_BALANCE",
                 "Opening balance has not been set for this entity.", partner_id,
-                partner_address_id, created_at, None, reference_number, org_sequence_number
+                partner_address_id, submitted_by_user_id, submitted_by_display_name,
+                created_at, None, reference_number, org_sequence_number,
+                None, None,
             )
         )
 
@@ -8114,7 +8210,7 @@ def create_transaction():
             can_approve_now=False,
             can_reject_now=True,
             resource_id=resource_id,
-            resource_name=resource["name"],
+            resource_name=resource_name,
             status="AWAITING_FIX"
         )
 
@@ -8137,7 +8233,7 @@ def create_transaction():
             "depot_name": depot["name"],
             "transaction_type": transaction_type,
             "resource_id": resource_id,
-            "resource_name": resource["name"],
+            "resource_name": resource_name,
             "quantity": quantity,
             "direction": direction,
             "status": "PENDING_APPROVAL",
@@ -8160,7 +8256,9 @@ def create_transaction():
         (
             transaction_id, organisation_id, depot_id, transaction_type, resource_id,
             quantity, direction, "DRAFT", None, None, partner_id,
-            partner_address_id, created_at, None, reference_number, org_sequence_number
+            partner_address_id, submitted_by_user_id, submitted_by_display_name,
+            created_at, None, reference_number, org_sequence_number,
+            None, None,
         )
     )
 
@@ -8186,7 +8284,7 @@ def create_transaction():
         "depot_name": depot["name"],
         "transaction_type": transaction_type,
         "resource_id": resource_id,
-        "resource_name": resource["name"],
+        "resource_name": resource_name,
         "quantity": quantity,
         "direction": direction,
         "status": "DRAFT",
@@ -8366,6 +8464,132 @@ def post_transaction(transaction_id):
     return jsonify({
         "transaction_id": transaction_id,
         "status": "POSTED"
+    }), 200
+
+
+@app.patch("/transactions/<transaction_id>/resolve-entity")
+def resolve_transaction_entity(transaction_id):
+    """
+    Org Admin resolves a MISSING_ENTITY pending transaction.
+
+    Once the missing resource / partner has been created, call this route
+    with the correct IDs. The transaction is updated and immediately posted
+    to the ledger. No dead ends — the field worker's transaction completes.
+    """
+    current_user = g.current_user
+    _ORG_ADMIN_ROLES = {"ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+    if current_user["role"] not in _ORG_ADMIN_ROLES:
+        return jsonify({"error": "Only Org Admin or above can resolve entity issues"}), 403
+
+    body = request.get_json(silent=True) or {}
+    new_resource_id = (body.get("resource_id") or "").strip() or None
+    new_partner_id = (body.get("partner_id") or "").strip() or None
+    review_notes = (body.get("review_notes") or "").strip() or None
+
+    conn = get_conn()
+    ensure_transaction_partner_columns(conn)
+    ensure_transaction_numbering_tables(conn)
+
+    txn = conn.execute(
+        "SELECT * FROM transactions WHERE transaction_id = ?", (transaction_id,)
+    ).fetchone()
+
+    if not txn:
+        conn.close()
+        return jsonify({"error": "Transaction not found"}), 404
+
+    if txn["approval_reason_code"] != "MISSING_ENTITY":
+        conn.close()
+        return jsonify({"error": "Transaction is not pending due to a missing entity"}), 400
+
+    if txn["status"] != "PENDING_APPROVAL":
+        conn.close()
+        return jsonify({"error": f"Transaction status is '{txn['status']}' — only PENDING_APPROVAL transactions can be resolved"}), 400
+
+    organisation_id = txn["organisation_id"]
+
+    # Validate new resource if provided (required when current resource_id is the sentinel)
+    if txn["resource_id"] == "UNRESOLVED":
+        if not new_resource_id:
+            conn.close()
+            return jsonify({"error": "resource_id is required — the original transaction had no resource"}), 400
+        resource = conn.execute(
+            "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ? AND is_active = 1",
+            (new_resource_id, organisation_id),
+        ).fetchone()
+        if not resource:
+            conn.close()
+            return jsonify({"error": "Resource not found or inactive"}), 404
+    else:
+        resource = conn.execute(
+            "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ?",
+            (txn["resource_id"], organisation_id),
+        ).fetchone()
+        new_resource_id = txn["resource_id"]
+
+    # Validate new partner if provided
+    if new_partner_id:
+        partner = conn.execute(
+            "SELECT * FROM partners WHERE partner_id = ? AND organisation_id = ? AND is_active = 1",
+            (new_partner_id, organisation_id),
+        ).fetchone()
+        if not partner:
+            conn.close()
+            return jsonify({"error": "Partner not found or inactive"}), 404
+    else:
+        new_partner_id = txn["partner_id"]
+        partner = None
+
+    ts = now_iso()
+
+    conn.execute(
+        """UPDATE transactions
+           SET resource_id = ?, partner_id = ?,
+               unresolved_entity_note = NULL, unresolved_entity_type = NULL,
+               approval_reason_code = NULL, approval_reason_text = NULL
+           WHERE transaction_id = ?""",
+        (new_resource_id, new_partner_id, transaction_id),
+    )
+
+    # Re-fetch with the corrected resource_id before posting to ledger
+    txn_updated = conn.execute(
+        "SELECT * FROM transactions WHERE transaction_id = ?", (transaction_id,)
+    ).fetchone()
+    post_transaction_to_ledger(conn, txn_updated)
+
+    # Resolve the associated pending entry
+    conn.execute(
+        """UPDATE pending_approval_entries
+           SET status = 'RESOLVED', updated_at = ?
+           WHERE source_record_id = ? AND reason_code = 'MISSING_ENTITY'""",
+        (ts, transaction_id),
+    )
+
+    audit_event(
+        conn,
+        entity_type="Transaction",
+        entity_id=transaction_id,
+        action="ENTITY_RESOLVED",
+        summary=(
+            f"{current_user['display_name']} resolved missing entity on transaction {transaction_id}. "
+            f"Resource: {resource['name'] if resource else new_resource_id}. "
+            f"Notes: {review_notes or 'none'}."
+        ),
+        organisation_id=organisation_id,
+    )
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "transaction_id": transaction_id,
+        "status": "POSTED",
+        "resource_id": new_resource_id,
+        "resource_name": resource["name"] if resource else None,
+        "partner_id": new_partner_id,
+        "reviewed_by": current_user["display_name"],
+        "review_notes": review_notes,
+        "message": "Entity resolved. Transaction posted to ledger.",
     }), 200
 
 

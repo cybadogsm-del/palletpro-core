@@ -45,6 +45,11 @@ def ensure_resource_loss_tables(conn):
         updated_at                  TEXT NOT NULL
     )
     """)
+    loss_cols = {r["name"] for r in conn.execute("PRAGMA table_info(resource_losses)").fetchall()}
+    if "unresolved_entity_note" not in loss_cols:
+        conn.execute("ALTER TABLE resource_losses ADD COLUMN unresolved_entity_note TEXT")
+    if "unresolved_entity_type" not in loss_cols:
+        conn.execute("ALTER TABLE resource_losses ADD COLUMN unresolved_entity_type TEXT")
     conn.commit()
 
 
@@ -75,13 +80,15 @@ def register_resource_loss_routes(
         loss_date = (body.get("loss_date") or "").strip() or None
         partner_id = body.get("partner_id") or None
         related_transaction_id = body.get("related_transaction_id") or None
+        unresolved_entity_note = (body.get("unresolved_entity_note") or "").strip() or None
+        unresolved_entity_type = (body.get("unresolved_entity_type") or "").strip().upper() or None
 
         if not organisation_id:
             return jsonify({"error": "organisation_id is required"}), 400
         if not depot_id:
             return jsonify({"error": "depot_id is required"}), 400
-        if not resource_id:
-            return jsonify({"error": "resource_id is required"}), 400
+        if not resource_id and not unresolved_entity_note:
+            return jsonify({"error": "resource_id is required (or provide unresolved_entity_note if entity is missing)"}), 400
         if quantity is None:
             return jsonify({"error": "quantity is required"}), 400
         if not loss_type:
@@ -120,13 +127,18 @@ def register_resource_loss_routes(
             conn.close()
             return jsonify({"error": "Depot not found"}), 404
 
-        resource = conn.execute(
-            "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ? AND is_active = 1",
-            (resource_id, organisation_id),
-        ).fetchone()
-        if not resource:
-            conn.close()
-            return jsonify({"error": "Resource not found or inactive"}), 404
+        resource = None
+        if resource_id:
+            resource = conn.execute(
+                "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ? AND is_active = 1",
+                (resource_id, organisation_id),
+            ).fetchone()
+            if not resource and not unresolved_entity_note:
+                conn.close()
+                return jsonify({"error": "Resource not found or inactive"}), 404
+
+        if not resource_id and unresolved_entity_note:
+            resource_id = "UNRESOLVED"
 
         if partner_id:
             partner = conn.execute(
@@ -150,35 +162,52 @@ def register_resource_loss_routes(
         loss_id = make_id("loss")
         effective_date = loss_date or ts[:10]
 
+        resource_name = resource["name"] if resource else None
+
         conn.execute(
             """INSERT INTO resource_losses (
                 loss_id, organisation_id, depot_id, resource_id,
                 quantity, loss_type, loss_reason, loss_date, status,
                 reported_by_user_id, reported_by_display_name,
                 partner_id, related_transaction_id,
+                unresolved_entity_note, unresolved_entity_type,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_REVIEW', ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_REVIEW', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 loss_id, organisation_id, depot_id, resource_id,
                 quantity, loss_type, loss_reason, effective_date,
                 current_user["user_id"] if current_user["user_id"] != "master" else None,
                 current_user["display_name"],
                 partner_id, related_transaction_id,
+                unresolved_entity_note, unresolved_entity_type,
                 ts, ts,
             ),
         )
 
-        audit_event(
-            conn,
-            entity_type="ResourceLoss",
-            entity_id=loss_id,
-            action="REPORT",
-            summary=(
-                f"{current_user['display_name']} reported loss of {quantity} × "
-                f"{resource['name']} ({loss_type}) at depot {depot['name']}."
-            ),
-            organisation_id=organisation_id,
-        )
+        if unresolved_entity_note:
+            audit_event(
+                conn,
+                entity_type="ResourceLoss",
+                entity_id=loss_id,
+                action="REPORT",
+                summary=(
+                    f"{current_user['display_name']} reported loss of {quantity} items "
+                    f"({loss_type}) at depot {depot['name']} — unresolved entity: {unresolved_entity_note}."
+                ),
+                organisation_id=organisation_id,
+            )
+        else:
+            audit_event(
+                conn,
+                entity_type="ResourceLoss",
+                entity_id=loss_id,
+                action="REPORT",
+                summary=(
+                    f"{current_user['display_name']} reported loss of {quantity} × "
+                    f"{resource_name} ({loss_type}) at depot {depot['name']}."
+                ),
+                organisation_id=organisation_id,
+            )
 
         conn.commit()
         conn.close()
@@ -189,15 +218,21 @@ def register_resource_loss_routes(
             "depot_id": depot_id,
             "depot_name": depot["name"],
             "resource_id": resource_id,
-            "resource_name": resource["name"],
+            "resource_name": resource_name,
             "quantity": quantity,
             "loss_type": loss_type,
             "loss_reason": loss_reason,
             "loss_date": effective_date,
             "status": "PENDING_REVIEW",
+            "unresolved_entity_note": unresolved_entity_note,
+            "unresolved_entity_type": unresolved_entity_type,
             "reported_by_display_name": current_user["display_name"],
             "created_at": ts,
-            "message": "Loss reported. Awaiting Org Admin review.",
+            "message": (
+                "Loss reported. Your Org Admin will resolve the missing entity and confirm the loss."
+                if unresolved_entity_note
+                else "Loss reported. Awaiting Org Admin review."
+            ),
         }), 201
 
 
@@ -438,4 +473,96 @@ def register_resource_loss_routes(
             "reviewed_by": current_user["display_name"],
             "review_notes": review_notes,
             "message": "Loss report rejected. No ledger change.",
+        }), 200
+
+
+    @app.patch("/resource-losses/<loss_id>/resolve-entity")
+    def resolve_resource_loss_entity(loss_id):
+        """
+        Org Admin resolves a missing entity on a resource loss report.
+
+        Once the missing resource has been created, supply the correct resource_id.
+        The loss report is updated so the normal confirm flow can proceed.
+        """
+        current_user = g.current_user
+        if current_user["role"] not in _ORG_ADMIN_ROLES:
+            return jsonify({"error": "Only Org Admin or above can resolve entity issues"}), 403
+
+        body = request.get_json(silent=True) or {}
+        new_resource_id = (body.get("resource_id") or "").strip() or None
+        review_notes = (body.get("review_notes") or "").strip() or None
+
+        conn = get_conn()
+        ensure_resource_loss_tables(conn)
+
+        loss = conn.execute(
+            "SELECT * FROM resource_losses WHERE loss_id = ?", (loss_id,)
+        ).fetchone()
+
+        if not loss:
+            conn.close()
+            return jsonify({"error": "Resource loss report not found"}), 404
+
+        if not loss["unresolved_entity_note"]:
+            conn.close()
+            return jsonify({"error": "This loss report does not have an unresolved entity"}), 400
+
+        if loss["status"] != "PENDING_REVIEW":
+            conn.close()
+            return jsonify({"error": f"Cannot resolve entity on a loss report with status '{loss['status']}'"}), 400
+
+        organisation_id = loss["organisation_id"]
+
+        if loss["resource_id"] == "UNRESOLVED":
+            if not new_resource_id:
+                conn.close()
+                return jsonify({"error": "resource_id is required — the original report had no resource"}), 400
+            resource = conn.execute(
+                "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ? AND is_active = 1",
+                (new_resource_id, organisation_id),
+            ).fetchone()
+            if not resource:
+                conn.close()
+                return jsonify({"error": "Resource not found or inactive"}), 404
+        else:
+            resource = conn.execute(
+                "SELECT name FROM resources WHERE resource_id = ?", (loss["resource_id"],)
+            ).fetchone()
+            new_resource_id = loss["resource_id"]
+
+        ts = now_iso()
+        conn.execute(
+            """UPDATE resource_losses
+               SET resource_id = ?,
+                   unresolved_entity_note = NULL,
+                   unresolved_entity_type = NULL,
+                   updated_at = ?
+               WHERE loss_id = ?""",
+            (new_resource_id, ts, loss_id),
+        )
+
+        audit_event(
+            conn,
+            entity_type="ResourceLoss",
+            entity_id=loss_id,
+            action="ENTITY_RESOLVED",
+            summary=(
+                f"{current_user['display_name']} resolved missing entity on loss report {loss_id}. "
+                f"Resource: {resource['name'] if resource else new_resource_id}. "
+                f"Notes: {review_notes or 'none'}. Report is now ready to confirm."
+            ),
+            organisation_id=organisation_id,
+        )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "loss_id": loss_id,
+            "status": "PENDING_REVIEW",
+            "resource_id": new_resource_id,
+            "resource_name": resource["name"] if resource else None,
+            "reviewed_by": current_user["display_name"],
+            "review_notes": review_notes,
+            "message": "Entity resolved. Loss report is now ready to confirm.",
         }), 200

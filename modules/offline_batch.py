@@ -67,13 +67,15 @@ def _process_transaction_item(
         payload.get("submitted_by_display_name") or current_user["display_name"]
     ).strip()
     transaction_note = (payload.get("transaction_note") or "").strip() or None
+    unresolved_entity_note = (payload.get("unresolved_entity_note") or "").strip() or None
+    unresolved_entity_type = (payload.get("unresolved_entity_type") or "").strip().upper() or None
 
     if not organisation_id:
         raise ValueError("organisation_id is required")
     if not depot_id:
         raise ValueError("depot_id is required")
-    if not resource_id:
-        raise ValueError("resource_id is required")
+    if not resource_id and not unresolved_entity_note:
+        raise ValueError("resource_id is required (or provide unresolved_entity_note if entity is missing)")
     if quantity is None:
         raise ValueError("quantity is required")
     if direction not in ("IN", "OUT"):
@@ -104,21 +106,28 @@ def _process_transaction_item(
     if not depot:
         raise ValueError("Depot not found")
 
-    resource = conn.execute(
-        "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ? AND is_active = 1",
-        (resource_id, organisation_id),
-    ).fetchone()
-    if not resource:
-        raise ValueError("Resource not found or inactive")
+    resource = None
+    if resource_id:
+        resource = conn.execute(
+            "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ? AND is_active = 1",
+            (resource_id, organisation_id),
+        ).fetchone()
+        if not resource and not unresolved_entity_note:
+            raise ValueError("Resource not found or inactive")
+
+    if not resource_id and unresolved_entity_note:
+        resource_id = "UNRESOLVED"
 
     partner = None
-    if partner_id:
+    if partner_id and not unresolved_entity_note:
         partner = conn.execute(
             "SELECT * FROM partners WHERE partner_id = ? AND organisation_id = ? AND is_active = 1",
             (partner_id, organisation_id),
         ).fetchone()
         if not partner:
             raise ValueError("Partner not found")
+
+    resource_name = resource["name"] if resource else None
 
     # Preserve the field timestamp; fall back to now if not provided
     created_at = queued_at or now_iso()
@@ -134,16 +143,71 @@ def _process_transaction_item(
             submitted_by_user_id, submitted_by_display_name,
             created_at, posted_at,
             reference_number, org_sequence_number,
-            transaction_note
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            transaction_note,
+            unresolved_entity_note, unresolved_entity_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
-    # Ensure transaction_note column exists
+    # Ensure optional columns exist
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
     if "transaction_note" not in cols:
         conn.execute("ALTER TABLE transactions ADD COLUMN transaction_note TEXT")
+    if "unresolved_entity_note" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN unresolved_entity_note TEXT")
+    if "unresolved_entity_type" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN unresolved_entity_type TEXT")
 
-    if depot["opening_balance_used"] == 0:
+    if unresolved_entity_note:
+        conn.execute(
+            insert_sql,
+            (
+                transaction_id, organisation_id, depot_id, transaction_type,
+                resource_id, quantity, direction, "PENDING_APPROVAL",
+                "MISSING_ENTITY", unresolved_entity_note,
+                partner_id, None,
+                submitted_by_user_id, submitted_by_display_name,
+                created_at, None,
+                reference_number, org_sequence_number,
+                transaction_note,
+                unresolved_entity_note, unresolved_entity_type,
+            ),
+        )
+
+        create_pending_entry(
+            conn=conn,
+            organisation_id=organisation_id,
+            entry_type="Transaction",
+            source_record_id=transaction_id,
+            source_module="Transactions",
+            submitted_by_display_name=submitted_by_display_name,
+            related_entity_type=unresolved_entity_type or "UNKNOWN",
+            related_entity_id=None,
+            related_entity_name=None,
+            reason_code="MISSING_ENTITY",
+            reason_text=unresolved_entity_note,
+            direct_action_type="ResolveEntity",
+            direct_action_target_id=transaction_id,
+            direct_action_label="Resolve Missing Entity",
+            can_approve_now=False,
+            can_reject_now=True,
+            resource_id=resource_id if resource_id != "UNRESOLVED" else None,
+            resource_name=resource_name,
+            status="AWAITING_FIX",
+        )
+
+        audit_event(
+            conn, entity_type="Transaction", entity_id=transaction_id,
+            action="OFFLINE_UPLOAD_PENDING",
+            summary=(
+                f"Offline transaction uploaded by {submitted_by_display_name} — "
+                f"pending due to missing entity: {unresolved_entity_note}."
+            ),
+            organisation_id=organisation_id,
+        )
+
+        status = "PENDING_APPROVAL"
+
+    elif depot["opening_balance_used"] == 0:
         conn.execute(
             insert_sql,
             (
@@ -156,6 +220,7 @@ def _process_transaction_item(
                 created_at, None,
                 reference_number, org_sequence_number,
                 transaction_note,
+                None, None,
             ),
         )
 
@@ -177,7 +242,7 @@ def _process_transaction_item(
             can_approve_now=False,
             can_reject_now=True,
             resource_id=resource_id,
-            resource_name=resource["name"],
+            resource_name=resource_name,
             status="AWAITING_FIX",
         )
 
@@ -201,6 +266,7 @@ def _process_transaction_item(
                 created_at, None,
                 reference_number, org_sequence_number,
                 transaction_note,
+                None, None,
             ),
         )
 
@@ -223,7 +289,7 @@ def _process_transaction_item(
         "depot_id": depot_id,
         "depot_name": depot["name"],
         "resource_id": resource_id,
-        "resource_name": resource["name"],
+        "resource_name": resource_name,
         "quantity": quantity,
         "direction": direction,
         "status": status,
@@ -231,6 +297,7 @@ def _process_transaction_item(
         "org_sequence_number": org_sequence_number,
         "partner_id": partner_id,
         "partner_name": partner["name"] if partner else None,
+        "unresolved_entity_note": unresolved_entity_note,
         "submitted_by_display_name": submitted_by_display_name,
         "created_at": created_at,
         "queued_offline": True,
@@ -253,13 +320,15 @@ def _process_resource_loss_item(conn, payload, queued_at, current_user):
         payload.get("submitted_by_display_name") or current_user["display_name"]
     ).strip()
     submitted_by_user_id = payload.get("submitted_by_user_id") or None
+    unresolved_entity_note = (payload.get("unresolved_entity_note") or "").strip() or None
+    unresolved_entity_type = (payload.get("unresolved_entity_type") or "").strip().upper() or None
 
     if not organisation_id:
         raise ValueError("organisation_id is required")
     if not depot_id:
         raise ValueError("depot_id is required")
-    if not resource_id:
-        raise ValueError("resource_id is required")
+    if not resource_id and not unresolved_entity_note:
+        raise ValueError("resource_id is required (or provide unresolved_entity_note if entity is missing)")
     if quantity is None:
         raise ValueError("quantity is required")
     if not loss_type:
@@ -285,16 +354,30 @@ def _process_resource_loss_item(conn, payload, queued_at, current_user):
     if not depot:
         raise ValueError("Depot not found")
 
-    resource = conn.execute(
-        "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ? AND is_active = 1",
-        (resource_id, organisation_id),
-    ).fetchone()
-    if not resource:
-        raise ValueError("Resource not found or inactive")
+    resource = None
+    if resource_id:
+        resource = conn.execute(
+            "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ? AND is_active = 1",
+            (resource_id, organisation_id),
+        ).fetchone()
+        if not resource and not unresolved_entity_note:
+            raise ValueError("Resource not found or inactive")
+
+    if not resource_id and unresolved_entity_note:
+        resource_id = "UNRESOLVED"
+
+    resource_name = resource["name"] if resource else None
 
     created_at = queued_at or now_iso()
     loss_id = make_id("loss")
     effective_date = loss_date or created_at[:10]
+
+    # Ensure unresolved columns exist (may not on older DB)
+    loss_cols = {r["name"] for r in conn.execute("PRAGMA table_info(resource_losses)")}
+    if "unresolved_entity_note" not in loss_cols:
+        conn.execute("ALTER TABLE resource_losses ADD COLUMN unresolved_entity_note TEXT")
+    if "unresolved_entity_type" not in loss_cols:
+        conn.execute("ALTER TABLE resource_losses ADD COLUMN unresolved_entity_type TEXT")
 
     conn.execute(
         """INSERT INTO resource_losses (
@@ -302,27 +385,41 @@ def _process_resource_loss_item(conn, payload, queued_at, current_user):
             quantity, loss_type, loss_reason, loss_date, status,
             reported_by_user_id, reported_by_display_name,
             partner_id, related_transaction_id,
+            unresolved_entity_note, unresolved_entity_type,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_REVIEW', ?, ?, ?, ?, ?, ?)""",
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_REVIEW', ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             loss_id, organisation_id, depot_id, resource_id,
             quantity, loss_type, loss_reason, effective_date,
             submitted_by_user_id,
             submitted_by_display_name,
             partner_id, related_transaction_id,
+            unresolved_entity_note, unresolved_entity_type,
             created_at, created_at,
         ),
     )
 
-    audit_event(
-        conn, entity_type="ResourceLoss", entity_id=loss_id,
-        action="OFFLINE_UPLOAD",
-        summary=(
-            f"Offline loss report uploaded by {submitted_by_display_name}: "
-            f"{quantity} × {resource['name']} ({loss_type}) at {depot['name']}."
-        ),
-        organisation_id=organisation_id,
-    )
+    if unresolved_entity_note:
+        audit_event(
+            conn, entity_type="ResourceLoss", entity_id=loss_id,
+            action="OFFLINE_UPLOAD",
+            summary=(
+                f"Offline loss report uploaded by {submitted_by_display_name}: "
+                f"{quantity} items ({loss_type}) at {depot['name']} — "
+                f"unresolved entity: {unresolved_entity_note}."
+            ),
+            organisation_id=organisation_id,
+        )
+    else:
+        audit_event(
+            conn, entity_type="ResourceLoss", entity_id=loss_id,
+            action="OFFLINE_UPLOAD",
+            summary=(
+                f"Offline loss report uploaded by {submitted_by_display_name}: "
+                f"{quantity} × {resource_name} ({loss_type}) at {depot['name']}."
+            ),
+            organisation_id=organisation_id,
+        )
 
     return loss_id, {
         "loss_id": loss_id,
@@ -330,12 +427,13 @@ def _process_resource_loss_item(conn, payload, queued_at, current_user):
         "depot_id": depot_id,
         "depot_name": depot["name"],
         "resource_id": resource_id,
-        "resource_name": resource["name"],
+        "resource_name": resource_name,
         "quantity": quantity,
         "loss_type": loss_type,
         "loss_reason": loss_reason,
         "loss_date": effective_date,
         "status": "PENDING_REVIEW",
+        "unresolved_entity_note": unresolved_entity_note,
         "reported_by_display_name": submitted_by_display_name,
         "created_at": created_at,
         "queued_offline": True,
