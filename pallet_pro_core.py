@@ -13216,6 +13216,7 @@ from modules.resource_loss import register_resource_loss_routes
 from modules.offline_batch import register_offline_batch_routes
 from modules.referral import register_referral_routes
 from modules.org_branding import register_org_branding_routes
+from modules.help_text import register_help_text_routes
 
 register_auth_middleware(app)
 register_auth_routes(app)
@@ -13249,6 +13250,7 @@ register_offline_batch_routes(
 )
 register_referral_routes(app)
 register_org_branding_routes(app)
+register_help_text_routes(app)
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
 register_stock_position_routes(app)
