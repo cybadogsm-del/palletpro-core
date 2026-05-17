@@ -13214,6 +13214,7 @@ from modules.webauthn_auth import register_webauthn_routes
 from modules.tcr import register_tcr_routes
 from modules.resource_loss import register_resource_loss_routes
 from modules.offline_batch import register_offline_batch_routes
+from modules.referral import register_referral_routes
 
 register_auth_middleware(app)
 register_auth_routes(app)
@@ -13245,6 +13246,7 @@ register_offline_batch_routes(
     ensure_transaction_user_attribution_columns=ensure_transaction_user_attribution_columns,
     create_pending_entry=create_pending_entry,
 )
+register_referral_routes(app)
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
 register_stock_position_routes(app)

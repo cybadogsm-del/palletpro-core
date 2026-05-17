@@ -21,6 +21,8 @@ _EXEMPT_PATHS = {
     "/auth/reset-password",
     "/auth/webauthn/authenticate/begin",
     "/auth/webauthn/authenticate/complete",
+    "/install",
+    "/install-events",
 }
 _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
 
