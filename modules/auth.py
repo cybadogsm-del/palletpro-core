@@ -23,6 +23,7 @@ _EXEMPT_PATHS = {
     "/auth/webauthn/authenticate/complete",
     "/install",
     "/install-events",
+    "/vapid-public-key",
 }
 _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
 
