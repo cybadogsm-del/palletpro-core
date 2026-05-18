@@ -36,7 +36,31 @@ _rate_store: dict = defaultdict(list)   # ip -> [timestamp, ...]
 _RATE_WINDOW = 60       # seconds
 _RATE_MAX    = 10       # max attempts per window
 
-def _is_rate_limited(ip: str) -> bool:
+_PRIVATE_PREFIXES = ("127.", "10.", "172.16.", "172.17.", "172.18.", "172.19.",
+                     "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+                     "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+                     "192.168.", "::1", "fd", "fc")
+
+def _get_client_ip() -> str:
+    """
+    Return the real client IP, safe against X-Forwarded-For spoofing.
+    - Direct connection: use remote_addr (TCP-level, un-spoofable).
+    - Behind a trusted proxy (remote_addr is private/loopback): use the
+      RIGHTMOST entry in X-Forwarded-For — that is the IP the proxy added,
+      which the client cannot forge (they can only prepend to the list).
+    """
+    remote = request.remote_addr or "unknown"
+    if not any(remote.startswith(p) for p in _PRIVATE_PREFIXES):
+        return remote
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        ips = [ip.strip() for ip in xff.split(",") if ip.strip()]
+        if ips:
+            return ips[-1]
+    return remote
+
+def _is_rate_limited() -> bool:
+    ip = _get_client_ip()
     now = time.time()
     with _rate_lock:
         attempts = [t for t in _rate_store[ip] if now - t < _RATE_WINDOW]
@@ -11209,8 +11233,7 @@ def build_login_integrity_ai_report(event_type, role, active_session_count, ende
 
 @app.post("/sessions/login")
 def create_user_session():
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
-    if _is_rate_limited(client_ip):
+    if _is_rate_limited():
         return jsonify({"error": "TOO_MANY_REQUESTS", "message": "Too many login attempts. Wait a minute and try again."}), 429
 
     body = request.get_json(silent=True) or {}
