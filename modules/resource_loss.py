@@ -69,10 +69,15 @@ def register_resource_loss_routes(
         Field user reports a resource loss. Status is PENDING_REVIEW.
         The ledger is NOT updated until an Org Admin confirms.
         """
+        _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
         current_user = g.current_user
         body = request.get_json(silent=True) or {}
 
-        organisation_id = body.get("organisation_id")
+        # Enforce org isolation: non-global-admins always write to their own org
+        if current_user.get("role") not in _GLOBAL_ADMIN_ROLES:
+            organisation_id = current_user.get("user_org_id")
+        else:
+            organisation_id = body.get("organisation_id")
         depot_id = body.get("depot_id")
         resource_id = body.get("resource_id")
         quantity = body.get("quantity")

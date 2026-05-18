@@ -1,6 +1,9 @@
 import os
+import time
+import threading
+from collections import defaultdict
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from audit import audit_event
 from db import DB, get_conn, make_id, now_iso
 from modules.subscription_access import (
@@ -26,6 +29,54 @@ from modules.system_routes import register_system_routes
 from modules.transaction_reporting import register_transaction_reporting_routes
 
 app = Flask(__name__)
+
+# ── Security: rate limiter (login brute-force protection) ─────────────────────
+_rate_lock  = threading.Lock()
+_rate_store: dict = defaultdict(list)   # ip -> [timestamp, ...]
+_RATE_WINDOW = 60       # seconds
+_RATE_MAX    = 10       # max attempts per window
+
+def _is_rate_limited(ip: str) -> bool:
+    now = time.time()
+    with _rate_lock:
+        attempts = [t for t in _rate_store[ip] if now - t < _RATE_WINDOW]
+        attempts.append(now)
+        _rate_store[ip] = attempts
+        return len(attempts) > _RATE_MAX
+
+# ── Security: CORS + strip Server header ─────────────────────────────────────
+ALLOWED_ORIGINS = {
+    "http://localhost:3000",
+    "http://localhost:5173",
+}
+
+@app.after_request
+def apply_security_headers(response):
+    origin = request.headers.get("Origin", "")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"]  = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Max-Age"]       = "600"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"]        = "DENY"
+    response.headers["Server"]                 = "Pallet Pro"
+    return response
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        from flask import make_response
+        origin = request.headers.get("Origin", "")
+        resp = make_response("", 204)
+        if origin in ALLOWED_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"]  = origin
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, DELETE, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            resp.headers["Access-Control-Max-Age"]       = "600"
+        return resp
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def create_pending_entry(
@@ -783,8 +834,12 @@ init_db()
 
 @app.post("/organisations")
 def create_organisation():
+    _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+    if g.current_user.get("role") not in _GLOBAL_ADMIN_ROLES:
+        return jsonify({"error": "INSUFFICIENT_ROLE", "message": "Only Global Admin can create organisations."}), 403
+
     body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "").strip()
+    name = (body.get("name") or "").strip()[:255]
 
     if not name:
         return jsonify({"error": "name is required"}), 400
@@ -2467,9 +2522,14 @@ def list_depots():
 
 @app.post("/depots")
 def create_depot():
+    _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
     body = request.get_json(silent=True) or {}
-    organisation_id = body.get("organisation_id")
-    name = (body.get("name") or "").strip()
+    # Enforce org isolation: non-global-admins always write to their own org
+    if g.current_user.get("role") not in _GLOBAL_ADMIN_ROLES:
+        organisation_id = g.current_user.get("user_org_id")
+    else:
+        organisation_id = body.get("organisation_id")
+    name = (body.get("name") or "").strip()[:255]
 
     if not organisation_id:
         return jsonify({"error": "organisation_id is required"}), 400
@@ -3310,9 +3370,14 @@ def get_resource_module_overview(organisation_id):
 
 @app.post("/partners")
 def create_partner():
+    _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
     body = request.get_json(silent=True) or {}
-    organisation_id = body.get("organisation_id")
-    name = (body.get("name") or "").strip()
+    # Enforce org isolation: non-global-admins always write to their own org
+    if g.current_user.get("role") not in _GLOBAL_ADMIN_ROLES:
+        organisation_id = g.current_user.get("user_org_id")
+    else:
+        organisation_id = body.get("organisation_id")
+    name = (body.get("name") or "").strip()[:255]
     is_active = bool(body.get("is_active", True))
     is_customer = bool(body.get("is_customer", False))
     is_supplier = bool(body.get("is_supplier", False))
@@ -7349,13 +7414,18 @@ def get_resource_profile(resource_id):
 
 @app.post("/resources")
 def create_resource():
+    _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
     body = request.get_json(silent=True) or {}
-    organisation_id = body.get("organisation_id")
+    # Enforce org isolation: non-global-admins always write to their own org
+    if g.current_user.get("role") not in _GLOBAL_ADMIN_ROLES:
+        organisation_id = g.current_user.get("user_org_id")
+    else:
+        organisation_id = body.get("organisation_id")
     category_id = body.get("category_id")
     brand_id = body.get("brand_id")
-    name = (body.get("name") or "").strip()
-    resource_type = (body.get("resource_type") or "pallet").strip()
-    unit_type = (body.get("unit_type") or "each").strip()
+    name = (body.get("name") or "").strip()[:255]
+    resource_type = (body.get("resource_type") or "pallet").strip()[:100]
+    unit_type = (body.get("unit_type") or "each").strip()[:100]
 
     if not organisation_id:
         return jsonify({"error": "organisation_id is required"}), 400
@@ -7988,9 +8058,14 @@ def build_transaction_payload(conn, txn_row):
 
 @app.post("/transactions")
 def create_transaction():
+    _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
     body = request.get_json(silent=True) or {}
 
-    organisation_id = body.get("organisation_id")
+    # Enforce org isolation: non-global-admins always write to their own org
+    if g.current_user.get("role") not in _GLOBAL_ADMIN_ROLES:
+        organisation_id = g.current_user.get("user_org_id")
+    else:
+        organisation_id = body.get("organisation_id")
     depot_id = body.get("depot_id")
     transaction_type = (body.get("transaction_type") or "").strip()
     resource_id = body.get("resource_id")
@@ -11134,6 +11209,10 @@ def build_login_integrity_ai_report(event_type, role, active_session_count, ende
 
 @app.post("/sessions/login")
 def create_user_session():
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if _is_rate_limited(client_ip):
+        return jsonify({"error": "TOO_MANY_REQUESTS", "message": "Too many login attempts. Wait a minute and try again."}), 429
+
     body = request.get_json(silent=True) or {}
 
     mobile_number = (body.get("mobile_number") or "").strip() or None

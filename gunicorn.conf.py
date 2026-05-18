@@ -7,3 +7,6 @@ timeout = 120
 keepalive = 5
 accesslog = "-"
 errorlog = "-"
+# Suppress Gunicorn server header to avoid tech stack disclosure
+default_proc_name = "palletpro"
+forwarded_allow_ips = "*"
