@@ -12861,6 +12861,29 @@ def get_access_operations_health():
 
 # === ACCESS OPERATIONS HEALTH CHECK V0.1 END ===
 
+# === GLOBAL ADMIN ORGANISATIONS LIST V0.1 START ===
+
+@app.get("/global-admin/organisations")
+def list_all_organisations():
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT o.organisation_id, o.name, o.created_at,
+               COUNT(u.user_id) AS user_count
+        FROM organisations o
+        LEFT JOIN user_accounts u ON u.organisation_id = o.organisation_id
+        GROUP BY o.organisation_id
+        ORDER BY o.name ASC
+        """
+    ).fetchall()
+    conn.close()
+    return jsonify({
+        "count": len(rows),
+        "organisations": [dict(r) for r in rows],
+    }), 200
+
+# === GLOBAL ADMIN ORGANISATIONS LIST V0.1 END ===
+
 # === SYSTEM CONTROL PANEL V0.1 START ===
 
 @app.get("/global-admin/system-control-panel")
