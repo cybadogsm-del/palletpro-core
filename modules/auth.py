@@ -17,6 +17,7 @@ _EXEMPT_PATHS = {
     "/auth/bootstrap",
     "/sessions/login",
     "/auth/set-password",
+    "/auth/setup-token-info",
     "/auth/forgot-password",
     "/auth/reset-password",
     "/auth/webauthn/authenticate/begin",

@@ -80,6 +80,51 @@ def register_password_auth_routes(app):
 
     # --- exempt paths handled in auth middleware ---
 
+    @app.get("/auth/setup-token-info")
+    def get_setup_token_info():
+        """
+        Public. Returns display info for a setup token without consuming it.
+        Used by the /setup page to show the user's name and who invited them
+        before they submit the form.
+        """
+        raw_token = request.args.get("token", "").strip()
+        if not raw_token:
+            return jsonify({"error": "token is required"}), 400
+
+        conn = get_conn()
+        ensure_password_token_tables(conn)
+
+        ts = now_iso()
+        token_hash = _hash_token(raw_token)
+
+        row = conn.execute(
+            """SELECT user_id FROM user_setup_tokens
+               WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?""",
+            (token_hash, ts),
+        ).fetchone()
+
+        if not row:
+            conn.close()
+            return jsonify({"error": "This setup link has expired or already been used."}), 400
+
+        user = conn.execute(
+            """SELECT display_name, created_by_display_name, mobile_number, email
+               FROM user_accounts WHERE user_id = ?""",
+            (row["user_id"],),
+        ).fetchone()
+
+        conn.close()
+
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        return jsonify({
+            "display_name": user["display_name"],
+            "invited_by": user["created_by_display_name"] or "your admin",
+            "has_mobile": bool(user["mobile_number"]),
+            "has_email": bool(user["email"]),
+        }), 200
+
     @app.post("/auth/set-password")
     def set_password():
         """First-time password setup using a one-time setup token issued at user creation."""

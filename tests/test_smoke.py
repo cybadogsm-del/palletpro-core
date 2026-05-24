@@ -14,16 +14,9 @@ class PalletProSmokeTests(unittest.TestCase):
         os.environ["PALLET_PRO_DB"] = cls.db_path
         os.environ["PALLET_PRO_MASTER_KEY"] = _TEST_MASTER_KEY
 
-        for module_name in (
-            "pallet_pro_core",
-            "audit",
-            "db",
-            "modules.auth",
-            "modules.system_routes",
-            "modules.subscription_access",
-            "modules.transaction_reporting",
-        ):
-            sys.modules.pop(module_name, None)
+        for module_name in list(sys.modules.keys()):
+            if module_name.startswith(("pallet_pro_core", "modules.", "db", "audit")):
+                sys.modules.pop(module_name, None)
 
         cls.core = importlib.import_module("pallet_pro_core")
         cls.client = cls.core.app.test_client()

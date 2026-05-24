@@ -403,45 +403,35 @@ def init_db():
     )
     """)
 
-    resource_cols = {row["name"] for row in c.execute("PRAGMA table_info(resources)").fetchall()}
-    if "category_id" not in resource_cols:
-        c.execute("ALTER TABLE resources ADD COLUMN category_id TEXT")
-    if "brand_id" not in resource_cols:
-        c.execute("ALTER TABLE resources ADD COLUMN brand_id TEXT")
+    def _safe_add_column(table, column, col_type="TEXT"):
+        """Add a column if missing. Ignores duplicate-column errors from worker races."""
+        try:
+            cols = {row["name"] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):
+                raise
 
-    request_cols = {row["name"] for row in c.execute("PRAGMA table_info(resource_requests)").fetchall()}
-    if "category_id" not in request_cols:
-        c.execute("ALTER TABLE resource_requests ADD COLUMN category_id TEXT")
-    if "brand_id" not in request_cols:
-        c.execute("ALTER TABLE resource_requests ADD COLUMN brand_id TEXT")
-    if "rejection_reason_code" not in request_cols:
-        c.execute("ALTER TABLE resource_requests ADD COLUMN rejection_reason_code TEXT")
-    if "rejection_reason_text" not in request_cols:
-        c.execute("ALTER TABLE resource_requests ADD COLUMN rejection_reason_text TEXT")
+    _safe_add_column("resources", "category_id")
+    _safe_add_column("resources", "brand_id")
 
-    brand_request_cols = {row["name"] for row in c.execute("PRAGMA table_info(brand_requests)").fetchall()}
-    if "rejection_reason_code" not in brand_request_cols:
-        c.execute("ALTER TABLE brand_requests ADD COLUMN rejection_reason_code TEXT")
-    if "rejection_reason_text" not in brand_request_cols:
-        c.execute("ALTER TABLE brand_requests ADD COLUMN rejection_reason_text TEXT")
+    _safe_add_column("resource_requests", "category_id")
+    _safe_add_column("resource_requests", "brand_id")
+    _safe_add_column("resource_requests", "rejection_reason_code")
+    _safe_add_column("resource_requests", "rejection_reason_text")
 
-    category_request_cols = {row["name"] for row in c.execute("PRAGMA table_info(category_requests)").fetchall()}
-    if "rejection_reason_code" not in category_request_cols:
-        c.execute("ALTER TABLE category_requests ADD COLUMN rejection_reason_code TEXT")
-    if "rejection_reason_text" not in category_request_cols:
-        c.execute("ALTER TABLE category_requests ADD COLUMN rejection_reason_text TEXT")
+    _safe_add_column("brand_requests", "rejection_reason_code")
+    _safe_add_column("brand_requests", "rejection_reason_text")
 
-    pending_cols = {row["name"] for row in c.execute("PRAGMA table_info(pending_approval_entries)").fetchall()}
-    if "rejection_reason_code" not in pending_cols:
-        c.execute("ALTER TABLE pending_approval_entries ADD COLUMN rejection_reason_code TEXT")
-    if "rejection_reason_text" not in pending_cols:
-        c.execute("ALTER TABLE pending_approval_entries ADD COLUMN rejection_reason_text TEXT")
+    _safe_add_column("category_requests", "rejection_reason_code")
+    _safe_add_column("category_requests", "rejection_reason_text")
 
-    txn_cols = {row["name"] for row in c.execute("PRAGMA table_info(transactions)").fetchall()}
-    if "unresolved_entity_note" not in txn_cols:
-        c.execute("ALTER TABLE transactions ADD COLUMN unresolved_entity_note TEXT")
-    if "unresolved_entity_type" not in txn_cols:
-        c.execute("ALTER TABLE transactions ADD COLUMN unresolved_entity_type TEXT")
+    _safe_add_column("pending_approval_entries", "rejection_reason_code")
+    _safe_add_column("pending_approval_entries", "rejection_reason_text")
+
+    _safe_add_column("transactions", "unresolved_entity_note")
+    _safe_add_column("transactions", "unresolved_entity_type")
 
     ensure_subscription_guard_tables(conn)
     ensure_api_key_tables(conn)

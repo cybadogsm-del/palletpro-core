@@ -268,6 +268,9 @@ def register_user_routes(app):
         temporary_user_access_id = body.get("temporary_user_access_id")
         created_by_display_name = (body.get("created_by_display_name") or "Global Admin").strip()
         confirmation_text = (body.get("confirmation_text") or "").strip()
+        access_method = (body.get("access_method") or "").strip().upper()
+
+        _VALID_ACCESS_METHODS = {"MOBILE", "TABLET", "DESKTOP", "BOTH"}
 
         required_confirmation = "CREATE USER"
 
@@ -283,6 +286,27 @@ def register_user_routes(app):
 
         if role not in USER_ROLES:
             return jsonify({"error": "Invalid role", "allowed_roles": sorted(USER_ROLES)}), 400
+
+        # ── Access method validation ──────────────────────────────────────────
+        if not access_method or access_method not in _VALID_ACCESS_METHODS:
+            return jsonify({
+                "error": "access_method is required",
+                "allowed": sorted(_VALID_ACCESS_METHODS),
+                "hint": "MOBILE=phone/SMS, TABLET=wifi tablet/email, DESKTOP=email (admin only), BOTH=phone+email",
+            }), 400
+
+        if access_method in ("MOBILE", "BOTH") and not mobile_number:
+            return jsonify({"error": "mobile_number is required for MOBILE or BOTH access"}), 400
+
+        if access_method in ("TABLET", "DESKTOP", "BOTH") and not email:
+            return jsonify({"error": "email is required for TABLET, DESKTOP, or BOTH access"}), 400
+
+        if access_method == "DESKTOP" and role not in ("GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN", "ORG_ADMIN"):
+            return jsonify({
+                "error": "DESKTOP_ADMIN_ONLY",
+                "message": "Desktop-only access is reserved for ORG_ADMIN or Global Admin roles. "
+                           "Field users need a mobile or tablet to use Pallet Pro.",
+            }), 400
 
         if access_status not in USER_ACCESS_STATUSES:
             return jsonify({"error": "Invalid access_status", "allowed_statuses": sorted(USER_ACCESS_STATUSES)}), 400
@@ -423,11 +447,47 @@ def register_user_routes(app):
 
         conn.close()
 
+        # ── Invite delivery ───────────────────────────────────────────────────
+        # SMS for MOBILE / BOTH; email for TABLET / DESKTOP / BOTH.
+        sms_sent = False
+        email_sent = False
+
+        if access_method in ("MOBILE", "BOTH") and mobile_number:
+            from modules.sms import send_invite_sms
+            sms_sent = send_invite_sms(
+                to=mobile_number,
+                setup_token=setup_token,
+                invited_by=created_by_display_name,
+            )
+
+        if access_method in ("TABLET", "DESKTOP", "BOTH") and email:
+            from modules.email import send_invite_email
+            email_sent = send_invite_email(
+                to=email,
+                setup_token=setup_token,
+                display_name=display_name,
+                invited_by=created_by_display_name,
+            )
+
+        delivery_parts = []
+        if sms_sent:
+            delivery_parts.append("SMS sent to mobile")
+        if email_sent:
+            delivery_parts.append("email sent")
+        delivery_note = (
+            " and ".join(delivery_parts).capitalize() + "."
+            if delivery_parts else
+            "No invite sent (credentials not configured). Share this setup token securely — "
+            "user must call POST /auth/set-password. Expires in 7 days."
+        )
+
         return jsonify({
             "user": dict(user),
             "access_policy": policy,
             "setup_token": setup_token,
-            "setup_token_note": "Share this token securely with the user. They must call POST /auth/set-password to activate their account. Expires in 7 days.",
+            "setup_token_note": delivery_note,
+            "sms_sent": sms_sent,
+            "email_sent": email_sent,
             "rule": "User access is role-based and organisation-aware.",
         }), 201
 

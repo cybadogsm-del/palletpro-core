@@ -3,3 +3,5 @@ gunicorn>=22.0
 webauthn>=2.0.0
 pywebpush>=2.0.0
 anthropic>=0.40.0
+twilio>=9.0.0
+sendgrid>=6.0.0
