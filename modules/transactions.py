@@ -71,6 +71,15 @@ def ensure_transaction_numbering_tables(conn):
         conn.execute("ALTER TABLE transactions ADD COLUMN org_sequence_number INTEGER")
 
 
+def ensure_transaction_reference_columns(conn):
+    """Add customer_reference and admin_orgs_reference columns if not present."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+    if "customer_reference" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN customer_reference TEXT")
+    if "admin_orgs_reference" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN admin_orgs_reference TEXT")
+
+
 # ── Core helpers ───────────────────────────────────────────────────────────────
 
 def generate_transaction_reference(conn, organisation_id):
@@ -361,6 +370,8 @@ def register_transaction_routes(
         partner_address_id = body.get("partner_address_id")
         unresolved_entity_note = (body.get("unresolved_entity_note") or "").strip() or None
         unresolved_entity_type = (body.get("unresolved_entity_type") or "").strip().upper() or None
+        customer_reference = (body.get("customer_reference") or "").strip()[:255] or None
+        admin_orgs_reference = (body.get("admin_orgs_reference") or "").strip()[:255] or None
 
         if not organisation_id:
             return jsonify({"error": "organisation_id is required"}), 400
@@ -386,6 +397,7 @@ def register_transaction_routes(
         ensure_partner_address_tables(conn)
         ensure_transaction_user_attribution_columns(conn)
         ensure_transaction_numbering_tables(conn)
+        ensure_transaction_reference_columns(conn)
 
         access_error = require_active_org_access(conn, organisation_id)
         if access_error:
@@ -488,8 +500,10 @@ def register_transaction_routes(
                 reference_number,
                 org_sequence_number,
                 unresolved_entity_note,
-                unresolved_entity_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                unresolved_entity_type,
+                customer_reference,
+                admin_orgs_reference
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
 
         resource_name = resource["name"] if resource else None
@@ -504,6 +518,7 @@ def register_transaction_routes(
                     None, submitted_by_user_id, submitted_by_display_name,
                     created_at, None, reference_number, org_sequence_number,
                     unresolved_entity_note, unresolved_entity_type,
+                    customer_reference, admin_orgs_reference,
                 )
             )
 
@@ -565,6 +580,8 @@ def register_transaction_routes(
                 "submitted_by_display_name": submitted_by_display_name,
                 "reference_number": reference_number,
                 "org_sequence_number": org_sequence_number,
+                "customer_reference": customer_reference,
+                "admin_orgs_reference": admin_orgs_reference,
                 "message": "Transaction saved. Your Org Admin has been notified to resolve the missing entity and complete the transaction.",
             }), 201
 
@@ -578,6 +595,7 @@ def register_transaction_routes(
                     partner_address_id, submitted_by_user_id, submitted_by_display_name,
                     created_at, None, reference_number, org_sequence_number,
                     None, None,
+                    customer_reference, admin_orgs_reference,
                 )
             )
 
@@ -637,6 +655,8 @@ def register_transaction_routes(
                 "submitted_by_display_name": submitted_by_display_name,
                 "reference_number": reference_number,
                 "org_sequence_number": org_sequence_number,
+                "customer_reference": customer_reference,
+                "admin_orgs_reference": admin_orgs_reference,
                 "message": "Opening balance has not been set for this entity. This transaction cannot be processed automatically and has been sent to your Org Admin for approval."
             }), 201
 
@@ -648,6 +668,7 @@ def register_transaction_routes(
                 partner_address_id, submitted_by_user_id, submitted_by_display_name,
                 created_at, None, reference_number, org_sequence_number,
                 None, None,
+                customer_reference, admin_orgs_reference,
             )
         )
 
@@ -684,7 +705,9 @@ def register_transaction_routes(
             "submitted_by_user_id": submitted_by_user_id,
             "submitted_by_display_name": submitted_by_display_name,
             "reference_number": reference_number,
-            "org_sequence_number": org_sequence_number
+            "org_sequence_number": org_sequence_number,
+            "customer_reference": customer_reference,
+            "admin_orgs_reference": admin_orgs_reference,
         }), 201
 
 
@@ -698,6 +721,7 @@ def register_transaction_routes(
         ensure_transaction_partner_columns(conn)
         ensure_partner_address_tables(conn)
         ensure_transaction_numbering_tables(conn)
+        ensure_transaction_reference_columns(conn)
 
         sql = """
             SELECT
@@ -723,7 +747,9 @@ def register_transaction_routes(
                 t.created_at,
                 t.posted_at,
                 t.reference_number,
-                t.org_sequence_number
+                t.org_sequence_number,
+                t.customer_reference,
+                t.admin_orgs_reference
             FROM transactions t
             LEFT JOIN organisations o ON o.organisation_id = t.organisation_id
             LEFT JOIN depots d ON d.depot_id = t.depot_id

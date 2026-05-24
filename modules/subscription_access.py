@@ -764,3 +764,110 @@ def register_subscription_routes(app):
             "count": len(rows),
             "items": [dict(row) for row in rows],
         }), 200
+
+    @app.patch("/global-admin/pricing-plans/<pricing_plan_id>")
+    def update_pricing_plan(pricing_plan_id):
+        """SUPER_GLOBAL_ADMIN only — update price fields on a pricing plan."""
+        from flask import g
+        _SGA = {"SUPER_GLOBAL_ADMIN"}
+        if g.current_user.get("role") not in _SGA:
+            return jsonify({"error": "INSUFFICIENT_ROLE", "message": "Super Global Admin only."}), 403
+
+        body = request.get_json(silent=True) or {}
+        conn = get_conn()
+        ensure_subscription_guard_tables(conn)
+
+        plan = conn.execute(
+            "SELECT * FROM pricing_plans WHERE pricing_plan_id = ?", (pricing_plan_id,)
+        ).fetchone()
+        if not plan:
+            conn.close()
+            return jsonify({"error": "Pricing plan not found"}), 404
+
+        fields = {}
+        if "package_price_cents" in body:
+            v = body["package_price_cents"]
+            fields["package_price_cents"] = int(v) if v is not None else None
+        if "price_per_user_cents" in body:
+            v = body["price_per_user_cents"]
+            fields["price_per_user_cents"] = int(v) if v is not None else None
+        if "plan_name" in body:
+            fields["plan_name"] = (body["plan_name"] or "").strip()[:255] or None
+        if "notes" in body:
+            fields["notes"] = (body["notes"] or "").strip()[:1000] or None
+        if "is_active" in body:
+            fields["is_active"] = 1 if body["is_active"] else 0
+
+        if not fields:
+            conn.close()
+            return jsonify({"error": "No updateable fields provided"}), 400
+
+        fields["updated_at"] = now_iso()
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(
+            f"UPDATE pricing_plans SET {set_clause} WHERE pricing_plan_id = ?",
+            [*fields.values(), pricing_plan_id],
+        )
+
+        audit_event(
+            conn,
+            entity_type="PricingPlan",
+            entity_id=pricing_plan_id,
+            action="UPDATE",
+            summary=f"Pricing plan updated by Super Global Admin: {pricing_plan_id}",
+            organisation_id=None,
+        )
+
+        conn.commit()
+        updated = conn.execute(
+            "SELECT * FROM pricing_plans WHERE pricing_plan_id = ?", (pricing_plan_id,)
+        ).fetchone()
+        conn.close()
+
+        return jsonify(dict(updated)), 200
+
+    @app.patch("/global-admin/pricing-settings")
+    def update_pricing_settings():
+        """SUPER_GLOBAL_ADMIN only — update GST rate, temp access days, temp fee."""
+        from flask import g
+        _SGA = {"SUPER_GLOBAL_ADMIN"}
+        if g.current_user.get("role") not in _SGA:
+            return jsonify({"error": "INSUFFICIENT_ROLE", "message": "Super Global Admin only."}), 403
+
+        body = request.get_json(silent=True) or {}
+        conn = get_conn()
+        ensure_subscription_guard_tables(conn)
+
+        fields = {}
+        if "gst_rate_percent" in body:
+            fields["gst_rate_percent"] = float(body["gst_rate_percent"])
+        if "temporary_access_days" in body:
+            fields["temporary_access_days"] = int(body["temporary_access_days"])
+        if "temporary_user_access_fee_cents" in body:
+            fields["temporary_user_access_fee_cents"] = int(body["temporary_user_access_fee_cents"])
+
+        if not fields:
+            conn.close()
+            return jsonify({"error": "No updateable fields provided"}), 400
+
+        fields["updated_at"] = now_iso()
+        set_clause = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(
+            f"UPDATE pricing_settings SET {set_clause} WHERE pricing_settings_id = 'pricing_settings_default'",
+            list(fields.values()),
+        )
+
+        audit_event(
+            conn,
+            entity_type="PricingSettings",
+            entity_id="pricing_settings_default",
+            action="UPDATE",
+            summary="Pricing settings updated by Super Global Admin",
+            organisation_id=None,
+        )
+
+        conn.commit()
+        updated = conn.execute("SELECT * FROM pricing_settings LIMIT 1").fetchone()
+        conn.close()
+
+        return jsonify(dict(updated)), 200
