@@ -400,6 +400,29 @@ def register_billing_routes(app):
         }), 200
 
 
+    @app.get("/global-admin/billing-export-runs")
+    def list_billing_export_runs():
+        conn = get_conn()
+        ensure_subscription_guard_tables(conn)
+        ensure_billing_export_snapshot_tables(conn)
+
+        runs = conn.execute(
+            """
+            SELECT *
+            FROM billing_export_runs
+            ORDER BY created_at DESC
+            LIMIT 50
+            """
+        ).fetchall()
+
+        conn.close()
+
+        return jsonify({
+            "count": len(runs),
+            "items": [dict(r) for r in runs],
+        }), 200
+
+
     @app.get("/global-admin/billing-export-runs/<billing_export_run_id>")
     def get_billing_export_run(billing_export_run_id):
         conn = get_conn()
