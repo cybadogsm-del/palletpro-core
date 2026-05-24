@@ -5,3 +5,4 @@ node_modules/
 pallet_pro.db
 .env
 server.log
+*.db
