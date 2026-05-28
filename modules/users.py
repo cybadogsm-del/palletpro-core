@@ -9,7 +9,9 @@ Covers:
   - Routes: POST /global-admin/users,
     GET /organisations/<id>/users,
     GET /users/<id>/access-policy,
-    POST /global-admin/users/<id>/access
+    POST /global-admin/users/<id>/access,
+    GET /users/<id>/navigation-preference,
+    PATCH /users/<id>/navigation-preference
 """
 
 from datetime import datetime
@@ -28,6 +30,20 @@ from modules.subscription_access import (
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
+
+VALID_NAV_APP_KEYS = {
+    "google_maps",
+    "waze",
+    "apple_maps",
+    "generic_geo",
+}
+
+NAV_APP_LABELS = {
+    "google_maps": "Google Maps",
+    "waze": "Waze",
+    "apple_maps": "Apple Maps",
+    "generic_geo": "Default Navigation App",
+}
 
 USER_ROLES = {
     "SUPER_GLOBAL_ADMIN",
@@ -62,6 +78,10 @@ def ensure_user_access_tables(conn):
         updated_at TEXT NOT NULL
     )
     """)
+
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(user_accounts)").fetchall()}
+    if "default_nav_app" not in existing:
+        conn.execute("ALTER TABLE user_accounts ADD COLUMN default_nav_app TEXT NOT NULL DEFAULT 'google_maps'")
 
     conn.execute("""
     CREATE TABLE IF NOT EXISTS user_access_events (
@@ -645,4 +665,80 @@ def register_user_routes(app):
             "access_policy": policy,
             "changed_by_display_name": changed_by_display_name,
             "rule": "User role/access changes are audited.",
+        }), 200
+
+
+    @app.get("/users/<user_id>/navigation-preference")
+    def get_user_navigation_preference(user_id):
+        conn = get_conn()
+        ensure_user_access_tables(conn)
+
+        user = get_user_account(conn, user_id)
+        conn.close()
+
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        current_key = user["default_nav_app"] or "google_maps"
+
+        apps = [
+            {
+                "app_key": key,
+                "app_label": NAV_APP_LABELS[key],
+                "is_default": key == current_key,
+            }
+            for key in ("google_maps", "waze", "apple_maps", "generic_geo")
+        ]
+
+        return jsonify({
+            "user_id": user_id,
+            "default_nav_app": current_key,
+            "default_nav_app_label": NAV_APP_LABELS.get(current_key, current_key),
+            "available_apps": apps,
+        }), 200
+
+
+    @app.patch("/users/<user_id>/navigation-preference")
+    def update_user_navigation_preference(user_id):
+        body = request.get_json(silent=True) or {}
+        nav_app = (body.get("default_nav_app") or "").strip().lower()
+
+        if not nav_app:
+            return jsonify({"error": "default_nav_app is required"}), 400
+
+        if nav_app not in VALID_NAV_APP_KEYS:
+            return jsonify({
+                "error": "Invalid default_nav_app",
+                "allowed": sorted(VALID_NAV_APP_KEYS),
+            }), 400
+
+        conn = get_conn()
+        ensure_user_access_tables(conn)
+
+        user = get_user_account(conn, user_id)
+        if not user:
+            conn.close()
+            return jsonify({"error": "User not found"}), 404
+
+        conn.execute(
+            "UPDATE user_accounts SET default_nav_app = ?, updated_at = ? WHERE user_id = ?",
+            (nav_app, now_iso(), user_id)
+        )
+
+        audit_event(
+            conn,
+            entity_type="UserAccount",
+            entity_id=user_id,
+            action="NAV_PREFERENCE_UPDATED",
+            summary=f"Default navigation app set to {NAV_APP_LABELS.get(nav_app, nav_app)}.",
+            organisation_id=user["organisation_id"],
+        )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "user_id": user_id,
+            "default_nav_app": nav_app,
+            "default_nav_app_label": NAV_APP_LABELS.get(nav_app, nav_app),
         }), 200
