@@ -873,6 +873,21 @@ def register_transaction_routes(
 
         post_transaction_to_ledger(conn, txn)
 
+        # Route learning — update visit history for morning sync predictions
+        if txn["submitted_by_user_id"] and txn["partner_address_id"]:
+            from modules.route_intelligence import upsert_route_learning, ACTION_TO_DIRECTION
+            direction_to_action = {v: k for k, v in ACTION_TO_DIRECTION.items()}
+            learned_action = direction_to_action.get(txn["direction"], "Dropoff")
+            upsert_route_learning(
+                conn=conn,
+                user_id=txn["submitted_by_user_id"],
+                organisation_id=txn["organisation_id"],
+                partner_address_id=txn["partner_address_id"],
+                resource_id=txn["resource_id"],
+                action=learned_action,
+                transaction_created_at=txn["created_at"],
+            )
+
         conn.commit()
         conn.close()
 

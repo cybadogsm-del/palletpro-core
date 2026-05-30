@@ -82,6 +82,8 @@ def ensure_user_access_tables(conn):
     existing = {row[1] for row in conn.execute("PRAGMA table_info(user_accounts)").fetchall()}
     if "default_nav_app" not in existing:
         conn.execute("ALTER TABLE user_accounts ADD COLUMN default_nav_app TEXT NOT NULL DEFAULT 'google_maps'")
+    if "default_depot_id" not in existing:
+        conn.execute("ALTER TABLE user_accounts ADD COLUMN default_depot_id TEXT")
 
     conn.execute("""
     CREATE TABLE IF NOT EXISTS user_access_events (
@@ -289,6 +291,7 @@ def register_user_routes(app):
         created_by_display_name = (body.get("created_by_display_name") or "Global Admin").strip()
         confirmation_text = (body.get("confirmation_text") or "").strip()
         access_method = (body.get("access_method") or "").strip().upper()
+        default_depot_id = body.get("default_depot_id") or None
 
         _VALID_ACCESS_METHODS = {"MOBILE", "TABLET", "DESKTOP", "BOTH"}
 
@@ -421,9 +424,10 @@ def register_user_routes(app):
                 access_status,
                 temporary_user_access_id,
                 created_by_display_name,
+                default_depot_id,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -435,6 +439,7 @@ def register_user_routes(app):
                 access_status,
                 temporary_user_access_id,
                 created_by_display_name,
+                default_depot_id,
                 ts,
                 ts,
             )

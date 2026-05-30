@@ -84,6 +84,10 @@ def ensure_partner_address_tables(conn):
     )
     """)
 
+    existing_pa = {row[1] for row in conn.execute("PRAGMA table_info(partner_addresses)").fetchall()}
+    if "entry_heading" not in existing_pa:
+        conn.execute("ALTER TABLE partner_addresses ADD COLUMN entry_heading INTEGER")
+
     conn.execute("""
     CREATE TABLE IF NOT EXISTS location_update_requests (
         location_update_request_id TEXT PRIMARY KEY,
@@ -247,6 +251,15 @@ def register_partner_routes(app, record_shared_transaction_event):
         latitude = body.get("latitude")
         longitude = body.get("longitude")
 
+        entry_heading = body.get("entry_heading")
+        if entry_heading is not None:
+            try:
+                entry_heading = int(entry_heading)
+                if not (0 <= entry_heading <= 360):
+                    return jsonify({"error": "entry_heading must be between 0 and 360"}), 400
+            except (TypeError, ValueError):
+                return jsonify({"error": "entry_heading must be an integer between 0 and 360"}), 400
+
         is_primary = 1 if bool(body.get("is_primary")) else 0
         is_default_dispatch_site = 1 if bool(body.get("is_default_dispatch_site")) else 0
         is_default_receiving_site = 1 if bool(body.get("is_default_receiving_site")) else 0
@@ -341,9 +354,10 @@ def register_partner_routes(app, record_shared_transaction_event):
                 truck_access_notes,
                 latitude,
                 longitude,
+                entry_heading,
                 created_at,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 partner_address_id,
@@ -368,6 +382,7 @@ def register_partner_routes(app, record_shared_transaction_event):
                 truck_access_notes,
                 latitude,
                 longitude,
+                entry_heading,
                 now,
                 now
             )
@@ -648,6 +663,22 @@ def register_partner_routes(app, record_shared_transaction_event):
                         return jsonify({"error": f"{field} must be a number"}), 400
                 updates.append(f"{field} = ?")
                 params.append(value)
+
+        if "entry_heading" in body:
+            value = body.get("entry_heading")
+            if value in ("", None):
+                value = None
+            else:
+                try:
+                    value = int(value)
+                    if not (0 <= value <= 360):
+                        conn.close()
+                        return jsonify({"error": "entry_heading must be between 0 and 360"}), 400
+                except (TypeError, ValueError):
+                    conn.close()
+                    return jsonify({"error": "entry_heading must be an integer between 0 and 360"}), 400
+            updates.append("entry_heading = ?")
+            params.append(value)
 
         if not updates:
             conn.close()
