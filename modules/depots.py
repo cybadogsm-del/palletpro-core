@@ -12,6 +12,9 @@ from flask import g, jsonify, request
 from audit import audit_event
 from db import get_conn, make_id, now_iso
 
+_ORG_ADMIN_ROLES = {"ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+_GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+
 
 # ── Schema migration helper ────────────────────────────────────────────────────
 
@@ -22,6 +25,29 @@ def _ensure_depot_update_columns(conn):
     if "updated_at" not in cols:
         conn.execute("ALTER TABLE depots ADD COLUMN updated_at TEXT")
     conn.commit()
+
+
+def _require_org_admin_role(action_label):
+    role = g.current_user.get("role")
+    if role not in _ORG_ADMIN_ROLES:
+        return jsonify({
+            "error": "INSUFFICIENT_ROLE",
+            "message": f"Only Org Admin or above can {action_label}.",
+            "your_role": role,
+        }), 403
+    return None
+
+
+def _require_depot_org_access(depot):
+    role = g.current_user.get("role")
+    if role in _GLOBAL_ADMIN_ROLES:
+        return None
+    if g.current_user.get("user_org_id") == depot["organisation_id"]:
+        return None
+    return jsonify({
+        "error": "ORG_ACCESS_DENIED",
+        "message": "You do not have access to manage this depot.",
+    }), 403
 
 
 # ── Route registration ─────────────────────────────────────────────────────────
@@ -60,7 +86,10 @@ def register_depot_routes(app):
 
     @app.post("/depots")
     def create_depot():
-        _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+        role_error = _require_org_admin_role("create depots")
+        if role_error:
+            return role_error
+
         body = request.get_json(silent=True) or {}
         # Enforce org isolation: non-global-admins always write to their own org
         if g.current_user.get("role") not in _GLOBAL_ADMIN_ROLES:
@@ -267,6 +296,10 @@ def register_depot_routes(app):
 
     @app.post("/depots/<depot_id>/deactivate")
     def deactivate_depot(depot_id):
+        role_error = _require_org_admin_role("deactivate depots")
+        if role_error:
+            return role_error
+
         conn = get_conn()
         _ensure_depot_update_columns(conn)
 
@@ -277,6 +310,11 @@ def register_depot_routes(app):
         if not depot:
             conn.close()
             return jsonify({"error": "Depot not found"}), 404
+
+        access_error = _require_depot_org_access(depot)
+        if access_error:
+            conn.close()
+            return access_error
 
         depot_cols = {row["name"] for row in conn.execute("PRAGMA table_info(depots)")}
         if "is_active" in depot_cols and depot["is_active"] == 0:
@@ -310,6 +348,10 @@ def register_depot_routes(app):
 
     @app.post("/depots/<depot_id>/reactivate")
     def reactivate_depot(depot_id):
+        role_error = _require_org_admin_role("reactivate depots")
+        if role_error:
+            return role_error
+
         conn = get_conn()
         _ensure_depot_update_columns(conn)
 
@@ -320,6 +362,11 @@ def register_depot_routes(app):
         if not depot:
             conn.close()
             return jsonify({"error": "Depot not found"}), 404
+
+        access_error = _require_depot_org_access(depot)
+        if access_error:
+            conn.close()
+            return access_error
 
         ts = now_iso()
         conn.execute(

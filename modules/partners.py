@@ -21,6 +21,9 @@ from flask import g, jsonify, request
 from audit import audit_event
 from db import get_conn, make_id, now_iso
 
+_ORG_ADMIN_ROLES = {"ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+_GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+
 
 # ── DB setup ──────────────────────────────────────────────────────────────────
 
@@ -110,6 +113,29 @@ def ensure_partner_address_tables(conn):
     """)
 
     conn.commit()
+
+
+def _require_org_admin_role(action_label):
+    role = g.current_user.get("role")
+    if role not in _ORG_ADMIN_ROLES:
+        return jsonify({
+            "error": "INSUFFICIENT_ROLE",
+            "message": f"Only Org Admin or above can {action_label}.",
+            "your_role": role,
+        }), 403
+    return None
+
+
+def _require_partner_org_access(partner):
+    role = g.current_user.get("role")
+    if role in _GLOBAL_ADMIN_ROLES:
+        return None
+    if g.current_user.get("user_org_id") == partner["organisation_id"]:
+        return None
+    return jsonify({
+        "error": "ORG_ACCESS_DENIED",
+        "message": "You do not have access to manage this partner.",
+    }), 403
 
 
 # ── Navigation contract helper ─────────────────────────────────────────────────
@@ -1895,7 +1921,10 @@ def register_partner_routes(app, record_shared_transaction_event):
 
     @app.post("/partners")
     def create_partner():
-        _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+        role_error = _require_org_admin_role("create partners")
+        if role_error:
+            return role_error
+
         body = request.get_json(silent=True) or {}
         # Enforce org isolation: non-global-admins always write to their own org
         if g.current_user.get("role") not in _GLOBAL_ADMIN_ROLES:
@@ -2251,6 +2280,10 @@ def register_partner_routes(app, record_shared_transaction_event):
 
     @app.post("/partners/<partner_id>/deactivate")
     def deactivate_partner(partner_id):
+        role_error = _require_org_admin_role("deactivate partners")
+        if role_error:
+            return role_error
+
         conn = get_conn()
         ensure_partner_connection_tables(conn)
 
@@ -2261,6 +2294,11 @@ def register_partner_routes(app, record_shared_transaction_event):
         if not partner:
             conn.close()
             return jsonify({"error": "Partner not found"}), 404
+
+        access_error = _require_partner_org_access(partner)
+        if access_error:
+            conn.close()
+            return access_error
 
         if not partner["is_active"]:
             conn.close()
@@ -2293,6 +2331,10 @@ def register_partner_routes(app, record_shared_transaction_event):
 
     @app.post("/partners/<partner_id>/reactivate")
     def reactivate_partner(partner_id):
+        role_error = _require_org_admin_role("reactivate partners")
+        if role_error:
+            return role_error
+
         conn = get_conn()
         ensure_partner_connection_tables(conn)
 
@@ -2303,6 +2345,11 @@ def register_partner_routes(app, record_shared_transaction_event):
         if not partner:
             conn.close()
             return jsonify({"error": "Partner not found"}), 404
+
+        access_error = _require_partner_org_access(partner)
+        if access_error:
+            conn.close()
+            return access_error
 
         if partner["is_active"]:
             conn.close()

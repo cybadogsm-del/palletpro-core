@@ -660,6 +660,152 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(detail.status_code, 403)
         self.assertEqual(detail.get_json()["error"], "ORG_ACCESS_DENIED")
 
+    def test_org_user_listing_permissions_and_sanitized_response(self):
+        org_a = self.create_organisation("Org Users A")
+        org_b = self.create_organisation("Org Users B")
+        org_admin_id = self._create_user(org_a, "Org Users Admin", role="ORG_ADMIN")
+        field_user_id = self._create_user(org_a, "Org Users Field", role="USER")
+        org_b_user_id = self._create_user(org_b, "Other Org User", role="USER")
+        org_admin_client = self._client_for_user(org_admin_id, "org users admin key")
+        field_client = self._client_for_user(field_user_id, "org users field key")
+
+        field_list = field_client.get(f"/organisations/{org_a}/users")
+        self.assertEqual(field_list.status_code, 403)
+
+        own_list = org_admin_client.get(f"/organisations/{org_a}/users")
+        self.assertEqual(own_list.status_code, 200)
+        payload = own_list.get_json()
+        self.assertEqual(payload["organisation_id"], org_a)
+        self.assertGreaterEqual(payload["count"], 2)
+
+        forbidden_keys = {
+            "api_key",
+            "key_hash",
+            "password_hash",
+            "setup_token",
+            "token_hash",
+            "raw_token",
+            "credential_private_key",
+        }
+        for item in payload["items"]:
+            user_payload = item["user"]
+            self.assertTrue(forbidden_keys.isdisjoint(user_payload.keys()))
+
+        cross_list = org_admin_client.get(f"/organisations/{org_b}/users")
+        self.assertEqual(cross_list.status_code, 403)
+
+        sga_list = self.client.get(f"/organisations/{org_b}/users")
+        self.assertEqual(sga_list.status_code, 200)
+        self.assertIn(org_b_user_id, [item["user"]["user_id"] for item in sga_list.get_json()["items"]])
+
+    def test_partner_management_requires_org_admin_and_preserves_org_boundary(self):
+        org_a = self.create_organisation("Partner Mgmt A")
+        org_b = self.create_organisation("Partner Mgmt B")
+        org_admin_id = self._create_user(org_a, "Partner Admin", role="ORG_ADMIN")
+        field_user_id = self._create_user(org_a, "Partner Field", role="USER")
+        org_admin_client = self._client_for_user(org_admin_id, "partner admin key")
+        field_client = self._client_for_user(field_user_id, "partner field key")
+
+        field_create = field_client.post("/partners", json={
+            "organisation_id": org_a,
+            "name": "Field Created Partner",
+            "is_customer": True,
+        })
+        self.assertEqual(field_create.status_code, 403)
+
+        create = org_admin_client.post("/partners", json={
+            "organisation_id": org_b,
+            "name": "Admin Partner",
+            "is_customer": True,
+        })
+        self.assertEqual(create.status_code, 201)
+        self.assertEqual(create.get_json()["organisation_id"], org_a)
+        partner_id = create.get_json()["partner_id"]
+
+        field_deactivate = field_client.post(f"/partners/{partner_id}/deactivate")
+        self.assertEqual(field_deactivate.status_code, 403)
+
+        deactivate = org_admin_client.post(f"/partners/{partner_id}/deactivate")
+        self.assertEqual(deactivate.status_code, 200)
+        self.assertFalse(deactivate.get_json()["is_active"])
+
+        org_b_partner = self.client.post("/partners", json={
+            "organisation_id": org_b,
+            "name": "Other Org Partner",
+            "is_supplier": True,
+        })
+        self.assertEqual(org_b_partner.status_code, 201)
+        cross_deactivate = org_admin_client.post(
+            f"/partners/{org_b_partner.get_json()['partner_id']}/deactivate"
+        )
+        self.assertEqual(cross_deactivate.status_code, 403)
+
+    def test_resource_management_requires_org_admin_and_does_not_mutate_ledger(self):
+        org_a = self.create_organisation("Resource Mgmt A")
+        org_b = self.create_organisation("Resource Mgmt B")
+        category_a = self._create_category(org_a, "Resource Mgmt Cat A")
+        category_b = self._create_category(org_b, "Resource Mgmt Cat B")
+        org_admin_id = self._create_user(org_a, "Resource Admin", role="ORG_ADMIN")
+        field_user_id = self._create_user(org_a, "Resource Field", role="USER")
+        org_admin_client = self._client_for_user(org_admin_id, "resource admin key")
+        field_client = self._client_for_user(field_user_id, "resource field key")
+        resource_id = self._create_resource(org_a, category_a, "Managed Resource")
+
+        ledger_count_before = self._get_table_count("ledger_entries")
+
+        field_deactivate = field_client.post(f"/resources/{resource_id}/deactivate")
+        self.assertEqual(field_deactivate.status_code, 403)
+
+        deactivate = org_admin_client.post(f"/resources/{resource_id}/deactivate")
+        self.assertEqual(deactivate.status_code, 200)
+        self.assertFalse(deactivate.get_json()["is_active"])
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+
+        reactivate = org_admin_client.post(f"/resources/{resource_id}/reactivate")
+        self.assertEqual(reactivate.status_code, 200)
+        self.assertTrue(reactivate.get_json()["is_active"])
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+
+        org_b_resource = self._create_resource(org_b, category_b, "Other Org Resource")
+        cross_deactivate = org_admin_client.post(f"/resources/{org_b_resource}/deactivate")
+        self.assertEqual(cross_deactivate.status_code, 403)
+
+    def test_depot_management_requires_org_admin_and_does_not_mutate_ledger(self):
+        org_a = self.create_organisation("Depot Mgmt A")
+        org_b = self.create_organisation("Depot Mgmt B")
+        org_admin_id = self._create_user(org_a, "Depot Admin", role="ORG_ADMIN")
+        field_user_id = self._create_user(org_a, "Depot Field", role="USER")
+        org_admin_client = self._client_for_user(org_admin_id, "depot admin key")
+        field_client = self._client_for_user(field_user_id, "depot field key")
+
+        field_create = field_client.post("/depots", json={
+            "organisation_id": org_a,
+            "name": "Field Depot",
+        })
+        self.assertEqual(field_create.status_code, 403)
+
+        create = org_admin_client.post("/depots", json={
+            "organisation_id": org_b,
+            "name": "Admin Depot",
+        })
+        self.assertEqual(create.status_code, 201)
+        self.assertEqual(create.get_json()["organisation_id"], org_a)
+        depot_id = create.get_json()["depot_id"]
+
+        ledger_count_before = self._get_table_count("ledger_entries")
+
+        field_deactivate = field_client.post(f"/depots/{depot_id}/deactivate")
+        self.assertEqual(field_deactivate.status_code, 403)
+
+        deactivate = org_admin_client.post(f"/depots/{depot_id}/deactivate")
+        self.assertEqual(deactivate.status_code, 200)
+        self.assertFalse(deactivate.get_json()["is_active"])
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+
+        org_b_depot = self._create_depot(org_b, "Other Org Depot")
+        cross_deactivate = org_admin_client.post(f"/depots/{org_b_depot}/deactivate")
+        self.assertEqual(cross_deactivate.status_code, 403)
+
     def test_stock_position_org_and_depot(self):
         organisation_id = self.create_organisation("Stock Position Org")
         depot_id = self._create_depot(organisation_id, "Stock Depot")

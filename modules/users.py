@@ -563,8 +563,23 @@ def register_user_routes(app):
 
         items = []
         for row in rows:
+            safe_user = {
+                "user_id": row["user_id"],
+                "organisation_id": row["organisation_id"],
+                "display_name": row["display_name"],
+                "email": row["email"],
+                "mobile_number": row["mobile_number"] if "mobile_number" in row.keys() else None,
+                "role": row["role"],
+                "access_status": row["access_status"],
+                "temporary_user_access_id": row["temporary_user_access_id"],
+                "default_depot_id": row["default_depot_id"] if "default_depot_id" in row.keys() else None,
+                "default_nav_app": row["default_nav_app"] if "default_nav_app" in row.keys() else None,
+                "created_by_display_name": row["created_by_display_name"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
             items.append({
-                "user": dict(row),
+                "user": safe_user,
                 "access_policy": build_user_access_policy(conn, row),
             })
 

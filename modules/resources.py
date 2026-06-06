@@ -17,6 +17,9 @@ from flask import g, jsonify, request
 from audit import audit_event
 from db import get_conn, make_id, now_iso
 
+_ORG_ADMIN_ROLES = {"ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+_GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+
 
 # ── Schema migration helpers ───────────────────────────────────────────────────
 
@@ -30,6 +33,29 @@ def ensure_resource_cleanup_columns(conn):
         conn.execute("ALTER TABLE resources ADD COLUMN inactive_reason_text TEXT")
     if "updated_at" not in cols:
         conn.execute("ALTER TABLE resources ADD COLUMN updated_at TEXT")
+
+
+def _require_org_admin_role(action_label):
+    role = g.current_user.get("role")
+    if role not in _ORG_ADMIN_ROLES:
+        return jsonify({
+            "error": "INSUFFICIENT_ROLE",
+            "message": f"Only Org Admin or above can {action_label}.",
+            "your_role": role,
+        }), 403
+    return None
+
+
+def _require_resource_org_access(resource):
+    role = g.current_user.get("role")
+    if role in _GLOBAL_ADMIN_ROLES:
+        return None
+    if g.current_user.get("user_org_id") == resource["organisation_id"]:
+        return None
+    return jsonify({
+        "error": "ORG_ACCESS_DENIED",
+        "message": "You do not have access to manage this resource.",
+    }), 403
 
 
 # ── Opening-balance pending-entry helper ──────────────────────────────────────
@@ -1814,6 +1840,10 @@ def register_resource_routes(app, create_pending_entry, generate_transaction_ref
 
     @app.post("/resources/<resource_id>/deactivate")
     def deactivate_resource(resource_id):
+        role_error = _require_org_admin_role("deactivate resources")
+        if role_error:
+            return role_error
+
         body = request.get_json(silent=True) or {}
         merged_into_resource_id = body.get("merged_into_resource_id")
         inactive_reason_code = (body.get("inactive_reason_code") or "INACTIVE_BY_ADMIN").strip()
@@ -1830,6 +1860,11 @@ def register_resource_routes(app, create_pending_entry, generate_transaction_ref
         if not resource:
             conn.close()
             return jsonify({"error": "Resource not found"}), 404
+
+        access_error = _require_resource_org_access(resource)
+        if access_error:
+            conn.close()
+            return access_error
 
         if merged_into_resource_id == resource_id:
             conn.close()
@@ -1883,9 +1918,70 @@ def register_resource_routes(app, create_pending_entry, generate_transaction_ref
         return jsonify({
             "resource_id": resource_id,
             "status": "INACTIVE",
+            "is_active": False,
             "merged_into_resource_id": merged_into_resource_id,
             "inactive_reason_code": inactive_reason_code,
             "inactive_reason_text": inactive_reason_text
+        }), 200
+
+
+    @app.post("/resources/<resource_id>/reactivate")
+    def reactivate_resource(resource_id):
+        role_error = _require_org_admin_role("reactivate resources")
+        if role_error:
+            return role_error
+
+        conn = get_conn()
+        ensure_resource_cleanup_columns(conn)
+
+        resource = conn.execute(
+            "SELECT * FROM resources WHERE resource_id = ?",
+            (resource_id,)
+        ).fetchone()
+
+        if not resource:
+            conn.close()
+            return jsonify({"error": "Resource not found"}), 404
+
+        access_error = _require_resource_org_access(resource)
+        if access_error:
+            conn.close()
+            return access_error
+
+        if resource["is_active"]:
+            conn.close()
+            return jsonify({"error": "Resource is already active"}), 409
+
+        ts = now_iso()
+        conn.execute(
+            """
+            UPDATE resources
+            SET is_active = 1,
+                merged_into_resource_id = NULL,
+                inactive_reason_code = NULL,
+                inactive_reason_text = NULL,
+                updated_at = ?
+            WHERE resource_id = ?
+            """,
+            (ts, resource_id),
+        )
+
+        audit_event(
+            conn,
+            entity_type="Resource",
+            entity_id=resource_id,
+            action="REACTIVATE",
+            summary=f"Reactivated resource: {resource['name']}",
+            organisation_id=resource["organisation_id"]
+        )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "resource_id": resource_id,
+            "status": "ACTIVE",
+            "is_active": True,
         }), 200
 
 
