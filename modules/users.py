@@ -80,6 +80,8 @@ def ensure_user_access_tables(conn):
     """)
 
     existing = {row[1] for row in conn.execute("PRAGMA table_info(user_accounts)").fetchall()}
+    if "mobile_number" not in existing:
+        conn.execute("ALTER TABLE user_accounts ADD COLUMN mobile_number TEXT")
     if "default_nav_app" not in existing:
         conn.execute("ALTER TABLE user_accounts ADD COLUMN default_nav_app TEXT NOT NULL DEFAULT 'google_maps'")
     if "default_depot_id" not in existing:
@@ -291,6 +293,9 @@ def register_user_routes(app):
         created_by_display_name = (body.get("created_by_display_name") or "Global Admin").strip()
         confirmation_text = (body.get("confirmation_text") or "").strip()
         access_method = (body.get("access_method") or "").strip().upper()
+        manual_setup = not access_method
+        if manual_setup:
+            access_method = "MANUAL"
         default_depot_id = body.get("default_depot_id") or None
 
         _VALID_ACCESS_METHODS = {"MOBILE", "TABLET", "DESKTOP", "BOTH"}
@@ -311,7 +316,7 @@ def register_user_routes(app):
             return jsonify({"error": "Invalid role", "allowed_roles": sorted(USER_ROLES)}), 400
 
         # ── Access method validation ──────────────────────────────────────────
-        if not access_method or access_method not in _VALID_ACCESS_METHODS:
+        if not manual_setup and access_method not in _VALID_ACCESS_METHODS:
             return jsonify({
                 "error": "access_method is required",
                 "allowed": sorted(_VALID_ACCESS_METHODS),
