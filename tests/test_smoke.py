@@ -285,6 +285,73 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 201)
         return resp.get_json()["resource_id"]
 
+    def _set_opening_balance(self, organisation_id, depot_id, resource_id, quantity):
+        resp = self.client.post("/opening-balances", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "resource_id": resource_id,
+            "quantity": quantity,
+        })
+        self.assertIn(resp.status_code, (200, 201))
+
+    def _create_and_post_transaction(
+        self,
+        organisation_id,
+        depot_id,
+        resource_id,
+        quantity,
+        direction="OUT",
+    ):
+        create = self.client.post("/transactions", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "transaction_type": "Movement",
+            "resource_id": resource_id,
+            "quantity": quantity,
+            "direction": direction,
+            "submitted_by_display_name": "Field User",
+        })
+        self.assertEqual(create.status_code, 201)
+        self.assertEqual(create.get_json()["status"], "DRAFT")
+
+        transaction_id = create.get_json()["transaction_id"]
+        post = self.client.post(f"/transactions/{transaction_id}/post")
+        self.assertEqual(post.status_code, 200)
+        self.assertEqual(post.get_json()["status"], "POSTED")
+        return transaction_id
+
+    def _get_transaction_row(self, transaction_id):
+        conn = self.core.get_conn()
+        row = conn.execute(
+            "SELECT * FROM transactions WHERE transaction_id = ?",
+            (transaction_id,),
+        ).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        return dict(row)
+
+    def _get_resource_balance(self, organisation_id, depot_id, resource_id):
+        conn = self.core.get_conn()
+        row = conn.execute(
+            """
+            SELECT current_quantity
+            FROM balance_projection
+            WHERE organisation_id = ? AND depot_id = ? AND resource_id = ?
+            """,
+            (organisation_id, depot_id, resource_id),
+        ).fetchone()
+        conn.close()
+        return row["current_quantity"] if row else None
+
+    def _get_transaction_ledger_count(self, transaction_id):
+        conn = self.core.get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM ledger_entries WHERE transaction_id = ?",
+            (transaction_id,),
+        ).fetchone()
+        conn.close()
+        return row["count"]
+
     def test_stocktake_full_lifecycle_with_variance(self):
         organisation_id = self.create_organisation("Stocktake Full Org")
         depot_id = self._create_depot(organisation_id, "Main Depot")
@@ -515,6 +582,185 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(ol["report_type"], "RESOURCE_ORG_LEDGER")
         self.assertEqual(ol["total_balance_across_depots"], 100)
         self.assertEqual(ol["by_depot"][0]["current_balance"], 100)
+
+    def test_tcr_approval_posts_correction_without_editing_original_transaction(self):
+        organisation_id = self.create_organisation("TCR Approval Org")
+        depot_id = self._create_depot(organisation_id, "TCR Depot")
+        category_id = self._create_category(organisation_id, "TCR Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "TCR Pallet")
+        self._set_opening_balance(organisation_id, depot_id, resource_id, 100)
+        transaction_id = self._create_and_post_transaction(
+            organisation_id,
+            depot_id,
+            resource_id,
+            quantity=10,
+            direction="OUT",
+        )
+
+        original_before = self._get_transaction_row(transaction_id)
+        self.assertEqual(original_before["status"], "POSTED")
+        self.assertEqual(self._get_transaction_ledger_count(transaction_id), 1)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), 90)
+
+        request_resp = self.client.post(
+            f"/transactions/{transaction_id}/correction-request",
+            json={
+                "correction_reason": "Quantity was overstated",
+                "proposed_quantity": 6,
+            },
+        )
+        self.assertEqual(request_resp.status_code, 201)
+        tcr_id = request_resp.get_json()["tcr_id"]
+
+        approve = self.client.post(
+            f"/correction-requests/{tcr_id}/approve",
+            json={"review_notes": "Approved after docket check"},
+        )
+        self.assertEqual(approve.status_code, 200)
+        approve_payload = approve.get_json()
+        self.assertEqual(approve_payload["status"], "APPROVED")
+        self.assertTrue(approve_payload["ledger_updated"])
+        self.assertEqual(len(approve_payload["correction_transactions"]), 1)
+
+        original_after = self._get_transaction_row(transaction_id)
+        for field in (
+            "transaction_id",
+            "organisation_id",
+            "depot_id",
+            "transaction_type",
+            "resource_id",
+            "quantity",
+            "direction",
+            "status",
+            "posted_at",
+            "reference_number",
+            "org_sequence_number",
+        ):
+            self.assertEqual(original_after[field], original_before[field])
+        self.assertEqual(self._get_transaction_ledger_count(transaction_id), 1)
+
+        conn = self.core.get_conn()
+        corrections = conn.execute(
+            """
+            SELECT *
+            FROM transactions
+            WHERE correction_of_transaction_id = ?
+            """,
+            (transaction_id,),
+        ).fetchall()
+        correction_ledger = conn.execute(
+            """
+            SELECT le.*
+            FROM ledger_entries le
+            JOIN transactions t ON t.transaction_id = le.transaction_id
+            WHERE t.correction_of_transaction_id = ?
+            """,
+            (transaction_id,),
+        ).fetchall()
+        tcr = conn.execute(
+            "SELECT * FROM transaction_correction_requests WHERE tcr_id = ?",
+            (tcr_id,),
+        ).fetchone()
+        conn.close()
+
+        self.assertEqual(len(corrections), 1)
+        correction = dict(corrections[0])
+        self.assertEqual(correction["transaction_type"], "Correction")
+        self.assertEqual(correction["status"], "POSTED")
+        self.assertEqual(correction["quantity"], 4)
+        self.assertEqual(correction["direction"], "IN")
+        self.assertEqual(correction["correction_of_transaction_id"], transaction_id)
+        self.assertEqual(len(correction_ledger), 1)
+        self.assertEqual(correction_ledger[0]["quantity_delta"], 4)
+        self.assertEqual(tcr["status"], "APPROVED")
+        self.assertEqual(tcr["correction_transaction_id"], correction["transaction_id"])
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), 94)
+
+    def test_tcr_rejection_does_not_mutate_original_transaction_or_ledger(self):
+        organisation_id = self.create_organisation("TCR Rejection Org")
+        depot_id = self._create_depot(organisation_id, "Reject Depot")
+        category_id = self._create_category(organisation_id, "Reject Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "Reject Pallet")
+        self._set_opening_balance(organisation_id, depot_id, resource_id, 100)
+        transaction_id = self._create_and_post_transaction(
+            organisation_id,
+            depot_id,
+            resource_id,
+            quantity=8,
+            direction="OUT",
+        )
+
+        original_before = self._get_transaction_row(transaction_id)
+        balance_before = self._get_resource_balance(organisation_id, depot_id, resource_id)
+        conn = self.core.get_conn()
+        ledger_count_before = conn.execute(
+            "SELECT COUNT(*) AS count FROM ledger_entries"
+        ).fetchone()["count"]
+        transaction_count_before = conn.execute(
+            "SELECT COUNT(*) AS count FROM transactions"
+        ).fetchone()["count"]
+        conn.close()
+
+        request_resp = self.client.post(
+            f"/transactions/{transaction_id}/correction-request",
+            json={
+                "correction_reason": "Requested change was not supported",
+                "proposed_quantity": 4,
+            },
+        )
+        self.assertEqual(request_resp.status_code, 201)
+        tcr_id = request_resp.get_json()["tcr_id"]
+
+        reject = self.client.post(
+            f"/correction-requests/{tcr_id}/reject",
+            json={"review_notes": "Original docket is correct"},
+        )
+        self.assertEqual(reject.status_code, 200)
+        self.assertEqual(reject.get_json()["status"], "REJECTED")
+
+        original_after = self._get_transaction_row(transaction_id)
+        for field in (
+            "transaction_id",
+            "organisation_id",
+            "depot_id",
+            "transaction_type",
+            "resource_id",
+            "quantity",
+            "direction",
+            "status",
+            "posted_at",
+            "reference_number",
+            "org_sequence_number",
+        ):
+            self.assertEqual(original_after[field], original_before[field])
+
+        conn = self.core.get_conn()
+        ledger_count_after = conn.execute(
+            "SELECT COUNT(*) AS count FROM ledger_entries"
+        ).fetchone()["count"]
+        transaction_count_after = conn.execute(
+            "SELECT COUNT(*) AS count FROM transactions"
+        ).fetchone()["count"]
+        corrections = conn.execute(
+            """
+            SELECT *
+            FROM transactions
+            WHERE correction_of_transaction_id = ?
+            """,
+            (transaction_id,),
+        ).fetchall()
+        tcr = conn.execute(
+            "SELECT * FROM transaction_correction_requests WHERE tcr_id = ?",
+            (tcr_id,),
+        ).fetchone()
+        conn.close()
+
+        self.assertEqual(ledger_count_after, ledger_count_before)
+        self.assertEqual(transaction_count_after, transaction_count_before)
+        self.assertEqual(len(corrections), 0)
+        self.assertEqual(tcr["status"], "REJECTED")
+        self.assertIsNone(tcr["correction_transaction_id"])
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), balance_before)
 
     def test_stocktake_list_and_global_summary(self):
         resp = self.client.get("/global-admin/stocktake-summary")
