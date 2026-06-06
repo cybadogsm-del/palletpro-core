@@ -461,6 +461,7 @@ from modules.notifications import register_notification_routes, notify_user
 from modules.resource_sample_photos import register_resource_sample_photo_routes
 from modules.ai_counting import register_ai_counting_routes
 from modules.route_intelligence import register_route_intelligence_routes
+from modules.operational_insights import register_operational_insight_routes
 
 register_auth_middleware(app)
 register_auth_routes(app)
@@ -500,6 +501,7 @@ register_notification_routes(app)
 register_resource_sample_photo_routes(app)
 register_ai_counting_routes(app)
 register_route_intelligence_routes(app)
+register_operational_insight_routes(app)
 register_admin_handover_routes(app)
 register_feature_flag_routes(app)
 register_stock_position_routes(app)

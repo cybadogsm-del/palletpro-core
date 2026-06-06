@@ -30,6 +30,8 @@ def ensure_offline_batch_tables(conn):
         log_id          TEXT PRIMARY KEY,
         device_id       TEXT NOT NULL,
         local_id        TEXT NOT NULL,
+        organisation_id TEXT,
+        submitted_by_user_id TEXT,
         item_type       TEXT NOT NULL,
         status          TEXT NOT NULL,
         server_id       TEXT,
@@ -38,7 +40,20 @@ def ensure_offline_batch_tables(conn):
         UNIQUE (device_id, local_id)
     )
     """)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(offline_batch_log)").fetchall()}
+    if "organisation_id" not in cols:
+        conn.execute("ALTER TABLE offline_batch_log ADD COLUMN organisation_id TEXT")
+    if "submitted_by_user_id" not in cols:
+        conn.execute("ALTER TABLE offline_batch_log ADD COLUMN submitted_by_user_id TEXT")
     conn.commit()
+
+
+def _offline_log_context(current_user, payload):
+    if current_user.get("role") in {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}:
+        organisation_id = payload.get("organisation_id") or current_user.get("user_org_id")
+    else:
+        organisation_id = current_user.get("user_org_id") or payload.get("organisation_id")
+    return organisation_id, current_user.get("user_id")
 
 
 def _ensure_offline_transaction_schema(
@@ -545,6 +560,7 @@ def register_offline_batch_routes(
             item_type = (item.get("type") or "").strip().lower()
             queued_at = (item.get("queued_at") or "").strip() or None
             payload = item.get("payload") or {}
+            organisation_id, submitted_by_user_id = _offline_log_context(current_user, payload)
 
             if not local_id:
                 results.append({
@@ -623,9 +639,13 @@ def register_offline_batch_routes(
 
                 conn.execute(
                     """INSERT INTO offline_batch_log
-                       (log_id, device_id, local_id, item_type, status, server_id, processed_at)
-                       VALUES (?, ?, ?, ?, 'success', ?, ?)""",
-                    (make_id("obl"), device_id, local_id, item_type, server_id, ts),
+                       (log_id, device_id, local_id, organisation_id, submitted_by_user_id,
+                        item_type, status, server_id, processed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'success', ?, ?)""",
+                    (
+                        make_id("obl"), device_id, local_id, organisation_id,
+                        submitted_by_user_id, item_type, server_id, ts,
+                    ),
                 )
                 conn.execute("RELEASE SAVEPOINT batch_item")
                 conn.commit()
@@ -646,9 +666,13 @@ def register_offline_batch_routes(
                 error_msg = str(exc)
                 conn.execute(
                     """INSERT OR IGNORE INTO offline_batch_log
-                       (log_id, device_id, local_id, item_type, status, error_message, processed_at)
-                       VALUES (?, ?, ?, ?, 'error', ?, ?)""",
-                    (make_id("obl"), device_id, local_id, item_type, error_msg, ts),
+                       (log_id, device_id, local_id, organisation_id, submitted_by_user_id,
+                        item_type, status, error_message, processed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, 'error', ?, ?)""",
+                    (
+                        make_id("obl"), device_id, local_id, organisation_id,
+                        submitted_by_user_id, item_type, error_msg, ts,
+                    ),
                 )
                 conn.commit()
 
@@ -686,7 +710,8 @@ def register_offline_batch_routes(
         ensure_offline_batch_tables(conn)
 
         rows = conn.execute(
-            """SELECT log_id, local_id, item_type, status, server_id, error_message, processed_at
+            """SELECT log_id, local_id, organisation_id, submitted_by_user_id,
+                      item_type, status, server_id, error_message, processed_at
                FROM offline_batch_log WHERE device_id = ?
                ORDER BY processed_at DESC LIMIT 500""",
             (device_id,),

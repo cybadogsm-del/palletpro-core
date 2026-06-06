@@ -226,6 +226,77 @@ class BrickSmokeTests(unittest.TestCase):
         r = client.get(f"/organisations/{other_org_id}/users")
         self.assertEqual(r.status_code, 403)
 
+    def test_org_operational_insights_empty_org_is_clear(self):
+        """GET /organisations/<id>/operational-insights returns clear structured insight."""
+        org_id = self._create_org("Clear Insight Org")
+
+        r = self.client.get(f"/organisations/{org_id}/operational-insights")
+
+        self.assertEqual(r.status_code, 200)
+        payload = r.get_json()
+        self.assertEqual(payload["insight_type"], "ORG_OPERATIONAL_INSIGHTS")
+        self.assertEqual(payload["organisation_id"], org_id)
+        self.assertEqual(payload["summary"]["status"], "CLEAR")
+        self.assertEqual(payload["summary"]["total_attention_items"], 0)
+        self.assertEqual(payload["attention_items"], [])
+        self.assertGreaterEqual(len(payload["items"]), 1)
+
+    def test_field_user_cannot_view_org_operational_insights(self):
+        """Field users cannot view org-wide operational insights."""
+        org_id = self._create_org("Field Insight Block Org")
+        client, _ = self._create_login_client("USER", org_id)
+
+        r = client.get(f"/organisations/{org_id}/operational-insights")
+
+        self.assertEqual(r.status_code, 403)
+
+    def test_org_operational_insights_reports_attention_items(self):
+        """Operational insights expose deterministic backend issues for the frontend."""
+        from modules.offline_batch import ensure_offline_batch_tables
+
+        org_id = self._create_org("Attention Insight Org")
+        conn = self.core.get_conn()
+        ensure_offline_batch_tables(conn)
+        ts = self.core.now_iso()
+
+        conn.execute(
+            """
+            INSERT INTO pending_approval_entries (
+                pending_entry_id, organisation_id, entry_type, source_record_id,
+                source_module, submitted_by_display_name, status, reason_code,
+                reason_text, direct_action_type, direct_action_label,
+                can_approve_now, can_reject_now, created_at, updated_at
+            ) VALUES (?, ?, 'TRANSACTION', ?, 'transactions', 'Tester',
+                      'PENDING_APPROVAL', 'TEST', 'Needs review',
+                      'REVIEW', 'Review', 1, 1, ?, ?)
+            """,
+            (self.core.make_id("pend"), org_id, self.core.make_id("txn"), ts, ts),
+        )
+        conn.execute(
+            """
+            INSERT INTO offline_batch_log (
+                log_id, device_id, local_id, organisation_id, submitted_by_user_id,
+                item_type, status, error_message, processed_at
+            ) VALUES (?, 'device-1', 'local-1', ?, 'usr_test',
+                      'transaction', 'error', 'depot_id is required', ?)
+            """,
+            (self.core.make_id("obl"), org_id, ts),
+        )
+        conn.commit()
+        conn.close()
+
+        r = self.client.get(f"/organisations/{org_id}/operational-insights")
+
+        self.assertEqual(r.status_code, 200)
+        payload = r.get_json()
+        self.assertEqual(payload["summary"]["status"], "ATTENTION_REQUIRED")
+        self.assertEqual(payload["summary"]["total_attention_items"], 2)
+        by_id = {item["insight_id"]: item for item in payload["items"]}
+        self.assertEqual(by_id["pending_approvals"]["count"], 1)
+        self.assertEqual(by_id["offline_upload_failures"]["count"], 1)
+        self.assertEqual(by_id["offline_upload_failures"]["severity"], "medium")
+        self.assertIn("recommended_action", by_id["pending_approvals"])
+
     def test_user_access_policy(self):
         """GET /users/<id>/access-policy returns a structured policy."""
         org_id = self._create_org("Policy Org")
