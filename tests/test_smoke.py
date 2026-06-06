@@ -734,6 +734,249 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(sga_list.status_code, 200)
         self.assertIn(org_b_user_id, [item["user"]["user_id"] for item in sga_list.get_json()["items"]])
 
+    def test_route_intelligence_access_boundaries_and_no_business_mutation(self):
+        org_a = self.create_organisation("Route Intel Org A")
+        org_b = self.create_organisation("Route Intel Org B")
+        org_admin_id = self._create_user(org_a, "Route Intel Admin", role="ORG_ADMIN")
+        field_user_id = self._create_user(org_a, "Route Intel Field", role="USER")
+        same_org_user_id = self._create_user(org_a, "Route Intel Peer", role="USER")
+        other_org_user_id = self._create_user(org_b, "Route Intel Other Org", role="USER")
+        global_admin_id = self._create_user(org_a, "Route Intel GA", role="GLOBAL_ADMIN")
+
+        org_admin_client = self._client_for_user(org_admin_id, "route intel org admin key")
+        field_client = self._client_for_user(field_user_id, "route intel field key")
+        same_org_client = self._client_for_user(same_org_user_id, "route intel peer key")
+        other_org_client = self._client_for_user(other_org_user_id, "route intel other key")
+        global_admin_client = self._client_for_user(global_admin_id, "route intel ga key")
+        unauth_client = self.core.app.test_client()
+
+        readonly_paths = [
+            f"/users/{field_user_id}/morning-sync",
+            f"/users/{field_user_id}/route-history",
+            f"/users/{field_user_id}/dropdown-preferences",
+        ]
+
+        for path in readonly_paths:
+            with self.subTest(path=path, actor="unauthenticated"):
+                self.assertEqual(unauth_client.get(path).status_code, 401)
+
+            with self.subTest(path=path, actor="own-user"):
+                response = field_client.get(path)
+                self.assertEqual(response.status_code, 200)
+                payload = response.get_json()
+                self.assertEqual(payload["user_id"], field_user_id)
+                self.assertEqual(payload["organisation_id"], org_a)
+                self._assert_no_sensitive_keys(payload)
+
+            with self.subTest(path=path, actor="same-org-basic-user"):
+                self.assertEqual(same_org_client.get(path).status_code, 403)
+
+            with self.subTest(path=path, actor="other-org-basic-user"):
+                self.assertEqual(other_org_client.get(path).status_code, 403)
+
+            with self.subTest(path=path, actor="same-org-admin"):
+                self.assertEqual(org_admin_client.get(path).status_code, 200)
+
+            with self.subTest(path=path, actor="global-admin"):
+                self.assertEqual(global_admin_client.get(path).status_code, 200)
+
+            with self.subTest(path=path, actor="super-global-admin"):
+                self.assertEqual(self.client.get(path).status_code, 200)
+
+        cross_org_admin_read = org_admin_client.get(f"/users/{other_org_user_id}/morning-sync")
+        self.assertEqual(cross_org_admin_read.status_code, 403)
+
+        mutation_counts_before = {
+            "transactions": self._get_table_count("transactions"),
+            "ledger_entries": self._get_table_count("ledger_entries"),
+            "balance_projection": self._get_table_count("balance_projection"),
+        }
+
+        preference_body = {
+            "entity_type": "resource",
+            "ordered_ids": ["res_preferred"],
+            "default_id": "res_preferred",
+        }
+
+        own_patch = field_client.patch(
+            f"/users/{field_user_id}/dropdown-preferences",
+            json=preference_body,
+        )
+        self.assertEqual(own_patch.status_code, 200)
+
+        peer_patch = same_org_client.patch(
+            f"/users/{field_user_id}/dropdown-preferences",
+            json=preference_body,
+        )
+        self.assertEqual(peer_patch.status_code, 403)
+
+        cross_org_patch = org_admin_client.patch(
+            f"/users/{other_org_user_id}/dropdown-preferences",
+            json=preference_body,
+        )
+        self.assertEqual(cross_org_patch.status_code, 403)
+
+        admin_patch = org_admin_client.patch(
+            f"/users/{field_user_id}/dropdown-preferences",
+            json=preference_body,
+        )
+        self.assertEqual(admin_patch.status_code, 200)
+
+        mutation_counts_after = {
+            "transactions": self._get_table_count("transactions"),
+            "ledger_entries": self._get_table_count("ledger_entries"),
+            "balance_projection": self._get_table_count("balance_projection"),
+        }
+        self.assertEqual(mutation_counts_after, mutation_counts_before)
+
+    def test_route_intelligence_learns_posted_partner_address_patterns(self):
+        organisation_id = self.create_organisation("Route Learning Org")
+        depot_id = self._create_depot(organisation_id, "Route Learning Depot")
+        category_id = self._create_category(organisation_id, "Route Learning Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "Route Learning Pallet")
+        field_user_id = self._create_user(organisation_id, "Route Learning Driver", role="USER")
+        field_client = self._client_for_user(field_user_id, "route learning field key")
+        self._set_opening_balance(organisation_id, depot_id, resource_id, 100)
+
+        partner = self.client.post("/partners", json={
+            "organisation_id": organisation_id,
+            "name": "Route Learning Customer",
+            "is_customer": True,
+        })
+        self.assertEqual(partner.status_code, 201)
+        partner_id = partner.get_json()["partner_id"]
+
+        address = self.client.post(f"/partners/{partner_id}/addresses", json={
+            "organisation_id": organisation_id,
+            "label": "Front Gate",
+            "category": "WORK_SITE",
+            "address_line_1": "10 Test Road",
+            "suburb": "Melbourne",
+            "state": "VIC",
+            "entry_heading": 270,
+            "gate_number": "A",
+            "entry_instructions": "Use the western gate",
+            "is_default_dispatch_site": True,
+        })
+        self.assertEqual(address.status_code, 201)
+        partner_address_id = address.get_json()["partner_address_id"]
+
+        ledger_count_before = self._get_table_count("ledger_entries")
+        transaction_count_before = self._get_table_count("transactions")
+
+        first = field_client.post("/transactions", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "transaction_type": "Movement",
+            "resource_id": resource_id,
+            "quantity": 7,
+            "direction": "OUT",
+            "partner_id": partner_id,
+            "partner_address_id": partner_address_id,
+            "submitted_by_user_id": field_user_id,
+            "submitted_by_display_name": "Route Learning Driver",
+        })
+        self.assertEqual(first.status_code, 201)
+        first_transaction_id = first.get_json()["transaction_id"]
+        first_post = field_client.post(f"/transactions/{first_transaction_id}/post")
+        self.assertEqual(first_post.status_code, 200)
+
+        conn = self.core.get_conn()
+        first_txn = conn.execute(
+            "SELECT created_at FROM transactions WHERE transaction_id = ?",
+            (first_transaction_id,),
+        ).fetchone()
+        learned = conn.execute(
+            """
+            SELECT *
+            FROM user_route_defaults
+            WHERE user_id = ? AND organisation_id = ? AND partner_address_id = ?
+            """,
+            (field_user_id, organisation_id, partner_address_id),
+        ).fetchone()
+        conn.close()
+
+        self.assertIsNotNone(learned)
+        self.assertEqual(learned["visit_count"], 1)
+        self.assertEqual(learned["preferred_resource_id"], resource_id)
+        self.assertEqual(learned["preferred_action"], "Dropoff")
+        self.assertEqual(learned["last_visited_at"], first_txn["created_at"])
+
+        second = field_client.post("/transactions", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "transaction_type": "Movement",
+            "resource_id": resource_id,
+            "quantity": 3,
+            "direction": "IN",
+            "partner_id": partner_id,
+            "partner_address_id": partner_address_id,
+            "submitted_by_user_id": field_user_id,
+            "submitted_by_display_name": "Route Learning Driver",
+        })
+        self.assertEqual(second.status_code, 201)
+        second_transaction_id = second.get_json()["transaction_id"]
+        second_post = field_client.post(f"/transactions/{second_transaction_id}/post")
+        self.assertEqual(second_post.status_code, 200)
+
+        conn = self.core.get_conn()
+        second_txn = conn.execute(
+            "SELECT created_at FROM transactions WHERE transaction_id = ?",
+            (second_transaction_id,),
+        ).fetchone()
+        learned = conn.execute(
+            """
+            SELECT *
+            FROM user_route_defaults
+            WHERE user_id = ? AND organisation_id = ? AND partner_address_id = ?
+            """,
+            (field_user_id, organisation_id, partner_address_id),
+        ).fetchone()
+        conn.close()
+
+        self.assertEqual(learned["visit_count"], 2)
+        self.assertEqual(learned["preferred_resource_id"], resource_id)
+        self.assertEqual(learned["preferred_action"], "Pickup")
+        self.assertEqual(learned["last_visited_at"], second_txn["created_at"])
+
+        expected_counts_after_transactions = {
+            "transactions": transaction_count_before + 2,
+            "ledger_entries": ledger_count_before + 2,
+            "balance_projection": self._get_table_count("balance_projection"),
+        }
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), 96)
+
+        sync = field_client.get(f"/users/{field_user_id}/morning-sync")
+        self.assertEqual(sync.status_code, 200)
+        sync_payload = sync.get_json()
+        self.assertEqual(sync_payload["user_id"], field_user_id)
+        self.assertEqual(sync_payload["organisation_id"], organisation_id)
+        self.assertEqual(sync_payload["route_pool_count"], 1)
+        route = sync_payload["predicted_route_pool"][0]
+        self.assertEqual(route["partner_address_id"], partner_address_id)
+        self.assertEqual(route["partner_id"], partner_id)
+        self.assertEqual(route["partner_name"], "Route Learning Customer")
+        self.assertEqual(route["label"], "Front Gate")
+        self.assertEqual(route["entry_heading"], 270)
+        self.assertEqual(route["gate_number"], "A")
+        self.assertEqual(route["entry_instructions"], "Use the western gate")
+        self.assertEqual(route["visit_count"], 2)
+        self.assertEqual(route["last_visited_at"], second_txn["created_at"])
+        self.assertEqual(route["prefill"]["resource_id"], resource_id)
+        self.assertEqual(route["prefill"]["action"], "Pickup")
+        self.assertEqual(route["prefill"]["direction"], "IN")
+
+        history = field_client.get(f"/users/{field_user_id}/route-history")
+        self.assertEqual(history.status_code, 200)
+        history_payload = history.get_json()
+        self.assertEqual(history_payload["count"], 1)
+        self.assertEqual(history_payload["items"][0]["visit_count"], 2)
+
+        self.assertEqual(self._get_table_count("transactions"), expected_counts_after_transactions["transactions"])
+        self.assertEqual(self._get_table_count("ledger_entries"), expected_counts_after_transactions["ledger_entries"])
+        self.assertEqual(self._get_table_count("balance_projection"), expected_counts_after_transactions["balance_projection"])
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), 96)
+
     def test_partner_management_requires_org_admin_and_preserves_org_boundary(self):
         org_a = self.create_organisation("Partner Mgmt A")
         org_b = self.create_organisation("Partner Mgmt B")

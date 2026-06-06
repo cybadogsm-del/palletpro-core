@@ -27,6 +27,9 @@ ACTION_TO_DIRECTION = {
     "Exchange": "EXCHANGE",
 }
 
+_ROUTE_ADMIN_ROLES = {"ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+_GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
+
 
 # ── Schema ─────────────────────────────────────────────────────────────────────
 
@@ -142,6 +145,44 @@ def upsert_route_learning(conn, user_id, organisation_id, partner_address_id,
         )
 
 
+# ── Access policy ─────────────────────────────────────────────────────────────
+
+def _get_route_target_user(conn, user_id):
+    from modules.users import ensure_user_access_tables
+    ensure_user_access_tables(conn)
+
+    return conn.execute(
+        "SELECT user_id, organisation_id FROM user_accounts WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+
+
+def _route_access_error(target_user):
+    if not target_user:
+        return jsonify({"error": "User not found"}), 404
+
+    current_user = g.current_user
+    current_user_id = current_user.get("user_id")
+    current_role = current_user.get("role")
+    current_org_id = current_user.get("user_org_id")
+    target_org_id = target_user["organisation_id"]
+
+    if current_user_id == target_user["user_id"]:
+        return None
+
+    if current_role in _GLOBAL_ADMIN_ROLES:
+        return None
+
+    if current_role in _ROUTE_ADMIN_ROLES and current_org_id == target_org_id:
+        return None
+
+    return jsonify({
+        "error": "INSUFFICIENT_ROLE",
+        "message": "Route intelligence access requires the target user, same-organisation Org Admin, Global Admin, or Super Global Admin.",
+        "your_role": current_role,
+    }), 403
+
+
 # ── Route registration ─────────────────────────────────────────────────────────
 
 def register_route_intelligence_routes(app):
@@ -161,20 +202,19 @@ def register_route_intelligence_routes(app):
         conn = get_conn()
         ensure_route_intelligence_tables(conn)
 
-        from modules.users import ensure_user_access_tables
-        ensure_user_access_tables(conn)
+        user = _get_route_target_user(conn, user_id)
 
-        user = conn.execute(
-            "SELECT * FROM user_accounts WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-
-        if not user:
+        access_error = _route_access_error(user)
+        if access_error:
             conn.close()
-            return jsonify({"error": "User not found"}), 404
+            return access_error
 
         organisation_id = user["organisation_id"]
-        default_depot_id = user["default_depot_id"]
+        user_profile = conn.execute(
+            "SELECT default_depot_id FROM user_accounts WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        default_depot_id = user_profile["default_depot_id"] if user_profile else None
 
         now_dt = datetime.fromisoformat(now_iso())
         today_dow = now_dt.weekday()  # 0=Monday … 6=Sunday
@@ -338,17 +378,12 @@ def register_route_intelligence_routes(app):
         conn = get_conn()
         ensure_route_intelligence_tables(conn)
 
-        from modules.users import ensure_user_access_tables
-        ensure_user_access_tables(conn)
+        user = _get_route_target_user(conn, user_id)
 
-        user = conn.execute(
-            "SELECT organisation_id FROM user_accounts WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-
-        if not user:
+        access_error = _route_access_error(user)
+        if access_error:
             conn.close()
-            return jsonify({"error": "User not found"}), 404
+            return access_error
 
         rows = conn.execute(
             """
@@ -402,17 +437,12 @@ def register_route_intelligence_routes(app):
         conn = get_conn()
         ensure_route_intelligence_tables(conn)
 
-        from modules.users import ensure_user_access_tables
-        ensure_user_access_tables(conn)
+        user = _get_route_target_user(conn, user_id)
 
-        user = conn.execute(
-            "SELECT organisation_id FROM user_accounts WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-
-        if not user:
+        access_error = _route_access_error(user)
+        if access_error:
             conn.close()
-            return jsonify({"error": "User not found"}), 404
+            return access_error
 
         rows = conn.execute(
             """
@@ -453,17 +483,12 @@ def register_route_intelligence_routes(app):
         conn = get_conn()
         ensure_route_intelligence_tables(conn)
 
-        from modules.users import ensure_user_access_tables
-        ensure_user_access_tables(conn)
+        user = _get_route_target_user(conn, user_id)
 
-        user = conn.execute(
-            "SELECT organisation_id FROM user_accounts WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-
-        if not user:
+        access_error = _route_access_error(user)
+        if access_error:
             conn.close()
-            return jsonify({"error": "User not found"}), 404
+            return access_error
 
         organisation_id = user["organisation_id"]
         now = now_iso()
