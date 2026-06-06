@@ -41,6 +41,58 @@ def ensure_offline_batch_tables(conn):
     conn.commit()
 
 
+def _ensure_offline_transaction_schema(
+    conn,
+    ensure_transaction_numbering_tables,
+    ensure_transaction_partner_columns,
+    ensure_partner_address_tables,
+    ensure_transaction_user_attribution_columns,
+):
+    ensure_transaction_partner_columns(conn)
+    ensure_partner_address_tables(conn)
+    ensure_transaction_user_attribution_columns(conn)
+    ensure_transaction_numbering_tables(conn)
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
+    if "transaction_note" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN transaction_note TEXT")
+    if "unresolved_entity_note" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN unresolved_entity_note TEXT")
+    if "unresolved_entity_type" not in cols:
+        conn.execute("ALTER TABLE transactions ADD COLUMN unresolved_entity_type TEXT")
+
+
+def _ensure_offline_resource_loss_tables(conn):
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS resource_losses (
+        loss_id                     TEXT PRIMARY KEY,
+        organisation_id             TEXT NOT NULL,
+        depot_id                    TEXT NOT NULL,
+        resource_id                 TEXT NOT NULL,
+        quantity                    INTEGER NOT NULL,
+        loss_type                   TEXT NOT NULL,
+        loss_reason                 TEXT NOT NULL,
+        loss_date                   TEXT NOT NULL,
+        status                      TEXT NOT NULL DEFAULT 'PENDING_REVIEW',
+        reported_by_user_id         TEXT,
+        reported_by_display_name    TEXT NOT NULL,
+        partner_id                  TEXT,
+        related_transaction_id      TEXT,
+        reviewed_by_display_name    TEXT,
+        review_notes                TEXT,
+        reviewed_at                 TEXT,
+        loss_transaction_id         TEXT,
+        created_at                  TEXT NOT NULL,
+        updated_at                  TEXT NOT NULL
+    )
+    """)
+    loss_cols = {r["name"] for r in conn.execute("PRAGMA table_info(resource_losses)").fetchall()}
+    if "unresolved_entity_note" not in loss_cols:
+        conn.execute("ALTER TABLE resource_losses ADD COLUMN unresolved_entity_note TEXT")
+    if "unresolved_entity_type" not in loss_cols:
+        conn.execute("ALTER TABLE resource_losses ADD COLUMN unresolved_entity_type TEXT")
+
+
 def _process_transaction_item(
     conn,
     payload,
@@ -305,8 +357,6 @@ def _process_transaction_item(
 
 
 def _process_resource_loss_item(conn, payload, queued_at, current_user):
-    from modules.resource_loss import ensure_resource_loss_tables
-
     organisation_id = payload.get("organisation_id")
     depot_id = payload.get("depot_id")
     resource_id = payload.get("resource_id")
@@ -345,7 +395,7 @@ def _process_resource_loss_item(conn, payload, queued_at, current_user):
     except (ValueError, TypeError):
         raise ValueError("quantity must be a positive integer")
 
-    ensure_resource_loss_tables(conn)
+    _ensure_offline_resource_loss_tables(conn)
 
     depot = conn.execute(
         "SELECT * FROM depots WHERE depot_id = ? AND organisation_id = ?",
@@ -532,7 +582,22 @@ def register_offline_batch_routes(
                 duplicates += 1
                 continue
 
-            # Process the item
+            if item_type == "transaction":
+                _ensure_offline_transaction_schema(
+                    conn,
+                    ensure_transaction_numbering_tables=ensure_transaction_numbering_tables,
+                    ensure_transaction_partner_columns=ensure_transaction_partner_columns,
+                    ensure_partner_address_tables=ensure_partner_address_tables,
+                    ensure_transaction_user_attribution_columns=ensure_transaction_user_attribution_columns,
+                )
+                ensure_partner_address_for_item = lambda _conn: None
+            else:
+                _ensure_offline_resource_loss_tables(conn)
+                ensure_partner_address_for_item = ensure_partner_address_tables
+
+            # Process the item inside its own savepoint so one bad upload
+            # cannot crash or roll back the rest of the batch.
+            conn.execute("SAVEPOINT batch_item")
             try:
                 if item_type == "transaction":
                     server_id, detail = _process_transaction_item(
@@ -544,7 +609,7 @@ def register_offline_batch_routes(
                         generate_transaction_reference=generate_transaction_reference,
                         ensure_transaction_numbering_tables=ensure_transaction_numbering_tables,
                         ensure_transaction_partner_columns=ensure_transaction_partner_columns,
-                        ensure_partner_address_tables=ensure_partner_address_tables,
+                        ensure_partner_address_tables=ensure_partner_address_for_item,
                         ensure_transaction_user_attribution_columns=ensure_transaction_user_attribution_columns,
                         create_pending_entry=create_pending_entry,
                     )
@@ -562,6 +627,7 @@ def register_offline_batch_routes(
                        VALUES (?, ?, ?, ?, 'success', ?, ?)""",
                     (make_id("obl"), device_id, local_id, item_type, server_id, ts),
                 )
+                conn.execute("RELEASE SAVEPOINT batch_item")
                 conn.commit()
 
                 results.append({
@@ -574,8 +640,8 @@ def register_offline_batch_routes(
                 succeeded += 1
 
             except Exception as exc:
-                # Roll back only this item — use a savepoint pattern
                 conn.execute("ROLLBACK TO SAVEPOINT batch_item")
+                conn.execute("RELEASE SAVEPOINT batch_item")
 
                 error_msg = str(exc)
                 conn.execute(
@@ -593,9 +659,6 @@ def register_offline_batch_routes(
                     "error": error_msg,
                 })
                 failed += 1
-
-            # Set savepoint for next item
-            conn.execute("SAVEPOINT batch_item")
 
         conn.close()
 

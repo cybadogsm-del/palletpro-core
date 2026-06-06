@@ -361,6 +361,13 @@ class PalletProSmokeTests(unittest.TestCase):
 
     def _get_table_count(self, table_name):
         conn = self.core.get_conn()
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        if not exists:
+            conn.close()
+            return 0
         row = conn.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
         conn.close()
         return row["count"]
@@ -943,6 +950,226 @@ class PalletProSmokeTests(unittest.TestCase):
         ).fetchall()
         conn.close()
         self.assertEqual(len(cross_org_losses), 0)
+
+    def test_offline_batch_transaction_idempotency_does_not_duplicate_records_or_ledger(self):
+        organisation_id = self.create_organisation("Offline Txn Org")
+        depot_id = self._create_depot(organisation_id, "Offline Txn Depot")
+        category_id = self._create_category(organisation_id, "Offline Txn Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "Offline Txn Pallet")
+        self._set_opening_balance(organisation_id, depot_id, resource_id, 100)
+
+        ledger_count_before = self._get_table_count("ledger_entries")
+        transaction_count_before = self._get_table_count("transactions")
+        balance_before = self._get_resource_balance(organisation_id, depot_id, resource_id)
+        body = {
+            "device_id": "device-offline-txn-1",
+            "items": [{
+                "local_id": "local-txn-1",
+                "type": "transaction",
+                "queued_at": "2026-06-06T01:00:00Z",
+                "payload": {
+                    "organisation_id": organisation_id,
+                    "depot_id": depot_id,
+                    "resource_id": resource_id,
+                    "quantity": 12,
+                    "direction": "OUT",
+                    "transaction_type": "Movement",
+                    "submitted_by_display_name": "Offline User",
+                },
+            }],
+        }
+
+        first = self.client.post("/offline-batch", json=body)
+        self.assertEqual(first.status_code, 200)
+        first_payload = first.get_json()
+        self.assertEqual(first_payload["succeeded"], 1)
+        self.assertEqual(first_payload["failed"], 0)
+        self.assertEqual(first_payload["duplicates"], 0)
+        result = first_payload["results"][0]
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["detail"]["status"], "DRAFT")
+        transaction_id = result["server_id"]
+
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before + 1)
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), balance_before)
+        self.assertEqual(self._get_transaction_ledger_count(transaction_id), 0)
+
+        repeat = self.client.post("/offline-batch", json=body)
+        self.assertEqual(repeat.status_code, 200)
+        repeat_payload = repeat.get_json()
+        self.assertEqual(repeat_payload["succeeded"], 0)
+        self.assertEqual(repeat_payload["failed"], 0)
+        self.assertEqual(repeat_payload["duplicates"], 1)
+        duplicate = repeat_payload["results"][0]
+        self.assertEqual(duplicate["status"], "duplicate")
+        self.assertEqual(duplicate["server_id"], transaction_id)
+        self.assertEqual(duplicate["original_status"], "success")
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before + 1)
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), balance_before)
+
+    def test_offline_batch_resource_loss_idempotency_creates_pending_report_once(self):
+        organisation_id = self.create_organisation("Offline Loss Org")
+        depot_id = self._create_depot(organisation_id, "Offline Loss Depot")
+        category_id = self._create_category(organisation_id, "Offline Loss Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "Offline Loss Pallet")
+        self._set_opening_balance(organisation_id, depot_id, resource_id, 100)
+
+        ledger_count_before = self._get_table_count("ledger_entries")
+        loss_count_before = self._get_table_count("resource_losses")
+        balance_before = self._get_resource_balance(organisation_id, depot_id, resource_id)
+        body = {
+            "device_id": "device-offline-loss-1",
+            "items": [{
+                "local_id": "local-loss-1",
+                "type": "resource_loss",
+                "queued_at": "2026-06-06T02:00:00Z",
+                "payload": {
+                    "organisation_id": organisation_id,
+                    "depot_id": depot_id,
+                    "resource_id": resource_id,
+                    "quantity": 3,
+                    "loss_type": "DAMAGED",
+                    "loss_reason": "Found damaged while offline",
+                    "submitted_by_display_name": "Offline User",
+                },
+            }],
+        }
+
+        first = self.client.post("/offline-batch", json=body)
+        self.assertEqual(first.status_code, 200)
+        first_payload = first.get_json()
+        self.assertEqual(first_payload["succeeded"], 1)
+        result = first_payload["results"][0]
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["detail"]["status"], "PENDING_REVIEW")
+        loss_id = result["server_id"]
+
+        conn = self.core.get_conn()
+        loss = conn.execute(
+            "SELECT * FROM resource_losses WHERE loss_id = ?",
+            (loss_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(loss["status"], "PENDING_REVIEW")
+        self.assertIsNone(loss["loss_transaction_id"])
+        self.assertEqual(self._get_table_count("resource_losses"), loss_count_before + 1)
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), balance_before)
+
+        repeat = self.client.post("/offline-batch", json=body)
+        self.assertEqual(repeat.status_code, 200)
+        repeat_payload = repeat.get_json()
+        self.assertEqual(repeat_payload["succeeded"], 0)
+        self.assertEqual(repeat_payload["failed"], 0)
+        self.assertEqual(repeat_payload["duplicates"], 1)
+        duplicate = repeat_payload["results"][0]
+        self.assertEqual(duplicate["status"], "duplicate")
+        self.assertEqual(duplicate["server_id"], loss_id)
+        self.assertEqual(duplicate["original_status"], "success")
+        self.assertEqual(self._get_table_count("resource_losses"), loss_count_before + 1)
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), balance_before)
+
+    def test_offline_batch_invalid_payload_reports_failure_without_mutating_stock(self):
+        organisation_id = self.create_organisation("Offline Invalid Org")
+        depot_id = self._create_depot(organisation_id, "Offline Invalid Depot")
+        category_id = self._create_category(organisation_id, "Offline Invalid Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "Offline Invalid Pallet")
+        self._set_opening_balance(organisation_id, depot_id, resource_id, 100)
+
+        ledger_count_before = self._get_table_count("ledger_entries")
+        transaction_count_before = self._get_table_count("transactions")
+        loss_count_before = self._get_table_count("resource_losses")
+        balance_before = self._get_resource_balance(organisation_id, depot_id, resource_id)
+
+        response = self.client.post("/offline-batch", json={
+            "device_id": "device-offline-invalid-1",
+            "items": [{
+                "local_id": "local-invalid-1",
+                "type": "transaction",
+                "queued_at": "2026-06-06T03:00:00Z",
+                "payload": {
+                    "organisation_id": organisation_id,
+                    "depot_id": depot_id,
+                    "resource_id": resource_id,
+                    "quantity": 4,
+                    "direction": "SIDEWAYS",
+                    "transaction_type": "Movement",
+                },
+            }],
+        })
+        self.assertEqual(response.status_code, 207)
+        payload = response.get_json()
+        self.assertEqual(payload["succeeded"], 0)
+        self.assertEqual(payload["failed"], 1)
+        result = payload["results"][0]
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["type"], "transaction")
+        self.assertIn("direction must be IN or OUT", result["error"])
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before)
+        self.assertEqual(self._get_table_count("resource_losses"), loss_count_before)
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), balance_before)
+
+    def test_offline_batch_mixed_results_are_reported_per_item(self):
+        organisation_id = self.create_organisation("Offline Mixed Org")
+        depot_id = self._create_depot(organisation_id, "Offline Mixed Depot")
+        category_id = self._create_category(organisation_id, "Offline Mixed Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "Offline Mixed Pallet")
+        self._set_opening_balance(organisation_id, depot_id, resource_id, 100)
+
+        ledger_count_before = self._get_table_count("ledger_entries")
+        transaction_count_before = self._get_table_count("transactions")
+        loss_count_before = self._get_table_count("resource_losses")
+        balance_before = self._get_resource_balance(organisation_id, depot_id, resource_id)
+
+        response = self.client.post("/offline-batch", json={
+            "device_id": "device-offline-mixed-1",
+            "items": [
+                {
+                    "local_id": "local-mixed-txn-1",
+                    "type": "transaction",
+                    "queued_at": "2026-06-06T04:00:00Z",
+                    "payload": {
+                        "organisation_id": organisation_id,
+                        "depot_id": depot_id,
+                        "resource_id": resource_id,
+                        "quantity": 9,
+                        "direction": "IN",
+                        "transaction_type": "Movement",
+                    },
+                },
+                {
+                    "local_id": "local-mixed-loss-bad-1",
+                    "type": "resource_loss",
+                    "queued_at": "2026-06-06T04:05:00Z",
+                    "payload": {
+                        "organisation_id": organisation_id,
+                        "depot_id": depot_id,
+                        "resource_id": resource_id,
+                        "quantity": 2,
+                        "loss_type": "UNKNOWN",
+                        "loss_reason": "Invalid loss type",
+                    },
+                },
+            ],
+        })
+        self.assertEqual(response.status_code, 207)
+        payload = response.get_json()
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual(payload["succeeded"], 1)
+        self.assertEqual(payload["failed"], 1)
+        self.assertEqual(payload["duplicates"], 0)
+        results_by_local_id = {item["local_id"]: item for item in payload["results"]}
+        self.assertEqual(results_by_local_id["local-mixed-txn-1"]["status"], "success")
+        self.assertEqual(results_by_local_id["local-mixed-loss-bad-1"]["status"], "error")
+        self.assertIn("Invalid loss_type", results_by_local_id["local-mixed-loss-bad-1"]["error"])
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before + 1)
+        self.assertEqual(self._get_table_count("resource_losses"), loss_count_before)
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), balance_before)
 
     def test_stocktake_list_and_global_summary(self):
         resp = self.client.get("/global-admin/stocktake-summary")
