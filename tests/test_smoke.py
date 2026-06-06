@@ -320,6 +320,13 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(post.get_json()["status"], "POSTED")
         return transaction_id
 
+    def _client_for_user(self, user_id, label="test user key"):
+        resp = self.client.post("/auth/keys", json={"user_id": user_id, "label": label})
+        self.assertEqual(resp.status_code, 201)
+        user_client = self.core.app.test_client()
+        user_client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {resp.get_json()['api_key']}"
+        return user_client
+
     def _get_transaction_row(self, transaction_id):
         conn = self.core.get_conn()
         row = conn.execute(
@@ -349,6 +356,12 @@ class PalletProSmokeTests(unittest.TestCase):
             "SELECT COUNT(*) AS count FROM ledger_entries WHERE transaction_id = ?",
             (transaction_id,),
         ).fetchone()
+        conn.close()
+        return row["count"]
+
+    def _get_table_count(self, table_name):
+        conn = self.core.get_conn()
+        row = conn.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
         conn.close()
         return row["count"]
 
@@ -761,6 +774,175 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(tcr["status"], "REJECTED")
         self.assertIsNone(tcr["correction_transaction_id"])
         self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), balance_before)
+
+    def test_resource_loss_rejection_does_not_mutate_transaction_or_ledger_state(self):
+        organisation_id = self.create_organisation("Loss Rejection Org")
+        depot_id = self._create_depot(organisation_id, "Loss Reject Depot")
+        category_id = self._create_category(organisation_id, "Loss Reject Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "Loss Reject Pallet")
+        user_id = self._create_user(organisation_id, "Loss Field User", role="USER")
+        field_client = self._client_for_user(user_id, "loss rejection field key")
+        self._set_opening_balance(organisation_id, depot_id, resource_id, 100)
+
+        ledger_count_before = self._get_table_count("ledger_entries")
+        transaction_count_before = self._get_table_count("transactions")
+        balance_before = self._get_resource_balance(organisation_id, depot_id, resource_id)
+
+        create = field_client.post("/resource-loss", json={
+            "depot_id": depot_id,
+            "resource_id": resource_id,
+            "quantity": 5,
+            "loss_type": "DAMAGED",
+            "loss_reason": "Broken during unloading",
+            "loss_date": "2026-06-06",
+        })
+        self.assertEqual(create.status_code, 201)
+        create_payload = create.get_json()
+        self.assertEqual(create_payload["organisation_id"], organisation_id)
+        self.assertEqual(create_payload["status"], "PENDING_REVIEW")
+        loss_id = create_payload["loss_id"]
+
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), balance_before)
+
+        field_reject = field_client.post(
+            f"/resource-losses/{loss_id}/reject",
+            json={"review_notes": "Trying to self-review"},
+        )
+        self.assertEqual(field_reject.status_code, 403)
+
+        reject = self.client.post(
+            f"/resource-losses/{loss_id}/reject",
+            json={"review_notes": "Damage report was duplicated"},
+        )
+        self.assertEqual(reject.status_code, 200)
+        self.assertEqual(reject.get_json()["status"], "REJECTED")
+
+        conn = self.core.get_conn()
+        loss = conn.execute(
+            "SELECT * FROM resource_losses WHERE loss_id = ?",
+            (loss_id,),
+        ).fetchone()
+        resource_loss_transactions = conn.execute(
+            """
+            SELECT *
+            FROM transactions
+            WHERE transaction_type = 'ResourceLoss'
+              AND organisation_id = ?
+              AND depot_id = ?
+              AND resource_id = ?
+            """,
+            (organisation_id, depot_id, resource_id),
+        ).fetchall()
+        conn.close()
+
+        self.assertEqual(loss["status"], "REJECTED")
+        self.assertIsNone(loss["loss_transaction_id"])
+        self.assertEqual(len(resource_loss_transactions), 0)
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), balance_before)
+
+    def test_resource_loss_confirmation_posts_resource_loss_transaction(self):
+        organisation_id = self.create_organisation("Loss Confirm Org")
+        depot_id = self._create_depot(organisation_id, "Loss Confirm Depot")
+        category_id = self._create_category(organisation_id, "Loss Confirm Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "Loss Confirm Pallet")
+        user_id = self._create_user(organisation_id, "Loss Reporter", role="USER")
+        field_client = self._client_for_user(user_id, "loss confirm field key")
+        self._set_opening_balance(organisation_id, depot_id, resource_id, 100)
+
+        ledger_count_before = self._get_table_count("ledger_entries")
+        transaction_count_before = self._get_table_count("transactions")
+
+        create = field_client.post("/resource-loss", json={
+            "depot_id": depot_id,
+            "resource_id": resource_id,
+            "quantity": 7,
+            "loss_type": "LOST",
+            "loss_reason": "Missing after site reconciliation",
+        })
+        self.assertEqual(create.status_code, 201)
+        self.assertEqual(create.get_json()["status"], "PENDING_REVIEW")
+        loss_id = create.get_json()["loss_id"]
+
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), 100)
+
+        field_confirm = field_client.post(
+            f"/resource-losses/{loss_id}/confirm",
+            json={"review_notes": "Trying to self-confirm"},
+        )
+        self.assertEqual(field_confirm.status_code, 403)
+
+        confirm = self.client.post(
+            f"/resource-losses/{loss_id}/confirm",
+            json={"review_notes": "Confirmed against depot count"},
+        )
+        self.assertEqual(confirm.status_code, 200)
+        confirm_payload = confirm.get_json()
+        self.assertEqual(confirm_payload["status"], "CONFIRMED")
+        loss_transaction_id = confirm_payload["loss_transaction_id"]
+
+        conn = self.core.get_conn()
+        loss = conn.execute(
+            "SELECT * FROM resource_losses WHERE loss_id = ?",
+            (loss_id,),
+        ).fetchone()
+        loss_txn = conn.execute(
+            "SELECT * FROM transactions WHERE transaction_id = ?",
+            (loss_transaction_id,),
+        ).fetchone()
+        loss_ledger = conn.execute(
+            "SELECT * FROM ledger_entries WHERE transaction_id = ?",
+            (loss_transaction_id,),
+        ).fetchone()
+        conn.close()
+
+        self.assertEqual(loss["status"], "CONFIRMED")
+        self.assertEqual(loss["loss_transaction_id"], loss_transaction_id)
+        self.assertEqual(loss_txn["transaction_type"], "ResourceLoss")
+        self.assertEqual(loss_txn["status"], "POSTED")
+        self.assertEqual(loss_txn["direction"], "OUT")
+        self.assertEqual(loss_txn["quantity"], 7)
+        self.assertEqual(loss_ledger["quantity_delta"], -7)
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before + 1)
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before + 1)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, resource_id), 93)
+
+    def test_resource_loss_field_user_cannot_report_against_another_org(self):
+        org_a = self.create_organisation("Loss Boundary Org A")
+        org_b = self.create_organisation("Loss Boundary Org B")
+        depot_b = self._create_depot(org_b, "Boundary Depot B")
+        category_b = self._create_category(org_b, "Boundary Cat B")
+        resource_b = self._create_resource(org_b, category_b, "Boundary Pallet B")
+        user_id = self._create_user(org_a, "Boundary Field User", role="USER")
+        field_client = self._client_for_user(user_id, "loss boundary field key")
+
+        create = field_client.post("/resource-loss", json={
+            "organisation_id": org_b,
+            "depot_id": depot_b,
+            "resource_id": resource_b,
+            "quantity": 3,
+            "loss_type": "STOLEN",
+            "loss_reason": "Attempted cross-org report",
+        })
+        self.assertEqual(create.status_code, 404)
+        self.assertEqual(create.get_json()["error"], "Depot not found")
+
+        conn = self.core.get_conn()
+        cross_org_losses = conn.execute(
+            """
+            SELECT *
+            FROM resource_losses
+            WHERE organisation_id = ? AND depot_id = ? AND resource_id = ?
+            """,
+            (org_b, depot_b, resource_b),
+        ).fetchall()
+        conn.close()
+        self.assertEqual(len(cross_org_losses), 0)
 
     def test_stocktake_list_and_global_summary(self):
         resp = self.client.get("/global-admin/stocktake-summary")
