@@ -372,6 +372,42 @@ class PalletProSmokeTests(unittest.TestCase):
         conn.close()
         return row["count"]
 
+    def _assert_no_sensitive_keys(self, value):
+        forbidden_keys = {
+            "api_key",
+            "key_hash",
+            "password",
+            "password_hash",
+            "setup_token",
+            "token",
+            "token_hash",
+            "raw_token",
+            "session_token",
+            "credential_private_key",
+            "private_key",
+            "secret",
+            "env",
+            "environment",
+            "card_number",
+            "cvv",
+            "bank_account",
+            "bsb",
+        }
+
+        def walk(node):
+            if isinstance(node, dict):
+                self.assertTrue(
+                    forbidden_keys.isdisjoint(node.keys()),
+                    f"Sensitive key exposed: {forbidden_keys.intersection(node.keys())}",
+                )
+                for child in node.values():
+                    walk(child)
+            elif isinstance(node, list):
+                for child in node:
+                    walk(child)
+
+        walk(value)
+
     def test_stocktake_full_lifecycle_with_variance(self):
         organisation_id = self.create_organisation("Stocktake Full Org")
         depot_id = self._create_depot(organisation_id, "Main Depot")
@@ -805,6 +841,104 @@ class PalletProSmokeTests(unittest.TestCase):
         org_b_depot = self._create_depot(org_b, "Other Org Depot")
         cross_deactivate = org_admin_client.post(f"/depots/{org_b_depot}/deactivate")
         self.assertEqual(cross_deactivate.status_code, 403)
+
+    def test_global_admin_console_routes_require_global_admin_or_sga(self):
+        org_id = self.create_organisation("Global Console Org")
+        field_user_id = self._create_user(org_id, "Global Console Field", role="USER")
+        org_admin_id = self._create_user(org_id, "Global Console Org Admin", role="ORG_ADMIN")
+        global_admin_id = self._create_user(org_id, "Global Console GA", role="GLOBAL_ADMIN")
+        field_client = self._client_for_user(field_user_id, "global console field key")
+        org_admin_client = self._client_for_user(org_admin_id, "global console org admin key")
+        global_admin_client = self._client_for_user(global_admin_id, "global console ga key")
+        unauth_client = self.core.app.test_client()
+
+        routes = [
+            ("GET", "/global-admin/system-control-panel", None),
+            ("GET", "/global-admin/access-operations-dashboard", None),
+            ("GET", "/global-admin/billing-export-runs", None),
+            ("POST", "/global-admin/billing-export-preview", {}),
+            ("GET", "/global-admin/pricing-dashboard", None),
+        ]
+
+        for method, path, body in routes:
+            unauth = getattr(unauth_client, method.lower())(path, json=body) if body is not None else getattr(unauth_client, method.lower())(path)
+            self.assertEqual(unauth.status_code, 401, path)
+
+            field = getattr(field_client, method.lower())(path, json=body) if body is not None else getattr(field_client, method.lower())(path)
+            self.assertEqual(field.status_code, 403, path)
+
+            org_admin = getattr(org_admin_client, method.lower())(path, json=body) if body is not None else getattr(org_admin_client, method.lower())(path)
+            self.assertEqual(org_admin.status_code, 403, path)
+
+            ga = getattr(global_admin_client, method.lower())(path, json=body) if body is not None else getattr(global_admin_client, method.lower())(path)
+            self.assertEqual(ga.status_code, 200, path)
+            self._assert_no_sensitive_keys(ga.get_json())
+
+            sga = getattr(self.client, method.lower())(path, json=body) if body is not None else getattr(self.client, method.lower())(path)
+            self.assertEqual(sga.status_code, 200, path)
+            self._assert_no_sensitive_keys(sga.get_json())
+
+    def test_sga_only_global_org_and_user_access_boundaries(self):
+        org_a = self.create_organisation("SGA Boundary Org A")
+        org_b = self.create_organisation("SGA Boundary Org B")
+        org_admin_id = self._create_user(org_a, "SGA Boundary Org Admin", role="ORG_ADMIN")
+        field_user_id = self._create_user(org_a, "SGA Boundary Field", role="USER")
+        global_admin_id = self._create_user(org_a, "SGA Boundary GA", role="GLOBAL_ADMIN")
+        target_user_id = self._create_user(org_b, "SGA Boundary Target", role="USER")
+        org_admin_client = self._client_for_user(org_admin_id, "sga boundary org admin key")
+        field_client = self._client_for_user(field_user_id, "sga boundary field key")
+        global_admin_client = self._client_for_user(global_admin_id, "sga boundary ga key")
+        unauth_client = self.core.app.test_client()
+
+        unauth_orgs = unauth_client.get("/global-admin/organisations")
+        self.assertEqual(unauth_orgs.status_code, 401)
+        field_orgs = field_client.get("/global-admin/organisations")
+        self.assertEqual(field_orgs.status_code, 403)
+        org_admin_orgs = org_admin_client.get("/global-admin/organisations")
+        self.assertEqual(org_admin_orgs.status_code, 403)
+        ga_orgs = global_admin_client.get("/global-admin/organisations")
+        self.assertEqual(ga_orgs.status_code, 403)
+        sga_orgs = self.client.get("/global-admin/organisations")
+        self.assertEqual(sga_orgs.status_code, 200)
+        self._assert_no_sensitive_keys(sga_orgs.get_json())
+
+        access_body = {
+            "access_status": "SUSPENDED",
+            "changed_by_display_name": "Boundary Admin",
+            "confirmation_text": "CHANGE USER ACCESS",
+        }
+        unauth_access = unauth_client.post(
+            f"/global-admin/users/{target_user_id}/access",
+            json=access_body,
+        )
+        self.assertEqual(unauth_access.status_code, 401)
+        field_access = field_client.post(
+            f"/global-admin/users/{target_user_id}/access",
+            json=access_body,
+        )
+        self.assertEqual(field_access.status_code, 403)
+        org_admin_access = org_admin_client.post(
+            f"/global-admin/users/{target_user_id}/access",
+            json=access_body,
+        )
+        self.assertEqual(org_admin_access.status_code, 403)
+        ga_access = global_admin_client.post(
+            f"/global-admin/users/{target_user_id}/access",
+            json=access_body,
+        )
+        self.assertEqual(ga_access.status_code, 403)
+        sga_access = self.client.post(
+            f"/global-admin/users/{target_user_id}/access",
+            json=access_body,
+        )
+        self.assertEqual(sga_access.status_code, 200)
+        self._assert_no_sensitive_keys(sga_access.get_json())
+
+        ga_cross_users = global_admin_client.get(f"/organisations/{org_b}/users")
+        self.assertEqual(ga_cross_users.status_code, 403)
+        sga_cross_users = self.client.get(f"/organisations/{org_b}/users")
+        self.assertEqual(sga_cross_users.status_code, 200)
+        self._assert_no_sensitive_keys(sga_cross_users.get_json())
 
     def test_stock_position_org_and_depot(self):
         organisation_id = self.create_organisation("Stock Position Org")

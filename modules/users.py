@@ -140,6 +140,25 @@ def record_user_access_event(conn, user_id, organisation_id, action, summary, ch
     )
 
 
+def build_safe_user_payload(user_row):
+    keys = user_row.keys()
+    return {
+        "user_id": user_row["user_id"],
+        "organisation_id": user_row["organisation_id"],
+        "display_name": user_row["display_name"],
+        "email": user_row["email"],
+        "mobile_number": user_row["mobile_number"] if "mobile_number" in keys else None,
+        "role": user_row["role"],
+        "access_status": user_row["access_status"],
+        "temporary_user_access_id": user_row["temporary_user_access_id"],
+        "default_depot_id": user_row["default_depot_id"] if "default_depot_id" in keys else None,
+        "default_nav_app": user_row["default_nav_app"] if "default_nav_app" in keys else None,
+        "created_by_display_name": user_row["created_by_display_name"],
+        "created_at": user_row["created_at"],
+        "updated_at": user_row["updated_at"],
+    }
+
+
 def build_user_access_policy(conn, user_row):
     role = user_row["role"]
     status = user_row["access_status"]
@@ -563,23 +582,8 @@ def register_user_routes(app):
 
         items = []
         for row in rows:
-            safe_user = {
-                "user_id": row["user_id"],
-                "organisation_id": row["organisation_id"],
-                "display_name": row["display_name"],
-                "email": row["email"],
-                "mobile_number": row["mobile_number"] if "mobile_number" in row.keys() else None,
-                "role": row["role"],
-                "access_status": row["access_status"],
-                "temporary_user_access_id": row["temporary_user_access_id"],
-                "default_depot_id": row["default_depot_id"] if "default_depot_id" in row.keys() else None,
-                "default_nav_app": row["default_nav_app"] if "default_nav_app" in row.keys() else None,
-                "created_by_display_name": row["created_by_display_name"],
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
-            }
             items.append({
-                "user": safe_user,
+                "user": build_safe_user_payload(row),
                 "access_policy": build_user_access_policy(conn, row),
             })
 
@@ -708,7 +712,7 @@ def register_user_routes(app):
         conn.close()
 
         return jsonify({
-            "user": dict(updated_user),
+            "user": build_safe_user_payload(updated_user),
             "access_policy": policy,
             "changed_by_display_name": changed_by_display_name,
             "rule": "User role/access changes are audited.",
