@@ -110,7 +110,30 @@ def generate_transaction_reference(conn, organisation_id):
     return f"PP-{year}-{global_seq:06d}", org_seq
 
 
+def _begin_immediate_if_needed(conn):
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+
+
 def post_transaction_to_ledger(conn, txn):
+    _begin_immediate_if_needed(conn)
+
+    current_txn = conn.execute(
+        "SELECT transaction_id FROM transactions WHERE transaction_id = ?",
+        (txn["transaction_id"],),
+    ).fetchone()
+
+    if not current_txn:
+        raise ValueError("Transaction not found")
+
+    existing_ledger = conn.execute(
+        "SELECT ledger_entry_id FROM ledger_entries WHERE transaction_id = ? LIMIT 1",
+        (txn["transaction_id"],),
+    ).fetchone()
+
+    if existing_ledger:
+        return False
+
     quantity_delta = txn["quantity"] if txn["direction"] == "IN" else -txn["quantity"]
     ledger_entry_id = make_id("led")
 
@@ -137,45 +160,30 @@ def post_transaction_to_ledger(conn, txn):
         )
     )
 
-    existing_balance = conn.execute(
+    conn.execute(
         """
-        SELECT * FROM balance_projection
-        WHERE organisation_id = ? AND depot_id = ? AND resource_id = ?
+        INSERT INTO balance_projection (
+            balance_projection_id,
+            organisation_id,
+            depot_id,
+            resource_id,
+            current_quantity,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(organisation_id, depot_id, resource_id)
+        DO UPDATE SET
+            current_quantity = current_quantity + excluded.current_quantity,
+            updated_at = excluded.updated_at
         """,
-        (txn["organisation_id"], txn["depot_id"], txn["resource_id"])
-    ).fetchone()
-
-    if existing_balance:
-        new_qty = existing_balance["current_quantity"] + quantity_delta
-        conn.execute(
-            """
-            UPDATE balance_projection
-            SET current_quantity = ?, updated_at = ?
-            WHERE balance_projection_id = ?
-            """,
-            (new_qty, now_iso(), existing_balance["balance_projection_id"])
+        (
+            make_id("bal"),
+            txn["organisation_id"],
+            txn["depot_id"],
+            txn["resource_id"],
+            quantity_delta,
+            now_iso()
         )
-    else:
-        conn.execute(
-            """
-            INSERT INTO balance_projection (
-                balance_projection_id,
-                organisation_id,
-                depot_id,
-                resource_id,
-                current_quantity,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                make_id("bal"),
-                txn["organisation_id"],
-                txn["depot_id"],
-                txn["resource_id"],
-                quantity_delta,
-                now_iso()
-            )
-        )
+    )
 
     conn.execute(
         """
@@ -194,6 +202,8 @@ def post_transaction_to_ledger(conn, txn):
         summary=f"Posted transaction with delta {quantity_delta}",
         organisation_id=txn["organisation_id"]
     )
+
+    return True
 
 
 def get_partner_address_for_transaction(conn, partner_address_id, partner_id, organisation_id):

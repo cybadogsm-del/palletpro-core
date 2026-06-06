@@ -240,6 +240,10 @@ class BrickSmokeTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["total_attention_items"], 0)
         self.assertEqual(payload["attention_items"], [])
         self.assertGreaterEqual(len(payload["items"]), 1)
+        first_item = payload["items"][0]
+        self.assertIn("allowed_user_actions", first_item)
+        self.assertIn("audit_context", first_item)
+        self.assertIn("recommended_action", first_item)
 
     def test_field_user_cannot_view_org_operational_insights(self):
         """Field users cannot view org-wide operational insights."""
@@ -247,6 +251,26 @@ class BrickSmokeTests(unittest.TestCase):
         client, _ = self._create_login_client("USER", org_id)
 
         r = client.get(f"/organisations/{org_id}/operational-insights")
+
+        self.assertEqual(r.status_code, 403)
+
+    def test_org_admin_can_view_own_org_operational_insights(self):
+        """ORG_ADMIN can view deterministic insights for their own organisation."""
+        org_id = self._create_org("Org Admin Own Insight Org")
+        client, _ = self._create_login_client("ORG_ADMIN", org_id)
+
+        r = client.get(f"/organisations/{org_id}/operational-insights")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["organisation_id"], org_id)
+
+    def test_org_admin_cannot_view_other_org_operational_insights(self):
+        """ORG_ADMIN cannot view operational insight data for another org."""
+        own_org_id = self._create_org("Org Admin Own Insight Scope Org")
+        other_org_id = self._create_org("Org Admin Other Insight Scope Org")
+        client, _ = self._create_login_client("ORG_ADMIN", own_org_id)
+
+        r = client.get(f"/organisations/{other_org_id}/operational-insights")
 
         self.assertEqual(r.status_code, 403)
 
@@ -296,6 +320,62 @@ class BrickSmokeTests(unittest.TestCase):
         self.assertEqual(by_id["offline_upload_failures"]["count"], 1)
         self.assertEqual(by_id["offline_upload_failures"]["severity"], "medium")
         self.assertIn("recommended_action", by_id["pending_approvals"])
+        self.assertEqual(
+            by_id["pending_approvals"]["allowed_user_actions"][0]["can_act_now"],
+            True,
+        )
+        self.assertEqual(
+            by_id["offline_upload_failures"]["audit_context"]["entity_type"],
+            "OfflineBatchLog",
+        )
+
+    def test_post_transaction_to_ledger_is_idempotent(self):
+        """Ledger posting cannot apply the same transaction to balance twice."""
+        org_id = self._create_org("Idempotent Ledger Org")
+        depot_id = self._create_depot(org_id, "Main Depot")
+        category_id = self._create_category(org_id, "Pallets")
+        resource_id = self._create_resource(org_id, category_id, "CHEP")
+        transaction_id = self.core.make_id("txn")
+        ts = self.core.now_iso()
+
+        conn = self.core.get_conn()
+        conn.execute(
+            """
+            INSERT INTO transactions (
+                transaction_id, organisation_id, depot_id, transaction_type,
+                resource_id, quantity, direction, status, created_at
+            ) VALUES (?, ?, ?, 'MOVEMENT', ?, 5, 'IN', 'DRAFT', ?)
+            """,
+            (transaction_id, org_id, depot_id, resource_id, ts),
+        )
+        txn = conn.execute(
+            "SELECT * FROM transactions WHERE transaction_id = ?",
+            (transaction_id,),
+        ).fetchone()
+
+        first_posted = self.core.post_transaction_to_ledger(conn, txn)
+        second_posted = self.core.post_transaction_to_ledger(conn, txn)
+
+        ledger_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM ledger_entries WHERE transaction_id = ?",
+            (transaction_id,),
+        ).fetchone()["count"]
+        balance = conn.execute(
+            """
+            SELECT current_quantity
+            FROM balance_projection
+            WHERE organisation_id = ? AND depot_id = ? AND resource_id = ?
+            """,
+            (org_id, depot_id, resource_id),
+        ).fetchone()
+
+        conn.rollback()
+        conn.close()
+
+        self.assertTrue(first_posted)
+        self.assertFalse(second_posted)
+        self.assertEqual(ledger_count, 1)
+        self.assertEqual(balance["current_quantity"], 5)
 
     def test_user_access_policy(self):
         """GET /users/<id>/access-policy returns a structured policy."""
