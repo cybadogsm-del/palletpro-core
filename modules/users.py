@@ -524,6 +524,21 @@ def register_user_routes(app):
 
     @app.get("/organisations/<organisation_id>/users")
     def list_organisation_users(organisation_id):
+        current_user = g.current_user
+        current_role = current_user.get("role")
+        current_org_id = current_user.get("user_org_id")
+
+        if current_role == "SUPER_GLOBAL_ADMIN":
+            pass
+        elif current_org_id == organisation_id and current_role in ("ORG_ADMIN", "GLOBAL_ADMIN"):
+            pass
+        else:
+            return jsonify({
+                "error": "INSUFFICIENT_ROLE",
+                "message": "Listing organisation users requires ORG_ADMIN for your own organisation or SUPER_GLOBAL_ADMIN for cross-organisation access.",
+                "your_role": current_role,
+            }), 403
+
         conn = get_conn()
         ensure_user_access_tables(conn)
 
@@ -583,6 +598,13 @@ def register_user_routes(app):
 
     @app.post("/global-admin/users/<user_id>/access")
     def update_user_access(user_id):
+        if g.current_user.get("role") != "SUPER_GLOBAL_ADMIN":
+            return jsonify({
+                "error": "INSUFFICIENT_ROLE",
+                "message": "This endpoint requires SUPER_GLOBAL_ADMIN role.",
+                "your_role": g.current_user.get("role"),
+            }), 403
+
         body = request.get_json(silent=True) or {}
 
         role = (body.get("role") or "").strip().upper() if "role" in body else None

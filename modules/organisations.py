@@ -656,6 +656,13 @@ def register_organisation_routes(app):
 
     @app.get("/global-admin/organisations")
     def list_all_organisations():
+        if g.current_user.get("role") != "SUPER_GLOBAL_ADMIN":
+            return jsonify({
+                "error": "INSUFFICIENT_ROLE",
+                "message": "This endpoint requires SUPER_GLOBAL_ADMIN role.",
+                "your_role": g.current_user.get("role"),
+            }), 403
+
         conn = get_conn()
         rows = conn.execute(
             """

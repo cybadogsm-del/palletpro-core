@@ -35,6 +35,7 @@ class BrickSmokeTests(unittest.TestCase):
         cls.core = importlib.import_module("pallet_pro_core")
         cls.client = cls.core.app.test_client()
         cls.client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {_TEST_MASTER_KEY}"
+        cls._email_counter = 0
 
     @classmethod
     def tearDownClass(cls):
@@ -59,6 +60,44 @@ class BrickSmokeTests(unittest.TestCase):
         })
         self.assertEqual(r.status_code, 201)
         return r.get_json()["user"]["user_id"]
+
+    def _create_login_client(self, role, organisation_id=None):
+        self.__class__._email_counter += 1
+        email = f"{role.lower()}-{self.__class__._email_counter}@example.test"
+        password = "Password123!"
+        access_method = "DESKTOP" if role in ("ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN") else "TABLET"
+
+        r = self.client.post("/global-admin/users", json={
+            "organisation_id": organisation_id,
+            "display_name": f"{role} Test User {self.__class__._email_counter}",
+            "email": email,
+            "role": role,
+            "access_status": "ACTIVE",
+            "access_method": access_method,
+            "created_by_display_name": "Test",
+            "confirmation_text": "CREATE USER",
+        })
+        self.assertEqual(r.status_code, 201)
+        payload = r.get_json()
+
+        set_pw = self.client.post("/auth/set-password", json={
+            "setup_token": payload["setup_token"],
+            "password": password,
+        })
+        self.assertEqual(set_pw.status_code, 200)
+
+        login = self.client.post("/sessions/login", json={
+            "email": email,
+            "password": password,
+            "device_id": f"test-device-{self.__class__._email_counter}",
+            "device_label": "Test Client",
+        })
+        self.assertIn(login.status_code, (200, 201))
+
+        session_id = login.get_json()["session"]["session_id"]
+        client = self.core.app.test_client()
+        client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {session_id}"
+        return client, payload["user"]["user_id"]
 
     def _create_depot(self, organisation_id, name):
         r = self.client.post("/depots", json={"organisation_id": organisation_id, "name": name})
@@ -100,6 +139,26 @@ class BrickSmokeTests(unittest.TestCase):
         self.assertIsInstance(payload["organisations"], list)
         self.assertGreater(len(payload["organisations"]), 0)
 
+    def test_unauthenticated_global_organisations_blocked(self):
+        """GET /global-admin/organisations requires authentication."""
+        client = self.core.app.test_client()
+        r = client.get("/global-admin/organisations")
+        self.assertEqual(r.status_code, 401)
+
+    def test_global_admin_cannot_list_global_organisations(self):
+        """GET /global-admin/organisations is SGA-only."""
+        client, _ = self._create_login_client("GLOBAL_ADMIN")
+        r = client.get("/global-admin/organisations")
+        self.assertEqual(r.status_code, 403)
+
+    def test_super_global_admin_can_list_global_organisations(self):
+        """SUPER_GLOBAL_ADMIN can list all organisations."""
+        self._create_org("SGA List Org")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+        r = client.get("/global-admin/organisations")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("organisations", r.get_json())
+
     def test_org_admin_dashboard(self):
         """GET /organisations/<id>/admin-dashboard returns dashboard shape."""
         org_id = self._create_org("Dashboard Org")
@@ -137,6 +196,36 @@ class BrickSmokeTests(unittest.TestCase):
         self.assertIn("Alice", names)
         self.assertIn("Bob", names)
 
+    def test_unauthenticated_org_users_blocked(self):
+        """GET /organisations/<id>/users requires authentication."""
+        org_id = self._create_org("Unauth Users Org")
+        client = self.core.app.test_client()
+        r = client.get(f"/organisations/{org_id}/users")
+        self.assertEqual(r.status_code, 401)
+
+    def test_field_user_cannot_list_org_users(self):
+        """Field users cannot list organisation users."""
+        org_id = self._create_org("Field Block Org")
+        client, _ = self._create_login_client("USER", org_id)
+        r = client.get(f"/organisations/{org_id}/users")
+        self.assertEqual(r.status_code, 403)
+
+    def test_org_admin_can_list_own_org_users(self):
+        """ORG_ADMIN can list users in their own organisation."""
+        org_id = self._create_org("Org Admin Own Users Org")
+        client, _ = self._create_login_client("ORG_ADMIN", org_id)
+        r = client.get(f"/organisations/{org_id}/users")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("items", r.get_json())
+
+    def test_org_admin_cannot_list_other_org_users(self):
+        """ORG_ADMIN cannot list users in another organisation."""
+        own_org_id = self._create_org("Org Admin Own Org")
+        other_org_id = self._create_org("Org Admin Other Org")
+        client, _ = self._create_login_client("ORG_ADMIN", own_org_id)
+        r = client.get(f"/organisations/{other_org_id}/users")
+        self.assertEqual(r.status_code, 403)
+
     def test_user_access_policy(self):
         """GET /users/<id>/access-policy returns a structured policy."""
         org_id = self._create_org("Policy Org")
@@ -159,6 +248,31 @@ class BrickSmokeTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         payload = r.get_json()
         self.assertEqual(payload["user"]["access_status"], "SUSPENDED")
+
+    def test_global_admin_cannot_update_user_access(self):
+        """GLOBAL_ADMIN cannot use the SGA-only user access update endpoint."""
+        org_id = self._create_org("GA Access Block Org")
+        user_id = self._create_user(org_id, "GA Cannot Suspend")
+        client, _ = self._create_login_client("GLOBAL_ADMIN")
+        r = client.post(f"/global-admin/users/{user_id}/access", json={
+            "access_status": "SUSPENDED",
+            "changed_by_display_name": "Global Admin",
+            "confirmation_text": "CHANGE USER ACCESS",
+        })
+        self.assertEqual(r.status_code, 403)
+
+    def test_super_global_admin_can_update_user_access(self):
+        """SUPER_GLOBAL_ADMIN can use the user access update endpoint."""
+        org_id = self._create_org("SGA Access Update Org")
+        user_id = self._create_user(org_id, "SGA Can Suspend")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+        r = client.post(f"/global-admin/users/{user_id}/access", json={
+            "access_status": "SUSPENDED",
+            "changed_by_display_name": "Super Global Admin",
+            "confirmation_text": "CHANGE USER ACCESS",
+        })
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["user"]["access_status"], "SUSPENDED")
 
     # ─── sessions brick ───────────────────────────────────────────────────────
 
