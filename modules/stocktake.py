@@ -1,9 +1,11 @@
 from collections import defaultdict
 
-from flask import jsonify, request
+from flask import g, jsonify, request
 
 from audit import audit_event
 from db import get_conn as _get_conn, make_id, now_iso
+
+_ORG_ADMIN_ROLES = {"ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
 
 
 def ensure_stocktake_tables(conn):
@@ -106,6 +108,17 @@ def _update_session_counts(conn, stocktake_id):
         """,
         (total, counted, variances, stocktake_id),
     )
+
+
+def _require_org_admin_or_above(action_label):
+    current_user = g.current_user
+    if current_user["role"] not in _ORG_ADMIN_ROLES:
+        return jsonify({
+            "error": "INSUFFICIENT_ROLE",
+            "message": f"Only Org Admin or above can {action_label}.",
+            "your_role": current_user["role"],
+        }), 403
+    return None
 
 
 def register_stocktake_routes(
@@ -514,6 +527,10 @@ def register_stocktake_routes(
 
     @app.post("/organisations/<organisation_id>/stocktake/<stocktake_id>/lines/<stocktake_line_id>/accept")
     def accept_stocktake_line(organisation_id, stocktake_id, stocktake_line_id):
+        role_error = _require_org_admin_or_above("accept stocktake variance lines")
+        if role_error:
+            return role_error
+
         body = request.get_json(silent=True) or {}
         reviewed_by = (body.get("reviewed_by_display_name") or "").strip()
 
@@ -595,6 +612,10 @@ def register_stocktake_routes(
 
     @app.post("/organisations/<organisation_id>/stocktake/<stocktake_id>/lines/<stocktake_line_id>/reject")
     def reject_stocktake_line(organisation_id, stocktake_id, stocktake_line_id):
+        role_error = _require_org_admin_or_above("reject stocktake variance lines")
+        if role_error:
+            return role_error
+
         body = request.get_json(silent=True) or {}
         reviewed_by = (body.get("reviewed_by_display_name") or "").strip()
         rejection_reason = (body.get("rejection_reason") or "").strip() or None
@@ -675,6 +696,10 @@ def register_stocktake_routes(
 
     @app.post("/organisations/<organisation_id>/stocktake/<stocktake_id>/bulk-accept")
     def bulk_accept_stocktake_lines(organisation_id, stocktake_id):
+        role_error = _require_org_admin_or_above("bulk accept stocktake lines")
+        if role_error:
+            return role_error
+
         body = request.get_json(silent=True) or {}
         reviewed_by = (body.get("reviewed_by_display_name") or "").strip()
 
@@ -801,6 +826,10 @@ def register_stocktake_routes(
 
     @app.post("/organisations/<organisation_id>/stocktake/<stocktake_id>/post")
     def post_stocktake(organisation_id, stocktake_id):
+        role_error = _require_org_admin_or_above("post stocktakes")
+        if role_error:
+            return role_error
+
         body = request.get_json(silent=True) or {}
         posted_by = (body.get("posted_by_display_name") or "").strip()
 

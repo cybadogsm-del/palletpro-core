@@ -522,6 +522,144 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(cancel.status_code, 200)
         self.assertEqual(cancel.get_json()["status"], "CANCELLED")
 
+    def test_stocktake_lifecycle_requires_review_before_ledger_adjustment(self):
+        organisation_id = self.create_organisation("Stocktake Proof Org")
+        depot_id = self._create_depot(organisation_id, "Proof Depot")
+        category_id = self._create_category(organisation_id, "Proof Cat")
+        counted_resource_id = self._create_resource(
+            organisation_id,
+            category_id,
+            "Counted Pallet",
+        )
+        zero_balance_resource_id = self._create_resource(
+            organisation_id,
+            category_id,
+            "Zero Balance Pallet",
+        )
+        org_admin_id = self._create_user(organisation_id, "Stocktake Admin", role="ORG_ADMIN")
+        field_user_id = self._create_user(organisation_id, "Stocktake Field", role="USER")
+        org_admin_client = self._client_for_user(org_admin_id, "stocktake admin key")
+        field_client = self._client_for_user(field_user_id, "stocktake field key")
+        self._set_opening_balance(organisation_id, depot_id, counted_resource_id, 50)
+
+        ledger_count_before = self._get_table_count("ledger_entries")
+        transaction_count_before = self._get_table_count("transactions")
+
+        initiate = org_admin_client.post(
+            f"/organisations/{organisation_id}/stocktake",
+            json={
+                "depot_id": depot_id,
+                "initiated_by_display_name": "Stocktake Admin",
+                "notes": "Proof test",
+            },
+        )
+        self.assertEqual(initiate.status_code, 201)
+        self.assertEqual(initiate.get_json()["status"], "IN_PROGRESS")
+        self.assertEqual(initiate.get_json()["total_lines"], 2)
+        stocktake_id = initiate.get_json()["stocktake_id"]
+
+        detail = org_admin_client.get(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}"
+        )
+        self.assertEqual(detail.status_code, 200)
+        lines = detail.get_json()["lines"]
+        self.assertEqual(len(lines), 2)
+        expected_by_resource = {line["resource_id"]: line["expected_quantity"] for line in lines}
+        self.assertEqual(expected_by_resource[counted_resource_id], 50)
+        self.assertEqual(expected_by_resource[zero_balance_resource_id], 0)
+
+        lines_by_resource = {line["resource_id"]: line for line in lines}
+        counted_line_id = lines_by_resource[counted_resource_id]["stocktake_line_id"]
+        zero_line_id = lines_by_resource[zero_balance_resource_id]["stocktake_line_id"]
+
+        count_variance = field_client.patch(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/lines/{counted_line_id}",
+            json={"counted_quantity": 45, "counted_by_display_name": "Stocktake Field"},
+        )
+        self.assertEqual(count_variance.status_code, 200)
+        self.assertEqual(count_variance.get_json()["variance"], -5)
+
+        count_zero = field_client.patch(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/lines/{zero_line_id}",
+            json={"counted_quantity": 0, "counted_by_display_name": "Stocktake Field"},
+        )
+        self.assertEqual(count_zero.status_code, 200)
+        self.assertEqual(count_zero.get_json()["variance"], 0)
+
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, counted_resource_id), 50)
+
+        submit = field_client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/submit",
+            json={"submitted_by_display_name": "Stocktake Field"},
+        )
+        self.assertEqual(submit.status_code, 200)
+        self.assertEqual(submit.get_json()["status"], "PENDING_REVIEW")
+        self.assertEqual(submit.get_json()["variance_lines"], 1)
+
+        field_accept = field_client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/lines/{counted_line_id}/accept",
+            json={"reviewed_by_display_name": "Stocktake Field"},
+        )
+        self.assertEqual(field_accept.status_code, 403)
+
+        accept = org_admin_client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/lines/{counted_line_id}/accept",
+            json={"reviewed_by_display_name": "Stocktake Admin"},
+        )
+        self.assertEqual(accept.status_code, 200)
+        self.assertEqual(accept.get_json()["review_status"], "ACCEPTED")
+
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before)
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, counted_resource_id), 50)
+
+        field_post = field_client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/post",
+            json={"posted_by_display_name": "Stocktake Field"},
+        )
+        self.assertEqual(field_post.status_code, 403)
+
+        post = org_admin_client.post(
+            f"/organisations/{organisation_id}/stocktake/{stocktake_id}/post",
+            json={"posted_by_display_name": "Stocktake Admin"},
+        )
+        self.assertEqual(post.status_code, 200)
+        self.assertEqual(post.get_json()["status"], "POSTED")
+        self.assertEqual(post.get_json()["adjustments_posted"], 1)
+        adjustment = post.get_json()["adjustment_transactions"][0]
+        self.assertEqual(adjustment["direction"], "OUT")
+        self.assertEqual(adjustment["quantity"], 5)
+        adjustment_transaction_id = adjustment["transaction_id"]
+
+        self.assertEqual(self._get_table_count("ledger_entries"), ledger_count_before + 1)
+        self.assertEqual(self._get_table_count("transactions"), transaction_count_before + 1)
+        self.assertEqual(self._get_transaction_ledger_count(adjustment_transaction_id), 1)
+        self.assertEqual(self._get_resource_balance(organisation_id, depot_id, counted_resource_id), 45)
+
+    def test_stocktake_cross_org_access_is_blocked_for_basic_user(self):
+        org_a = self.create_organisation("Stocktake Boundary Org A")
+        org_b = self.create_organisation("Stocktake Boundary Org B")
+        depot_b = self._create_depot(org_b, "Boundary Depot B")
+        category_b = self._create_category(org_b, "Boundary Cat B")
+        resource_b = self._create_resource(org_b, category_b, "Boundary Pallet B")
+        self._set_opening_balance(org_b, depot_b, resource_b, 25)
+
+        stocktake = self.client.post(
+            f"/organisations/{org_b}/stocktake",
+            json={"depot_id": depot_b, "initiated_by_display_name": "Boundary Admin"},
+        )
+        self.assertEqual(stocktake.status_code, 201)
+        stocktake_id = stocktake.get_json()["stocktake_id"]
+
+        user_id = self._create_user(org_a, "Stocktake Boundary User", role="USER")
+        user_client = self._client_for_user(user_id, "stocktake boundary key")
+
+        detail = user_client.get(f"/organisations/{org_b}/stocktake/{stocktake_id}")
+        self.assertEqual(detail.status_code, 403)
+        self.assertEqual(detail.get_json()["error"], "ORG_ACCESS_DENIED")
+
     def test_stock_position_org_and_depot(self):
         organisation_id = self.create_organisation("Stock Position Org")
         depot_id = self._create_depot(organisation_id, "Stock Depot")
