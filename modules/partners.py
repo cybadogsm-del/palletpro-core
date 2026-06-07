@@ -257,6 +257,10 @@ def register_partner_routes(app, record_shared_transaction_event):
 
     @app.post("/partners/<partner_id>/addresses")
     def create_partner_address(partner_id):
+        role_error = _require_org_admin_role("create partner addresses")
+        if role_error:
+            return role_error
+
         body = request.get_json(silent=True) or {}
         organisation_id = body.get("organisation_id")
         label = (body.get("label") or "").strip()
@@ -335,6 +339,10 @@ def register_partner_routes(app, record_shared_transaction_event):
         if not partner:
             conn.close()
             return jsonify({"error": "Partner not found"}), 404
+        access_error = _require_partner_org_access(partner)
+        if access_error:
+            conn.close()
+            return access_error
 
         if is_primary:
             conn.execute(
@@ -457,6 +465,10 @@ def register_partner_routes(app, record_shared_transaction_event):
 
     @app.get("/partners/<partner_id>/addresses")
     def list_partner_addresses(partner_id):
+        role_error = _require_org_admin_role("list partner addresses")
+        if role_error:
+            return role_error
+
         conn = get_conn()
         ensure_partner_address_tables(conn)
 
@@ -468,6 +480,10 @@ def register_partner_routes(app, record_shared_transaction_event):
         if not partner:
             conn.close()
             return jsonify({"error": "Partner not found"}), 404
+        access_error = _require_partner_org_access(partner)
+        if access_error:
+            conn.close()
+            return access_error
 
         rows = conn.execute(
             """
@@ -585,6 +601,10 @@ def register_partner_routes(app, record_shared_transaction_event):
 
     @app.patch("/partner-addresses/<partner_address_id>")
     def update_partner_address(partner_address_id):
+        role_error = _require_org_admin_role("update partner addresses")
+        if role_error:
+            return role_error
+
         body = request.get_json(silent=True) or {}
         organisation_id = body.get("organisation_id")
         updated_by_display_name = (body.get("updated_by_display_name") or "Unknown Admin").strip()
@@ -600,14 +620,24 @@ def register_partner_routes(app, record_shared_transaction_event):
             SELECT pa.*, p.name AS partner_name
             FROM partner_addresses pa
             LEFT JOIN partners p ON p.partner_id = pa.partner_id
-            WHERE pa.partner_address_id = ? AND pa.organisation_id = ?
+            WHERE pa.partner_address_id = ?
             """,
-            (partner_address_id, organisation_id)
+            (partner_address_id,)
         ).fetchone()
 
         if not addr:
             conn.close()
             return jsonify({"error": "Partner address not found"}), 404
+        access_error = _require_partner_org_access(addr)
+        if access_error:
+            conn.close()
+            return access_error
+        if addr["organisation_id"] != organisation_id:
+            conn.close()
+            return jsonify({
+                "error": "ORG_ACCESS_DENIED",
+                "message": "You do not have access to manage this partner address.",
+            }), 403
 
         allowed_categories = {
             "HEAD_OFFICE",
@@ -751,6 +781,10 @@ def register_partner_routes(app, record_shared_transaction_event):
 
     @app.post("/partner-addresses/<partner_address_id>/deactivate")
     def deactivate_partner_address(partner_address_id):
+        role_error = _require_org_admin_role("deactivate partner addresses")
+        if role_error:
+            return role_error
+
         body = request.get_json(silent=True) or {}
         organisation_id = body.get("organisation_id")
         deactivated_by_display_name = (body.get("deactivated_by_display_name") or "Unknown Admin").strip()
@@ -766,14 +800,24 @@ def register_partner_routes(app, record_shared_transaction_event):
             SELECT pa.*, p.name AS partner_name
             FROM partner_addresses pa
             LEFT JOIN partners p ON p.partner_id = pa.partner_id
-            WHERE pa.partner_address_id = ? AND pa.organisation_id = ?
+            WHERE pa.partner_address_id = ?
             """,
-            (partner_address_id, organisation_id)
+            (partner_address_id,)
         ).fetchone()
 
         if not addr:
             conn.close()
             return jsonify({"error": "Partner address not found"}), 404
+        access_error = _require_partner_org_access(addr)
+        if access_error:
+            conn.close()
+            return access_error
+        if addr["organisation_id"] != organisation_id:
+            conn.close()
+            return jsonify({
+                "error": "ORG_ACCESS_DENIED",
+                "message": "You do not have access to manage this partner address.",
+            }), 403
 
         conn.execute(
             """

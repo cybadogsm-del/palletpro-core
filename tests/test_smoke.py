@@ -1019,6 +1019,281 @@ class PalletProSmokeTests(unittest.TestCase):
         )
         self.assertEqual(cross_deactivate.status_code, 403)
 
+    def test_partner_address_management_requires_org_admin_and_preserves_org_boundary(self):
+        org_a = self.create_organisation("Partner Address Mgmt A")
+        org_b = self.create_organisation("Partner Address Mgmt B")
+        org_admin_id = self._create_user(org_a, "Partner Address Admin", role="ORG_ADMIN")
+        field_user_id = self._create_user(org_a, "Partner Address Field", role="USER")
+        org_admin_client = self._client_for_user(org_admin_id, "paddr admin key")
+        field_client = self._client_for_user(field_user_id, "paddr field key")
+        cross_org_field_id = self._create_user(org_b, "Cross Org Field", role="USER")
+        cross_org_field_client = self._client_for_user(cross_org_field_id, "cross org field key")
+
+        partner = org_admin_client.post("/partners", json={
+            "organisation_id": org_a,
+            "name": "Preferred Supplier",
+            "is_supplier": True,
+        })
+        self.assertEqual(partner.status_code, 201)
+        partner_id = partner.get_json()["partner_id"]
+
+        mutation_counts_before = {
+            "transactions": self._get_table_count("transactions"),
+            "ledger_entries": self._get_table_count("ledger_entries"),
+            "balance_projection": self._get_table_count("balance_projection"),
+            "resource_losses": self._get_table_count("resource_losses"),
+            "organisation_subscriptions": self._get_table_count("organisation_subscriptions"),
+            "billing_export_runs": self._get_table_count("billing_export_runs"),
+        }
+
+        field_create = field_client.post(f"/partners/{partner_id}/addresses", json={
+            "organisation_id": org_a,
+            "label": "Field Site",
+            "category": "WORK_SITE",
+        })
+        self.assertEqual(field_create.status_code, 403)
+
+        own_list = field_client.get(f"/partners/{partner_id}/addresses")
+        self.assertEqual(own_list.status_code, 403)
+
+        partner_address = org_admin_client.post(f"/partners/{partner_id}/addresses", json={
+            "organisation_id": org_a,
+            "label": "Admin Site",
+            "category": "WAREHOUSE",
+            "address_line_1": "10 Admin Road",
+            "state": "VIC",
+            "is_primary": True,
+            "is_default_dispatch_site": True,
+            "is_default_receiving_site": True,
+            "entry_heading": 180,
+            "gate_number": "7",
+            "door_number": "2",
+        })
+        self.assertEqual(partner_address.status_code, 201)
+        partner_address_payload = partner_address.get_json()
+        partner_address_id = partner_address_payload["partner_address_id"]
+        self._assert_no_sensitive_keys(partner_address_payload)
+
+        # Cross-org basic user is also blocked
+        cross_org_field_list = cross_org_field_client.get(f"/partners/{partner_id}/addresses")
+        self.assertEqual(cross_org_field_list.status_code, 403)
+
+        org_admin_list = org_admin_client.get(f"/partners/{partner_id}/addresses")
+        self.assertEqual(org_admin_list.status_code, 200)
+        list_payload = org_admin_list.get_json()
+        self.assertEqual(list_payload["partner_id"], partner_id)
+        self.assertEqual(list_payload["count"], 1)
+        self._assert_no_sensitive_keys(list_payload)
+
+        update = org_admin_client.patch(f"/partner-addresses/{partner_address_id}", json={
+            "organisation_id": org_a,
+            "label": "Updated Admin Site",
+            "entry_instructions": "Use back gate",
+        })
+        self.assertEqual(update.status_code, 200)
+        self.assertEqual(update.get_json()["label"], "Updated Admin Site")
+        self._assert_no_sensitive_keys(update.get_json())
+
+        field_update = field_client.patch(f"/partner-addresses/{partner_address_id}", json={
+            "organisation_id": org_a,
+            "label": "Should Never Happen",
+        })
+        self.assertEqual(field_update.status_code, 403)
+
+        deactivate = org_admin_client.post(f"/partner-addresses/{partner_address_id}/deactivate", json={
+            "organisation_id": org_a,
+            "deactivated_by_display_name": "Partner Address Admin",
+        })
+        self.assertEqual(deactivate.status_code, 200)
+        self.assertFalse(deactivate.get_json()["is_active"])
+        self._assert_no_sensitive_keys(deactivate.get_json())
+
+        field_deactivate = field_client.post(f"/partner-addresses/{partner_address_id}/deactivate", json={
+            "organisation_id": org_a,
+            "deactivated_by_display_name": "Partner Address Field",
+        })
+        self.assertEqual(field_deactivate.status_code, 403)
+
+        mutation_counts_after = {
+            "transactions": self._get_table_count("transactions"),
+            "ledger_entries": self._get_table_count("ledger_entries"),
+            "balance_projection": self._get_table_count("balance_projection"),
+            "resource_losses": self._get_table_count("resource_losses"),
+            "organisation_subscriptions": self._get_table_count("organisation_subscriptions"),
+            "billing_export_runs": self._get_table_count("billing_export_runs"),
+        }
+        self.assertEqual(mutation_counts_before, mutation_counts_after)
+
+    def test_partner_address_org_admin_cannot_manage_other_orgs_and_field_basic_is_cross_org_blocked(self):
+        org_a = self.create_organisation("Partner Address Boundary A")
+        org_b = self.create_organisation("Partner Address Boundary B")
+        org_admin_a_id = self._create_user(org_a, "Address Boundary Admin A", role="ORG_ADMIN")
+        org_admin_b_id = self._create_user(org_b, "Address Boundary Admin B", role="ORG_ADMIN")
+        field_a_id = self._create_user(org_a, "Address Boundary Field A", role="USER")
+
+        org_admin_a_client = self._client_for_user(org_admin_a_id, "address boundary admin a key")
+        org_admin_b_client = self._client_for_user(org_admin_b_id, "address boundary admin b key")
+        field_a_client = self._client_for_user(field_a_id, "address boundary field a key")
+
+        partner_b = org_admin_b_client.post("/partners", json={
+            "organisation_id": org_b,
+            "name": "Boundary Partner",
+            "is_customer": True,
+        })
+        self.assertEqual(partner_b.status_code, 201)
+        partner_b_id = partner_b.get_json()["partner_id"]
+
+        partner_b_address = org_admin_b_client.post(f"/partners/{partner_b_id}/addresses", json={
+            "organisation_id": org_b,
+            "label": "Boundary Address",
+            "category": "WORK_SITE",
+            "address_line_1": "99 Boundary Road",
+        })
+        self.assertEqual(partner_b_address.status_code, 201)
+        partner_b_address_id = partner_b_address.get_json()["partner_address_id"]
+
+        cross_admin_list = org_admin_a_client.get(f"/partners/{partner_b_id}/addresses")
+        self.assertEqual(cross_admin_list.status_code, 403)
+
+        cross_admin_create = org_admin_a_client.post(f"/partners/{partner_b_id}/addresses", json={
+            "organisation_id": org_b,
+            "label": "Cross Admin Add",
+            "category": "WORK_SITE",
+            "address_line_1": "1 Foreign Road",
+        })
+        self.assertEqual(cross_admin_create.status_code, 403)
+
+        cross_admin_update = org_admin_a_client.patch(f"/partner-addresses/{partner_b_address_id}", json={
+            "organisation_id": org_b,
+            "label": "Cross Admin Update",
+        })
+        self.assertEqual(cross_admin_update.status_code, 403)
+
+        cross_admin_deactivate = org_admin_a_client.post(
+            f"/partner-addresses/{partner_b_address_id}/deactivate",
+            json={"organisation_id": org_b, "deactivated_by_display_name": "Address Boundary Admin A"},
+        )
+        self.assertEqual(cross_admin_deactivate.status_code, 403)
+
+        cross_field_list = field_a_client.get(f"/partners/{partner_b_id}/addresses")
+        self.assertEqual(cross_field_list.status_code, 403)
+
+        cross_field_create = field_a_client.post(f"/partners/{partner_b_id}/addresses", json={
+            "organisation_id": org_b,
+            "label": "Cross Field Add",
+            "category": "WORK_SITE",
+            "address_line_1": "1 Foreign Road",
+        })
+        self.assertEqual(cross_field_create.status_code, 403)
+
+        cross_field_update = field_a_client.patch(f"/partner-addresses/{partner_b_address_id}", json={
+            "organisation_id": org_b,
+            "label": "Cross Field Update",
+        })
+        self.assertEqual(cross_field_update.status_code, 403)
+
+        cross_field_deactivate = field_a_client.post(
+            f"/partner-addresses/{partner_b_address_id}/deactivate",
+            json={"organisation_id": org_b, "deactivated_by_display_name": "Address Boundary Field A"},
+        )
+        self.assertEqual(cross_field_deactivate.status_code, 403)
+
+    def test_inactive_partner_addresses_are_filtered_out_of_morning_sync_and_defaults(self):
+        organisation_id = self.create_organisation("Partner Address Defaults Org")
+        category_id = self._create_category(organisation_id, "Route Default Cat")
+        resource_id = self._create_resource(organisation_id, category_id, "Route Default Pallet")
+        depot_id = self._create_depot(organisation_id, "Route Default Depot")
+        self._set_opening_balance(organisation_id, depot_id, resource_id, 50)
+
+        org_admin_id = self._create_user(organisation_id, "Address Default Admin", role="ORG_ADMIN")
+        field_user_id = self._create_user(organisation_id, "Address Default Field", role="USER")
+
+        org_admin_client = self._client_for_user(org_admin_id, "address defaults admin key")
+        field_client = self._client_for_user(field_user_id, "address defaults field key")
+
+        partner = org_admin_client.post("/partners", json={
+            "organisation_id": organisation_id,
+            "name": "Default Partner",
+            "is_customer": True,
+        })
+        self.assertEqual(partner.status_code, 201)
+        partner_id = partner.get_json()["partner_id"]
+
+        address = org_admin_client.post(f"/partners/{partner_id}/addresses", json={
+            "organisation_id": organisation_id,
+            "label": "Primary Dispatch",
+            "category": "WORK_SITE",
+            "address_line_1": "123 Route Road",
+            "state": "VIC",
+            "is_primary": True,
+            "is_default_dispatch_site": True,
+        })
+        self.assertEqual(address.status_code, 201)
+        address_id = address.get_json()["partner_address_id"]
+
+        transaction = field_client.post("/transactions", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "transaction_type": "Movement",
+            "resource_id": resource_id,
+            "quantity": 4,
+            "direction": "OUT",
+            "partner_id": partner_id,
+            "partner_address_id": address_id,
+            "submitted_by_user_id": field_user_id,
+            "submitted_by_display_name": "Address Default Field",
+        })
+        self.assertEqual(transaction.status_code, 201)
+        transaction_id = transaction.get_json()["transaction_id"]
+        posted = field_client.post(f"/transactions/{transaction_id}/post")
+        self.assertEqual(posted.status_code, 200)
+
+        sync_before = field_client.get(f"/users/{field_user_id}/morning-sync")
+        self.assertEqual(sync_before.status_code, 200)
+        sync_before_payload = sync_before.get_json()
+        self.assertTrue(any(
+            route["partner_address_id"] == address_id
+            for route in sync_before_payload["predicted_route_pool"]
+        ))
+
+        deactivate = org_admin_client.post(f"/partner-addresses/{address_id}/deactivate", json={
+            "organisation_id": organisation_id,
+            "deactivated_by_display_name": "Address Default Admin",
+        })
+        self.assertEqual(deactivate.status_code, 200)
+
+        sync_after = field_client.get(f"/users/{field_user_id}/morning-sync")
+        self.assertEqual(sync_after.status_code, 200)
+        self.assertEqual(sync_after.get_json()["route_pool_count"], 0)
+
+        defaulted_txn = field_client.post("/transactions", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "transaction_type": "Movement",
+            "resource_id": resource_id,
+            "quantity": 2,
+            "direction": "OUT",
+            "partner_id": partner_id,
+            "submitted_by_user_id": field_user_id,
+            "submitted_by_display_name": "Address Default Field",
+        })
+        self.assertEqual(defaulted_txn.status_code, 201)
+        self.assertIsNone(defaulted_txn.get_json()["partner_address_id"])
+
+        explicit_inactive = field_client.post("/transactions", json={
+            "organisation_id": organisation_id,
+            "depot_id": depot_id,
+            "transaction_type": "Movement",
+            "resource_id": resource_id,
+            "quantity": 2,
+            "direction": "OUT",
+            "partner_id": partner_id,
+            "partner_address_id": address_id,
+            "submitted_by_user_id": field_user_id,
+            "submitted_by_display_name": "Address Default Field",
+        })
+        self.assertEqual(explicit_inactive.status_code, 404)
+
     def test_resource_management_requires_org_admin_and_does_not_mutate_ledger(self):
         org_a = self.create_organisation("Resource Mgmt A")
         org_b = self.create_organisation("Resource Mgmt B")
