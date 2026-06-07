@@ -354,7 +354,15 @@ class BrickSmokeTests(unittest.TestCase):
         ).fetchone()
 
         first_posted = self.core.post_transaction_to_ledger(conn, txn)
+        after_first = conn.execute(
+            "SELECT status, posted_at FROM transactions WHERE transaction_id = ?",
+            (transaction_id,),
+        ).fetchone()
         second_posted = self.core.post_transaction_to_ledger(conn, txn)
+        after_second = conn.execute(
+            "SELECT status, posted_at FROM transactions WHERE transaction_id = ?",
+            (transaction_id,),
+        ).fetchone()
 
         ledger_count = conn.execute(
             "SELECT COUNT(*) AS count FROM ledger_entries WHERE transaction_id = ?",
@@ -368,14 +376,83 @@ class BrickSmokeTests(unittest.TestCase):
             """,
             (org_id, depot_id, resource_id),
         ).fetchone()
+        post_audit_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM audit_events
+            WHERE entity_type = 'Transaction'
+              AND entity_id = ?
+              AND action = 'POST'
+            """,
+            (transaction_id,),
+        ).fetchone()["count"]
 
         conn.rollback()
         conn.close()
 
         self.assertTrue(first_posted)
         self.assertFalse(second_posted)
+        self.assertEqual(after_first["status"], "POSTED")
+        self.assertIsNotNone(after_first["posted_at"])
+        self.assertEqual(after_second["status"], "POSTED")
+        self.assertEqual(after_second["posted_at"], after_first["posted_at"])
         self.assertEqual(ledger_count, 1)
         self.assertEqual(balance["current_quantity"], 5)
+        self.assertEqual(post_audit_count, 1)
+
+    def test_post_transaction_to_ledger_rejects_missing_transaction(self):
+        """Ledger posting never creates ledger or balance rows for missing transactions."""
+        org_id = self._create_org("Missing Ledger Org")
+        depot_id = self._create_depot(org_id, "Missing Depot")
+        category_id = self._create_category(org_id, "Missing Category")
+        resource_id = self._create_resource(org_id, category_id, "Missing Pallet")
+        missing_transaction_id = self.core.make_id("txn")
+        txn = {
+            "transaction_id": missing_transaction_id,
+            "organisation_id": org_id,
+            "depot_id": depot_id,
+            "resource_id": resource_id,
+            "quantity": 9,
+            "direction": "IN",
+        }
+
+        conn = self.core.get_conn()
+        ledger_count_before = conn.execute(
+            "SELECT COUNT(*) AS count FROM ledger_entries"
+        ).fetchone()["count"]
+        balance_count_before = conn.execute(
+            "SELECT COUNT(*) AS count FROM balance_projection"
+        ).fetchone()["count"]
+
+        with self.assertRaisesRegex(ValueError, "Transaction not found"):
+            self.core.post_transaction_to_ledger(conn, txn)
+
+        missing_ledger_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM ledger_entries WHERE transaction_id = ?",
+            (missing_transaction_id,),
+        ).fetchone()["count"]
+        missing_balance = conn.execute(
+            """
+            SELECT *
+            FROM balance_projection
+            WHERE organisation_id = ? AND depot_id = ? AND resource_id = ?
+            """,
+            (org_id, depot_id, resource_id),
+        ).fetchone()
+        ledger_count_after = conn.execute(
+            "SELECT COUNT(*) AS count FROM ledger_entries"
+        ).fetchone()["count"]
+        balance_count_after = conn.execute(
+            "SELECT COUNT(*) AS count FROM balance_projection"
+        ).fetchone()["count"]
+
+        conn.rollback()
+        conn.close()
+
+        self.assertEqual(missing_ledger_count, 0)
+        self.assertIsNone(missing_balance)
+        self.assertEqual(ledger_count_after, ledger_count_before)
+        self.assertEqual(balance_count_after, balance_count_before)
 
     def test_user_access_policy(self):
         """GET /users/<id>/access-policy returns a structured policy."""
