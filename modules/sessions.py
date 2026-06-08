@@ -36,6 +36,7 @@ from db import get_conn, make_id, now_iso
 from modules.subscription_access import ensure_subscription_guard_tables
 from modules.users import (
     build_user_access_policy,
+    build_safe_user_payload,
     ensure_user_access_tables,
     get_user_account,
     record_user_access_event,
@@ -460,7 +461,7 @@ def register_session_routes(app, is_rate_limited):
 
         return jsonify({
             "session": dict(session),
-            "user": dict(user),
+            "user": build_safe_user_payload(user),
             "access_policy": policy,
             "one_device_rule_applies": role in ONE_DEVICE_ROLES,
             "multi_device_allowed": role in MULTI_DEVICE_ALLOWED_ROLES,

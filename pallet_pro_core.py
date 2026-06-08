@@ -96,6 +96,8 @@ def _is_rate_limited() -> bool:
 ALLOWED_ORIGINS = {
     "http://localhost:3000",
     "http://localhost:5173",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
 }
 
 @app.after_request

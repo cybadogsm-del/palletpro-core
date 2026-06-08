@@ -37,6 +37,11 @@ class BrickSmokeTests(unittest.TestCase):
         cls.client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {_TEST_MASTER_KEY}"
         cls._email_counter = 0
 
+    def setUp(self):
+        if hasattr(self.core, "_rate_store"):
+            with self.core._rate_lock:
+                self.core._rate_store.clear()
+
     @classmethod
     def tearDownClass(cls):
         if os.path.exists(cls.db_path):
