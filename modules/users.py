@@ -294,6 +294,253 @@ def build_user_access_policy(conn, user_row):
     return base
 
 
+
+# ── Route registration helpers ───────────────────────────────────────────────
+
+def _build_user_create_payload(conn, body, *, forced_organisation_id=None, include_setup_token=False):
+    body = body or {}
+
+    organisation_id = body.get("organisation_id")
+    if forced_organisation_id is not None:
+        if organisation_id and organisation_id != forced_organisation_id:
+            return {
+                "error": "organisation_id must match route",
+                "organisation_id": organisation_id,
+                "expected_organisation_id": forced_organisation_id,
+            }, 400
+        organisation_id = forced_organisation_id
+
+    display_name = (body.get("display_name") or "").strip()
+    email = (body.get("email") or "").strip() or None
+    mobile_number = (body.get("mobile_number") or "").strip() or None
+    role = (body.get("role") or "").strip().upper()
+    access_status = (body.get("access_status") or "ACTIVE").strip().upper()
+    temporary_user_access_id = body.get("temporary_user_access_id")
+    created_by_display_name = (body.get("created_by_display_name") or "Global Admin").strip()
+    confirmation_text = (body.get("confirmation_text") or "").strip()
+    access_method = (body.get("access_method") or "").strip().upper()
+    manual_setup = not access_method
+    if manual_setup:
+        access_method = "MANUAL"
+    default_depot_id = body.get("default_depot_id") or None
+
+    _VALID_ACCESS_METHODS = {"MOBILE", "TABLET", "DESKTOP", "BOTH"}
+
+    required_confirmation = "CREATE USER"
+
+    if confirmation_text != required_confirmation:
+        return {
+            "error": "Confirmation text is required before creating a user",
+            "required_confirmation_text": required_confirmation,
+            "received_confirmation_text": confirmation_text,
+        }, 400
+
+    if not display_name:
+        return {"error": "display_name is required"}, 400
+
+    if role not in USER_ROLES:
+        return {"error": "Invalid role", "allowed_roles": sorted(USER_ROLES)}, 400
+
+    # ── Access method validation ──────────────────────────────────────────
+    if not manual_setup and access_method not in _VALID_ACCESS_METHODS:
+        return {
+            "error": "access_method is required",
+            "allowed": sorted(_VALID_ACCESS_METHODS),
+            "hint": "MOBILE=phone/SMS, TABLET=wifi tablet/email, DESKTOP=email (admin only), BOTH=phone+email",
+        }, 400
+
+    if access_method in ("MOBILE", "BOTH") and not mobile_number:
+        return {"error": "mobile_number is required for MOBILE or BOTH access"}, 400
+
+    if access_method in ("TABLET", "DESKTOP", "BOTH") and not email:
+        return {"error": "email is required for TABLET, DESKTOP, or BOTH access"}, 400
+
+    if access_method == "DESKTOP" and role not in ("GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN", "ORG_ADMIN"):
+        return {
+            "error": "DESKTOP_ADMIN_ONLY",
+            "message": "Desktop-only access is reserved for ORG_ADMIN or Global Admin roles. "
+                       "Field users need a mobile or tablet to use Pallet Pro.",
+        }, 400
+
+    if access_status not in USER_ACCESS_STATUSES:
+        return {"error": "Invalid access_status", "allowed_statuses": sorted(USER_ACCESS_STATUSES)}, 400
+
+    if role in ("ORG_ADMIN", "USER", "TEMPORARY_USER") and not organisation_id:
+        return {"error": "organisation_id is required for organisation-scoped users"}, 400
+
+    if role == "TEMPORARY_USER" and not temporary_user_access_id:
+        return {"error": "temporary_user_access_id is required for TEMPORARY_USER"}, 400
+
+    if organisation_id:
+        org = conn.execute(
+            "SELECT * FROM organisations WHERE organisation_id = ?",
+            (organisation_id,)
+        ).fetchone()
+
+        if not org:
+            return {"error": "Organisation not found"}, 404
+
+        if role in ("ORG_ADMIN", "USER"):
+            sub = conn.execute(
+                "SELECT selected_user_count FROM organisation_subscriptions WHERE organisation_id = ?",
+                (organisation_id,)
+            ).fetchone()
+            cap = sub["selected_user_count"] if sub and sub["selected_user_count"] is not None else None
+            if cap is not None:
+                active_count = count_active_permanent_users(conn, organisation_id)
+                if active_count >= cap:
+                    can_self_serve = cap < ORG_SELF_SERVE_USER_LIMIT
+                    return {
+                        "error": "USER_CAP_REACHED",
+                        "dialog": {
+                            "title": "User limit reached",
+                            "message": (
+                                f"This organisation has {active_count} active user{'s' if active_count != 1 else ''} "
+                                f"and is currently set to a limit of {cap}. "
+                                + (
+                                    f"You can increase your user count up to {ORG_SELF_SERVE_USER_LIMIT} from your subscription page."
+                                    if can_self_serve else
+                                    "Your plan has a custom user limit set by Pallet Pro. Please contact Pallet Pro to increase it."
+                                )
+                            ),
+                            "primary_action": {
+                                "label": "Go to Subscription",
+                                "route": f"/organisations/{organisation_id}/subscription-dashboard",
+                                "action_type": "NAVIGATE",
+                            },
+                        },
+                        "current_active_users": active_count,
+                        "selected_user_count": cap,
+                        "self_serve_limit": ORG_SELF_SERVE_USER_LIMIT,
+                        "can_self_serve_increase": can_self_serve,
+                    }, 403
+
+    if temporary_user_access_id:
+        temp = conn.execute(
+            """
+            SELECT *
+            FROM temporary_user_access
+            WHERE temporary_user_access_id = ?
+              AND organisation_id = ?
+            """,
+            (temporary_user_access_id, organisation_id)
+        ).fetchone()
+
+        if not temp:
+            return {"error": "Temporary user access record not found for this organisation"}, 404
+
+    from modules.password_auth import ensure_password_auth_columns, generate_setup_token
+    ensure_password_auth_columns(conn)
+
+    user_id = make_id("usr")
+    ts = now_iso()
+
+    conn.execute(
+        """
+        INSERT INTO user_accounts (
+            user_id,
+            organisation_id,
+            display_name,
+            email,
+            mobile_number,
+            role,
+            access_status,
+            temporary_user_access_id,
+            created_by_display_name,
+            default_depot_id,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            organisation_id,
+            display_name,
+            email,
+            mobile_number,
+            role,
+            access_status,
+            temporary_user_access_id,
+            created_by_display_name,
+            default_depot_id,
+            ts,
+            ts,
+        )
+    )
+
+    setup_token = generate_setup_token(conn, user_id)
+
+    record_user_access_event(
+        conn,
+        user_id=user_id,
+        organisation_id=organisation_id,
+        action="CREATE_USER",
+        summary=f"User {display_name} created with role {role}.",
+        changed_by_display_name=created_by_display_name,
+    )
+
+    audit_event(
+        conn,
+        entity_type="UserAccount",
+        entity_id=user_id,
+        action="CREATE",
+        summary=f"User account created with role {role}.",
+        organisation_id=organisation_id,
+    )
+
+    conn.commit()
+
+    user = get_user_account(conn, user_id)
+    policy = build_user_access_policy(conn, user)
+
+    # ── Invite delivery ───────────────────────────────────────────────────
+    # SMS for MOBILE / BOTH; email for TABLET / DESKTOP / BOTH.
+    sms_sent = False
+    email_sent = False
+
+    if access_method in ("MOBILE", "BOTH") and mobile_number:
+        from modules.sms import send_invite_sms
+        sms_sent = send_invite_sms(
+            to=mobile_number,
+            setup_token=setup_token,
+            invited_by=created_by_display_name,
+        )
+
+    if access_method in ("TABLET", "DESKTOP", "BOTH") and email:
+        from modules.email import send_invite_email
+        email_sent = send_invite_email(
+            to=email,
+            setup_token=setup_token,
+            display_name=display_name,
+            invited_by=created_by_display_name,
+        )
+
+    delivery_parts = []
+    if sms_sent:
+        delivery_parts.append("SMS sent to mobile")
+    if email_sent:
+        delivery_parts.append("email sent")
+    delivery_note = (
+        " and ".join(delivery_parts).capitalize() + "."
+        if delivery_parts else
+        "No invite sent (credentials not configured). Share this setup token securely — "
+        "user must call POST /auth/set-password. Expires in 7 days."
+    )
+
+    response = {
+        "user": build_safe_user_payload(user),
+        "access_policy": policy,
+        "setup_token_note": delivery_note,
+        "sms_sent": sms_sent,
+        "email_sent": email_sent,
+        "rule": "User access is role-based and organisation-aware.",
+    }
+    if include_setup_token:
+        response["setup_token"] = setup_token
+
+    return response, 201
+
+
 # ── Route registration ─────────────────────────────────────────────────────────
 
 def register_user_routes(app):
@@ -302,244 +549,45 @@ def register_user_routes(app):
     def create_user_account():
         body = request.get_json(silent=True) or {}
 
-        organisation_id = body.get("organisation_id")
-        display_name = (body.get("display_name") or "").strip()
-        email = (body.get("email") or "").strip() or None
-        mobile_number = (body.get("mobile_number") or "").strip() or None
-        role = (body.get("role") or "").strip().upper()
-        access_status = (body.get("access_status") or "ACTIVE").strip().upper()
-        temporary_user_access_id = body.get("temporary_user_access_id")
-        created_by_display_name = (body.get("created_by_display_name") or "Global Admin").strip()
-        confirmation_text = (body.get("confirmation_text") or "").strip()
-        access_method = (body.get("access_method") or "").strip().upper()
-        manual_setup = not access_method
-        if manual_setup:
-            access_method = "MANUAL"
-        default_depot_id = body.get("default_depot_id") or None
+        conn = get_conn()
+        ensure_user_access_tables(conn)
+        ensure_subscription_guard_tables(conn)
+        ensure_org_user_cap_column(conn)
 
-        _VALID_ACCESS_METHODS = {"MOBILE", "TABLET", "DESKTOP", "BOTH"}
+        payload, status = _build_user_create_payload(
+            conn,
+            body,
+            include_setup_token=True,
+        )
+        conn.close()
+        return jsonify(payload), status
 
-        required_confirmation = "CREATE USER"
 
-        if confirmation_text != required_confirmation:
+    @app.post("/organisations/<organisation_id>/users")
+    def create_organisation_user(organisation_id):
+        current_role = g.current_user.get("role")
+        if current_role not in ("ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"):
             return jsonify({
-                "error": "Confirmation text is required before creating a user",
-                "required_confirmation_text": required_confirmation,
-                "received_confirmation_text": confirmation_text,
-            }), 400
+                "error": "INSUFFICIENT_ROLE",
+                "message": "Creating users requires ORG_ADMIN role for organisation-scoped creation.",
+                "your_role": current_role,
+            }), 403
 
-        if not display_name:
-            return jsonify({"error": "display_name is required"}), 400
-
-        if role not in USER_ROLES:
-            return jsonify({"error": "Invalid role", "allowed_roles": sorted(USER_ROLES)}), 400
-
-        # ── Access method validation ──────────────────────────────────────────
-        if not manual_setup and access_method not in _VALID_ACCESS_METHODS:
-            return jsonify({
-                "error": "access_method is required",
-                "allowed": sorted(_VALID_ACCESS_METHODS),
-                "hint": "MOBILE=phone/SMS, TABLET=wifi tablet/email, DESKTOP=email (admin only), BOTH=phone+email",
-            }), 400
-
-        if access_method in ("MOBILE", "BOTH") and not mobile_number:
-            return jsonify({"error": "mobile_number is required for MOBILE or BOTH access"}), 400
-
-        if access_method in ("TABLET", "DESKTOP", "BOTH") and not email:
-            return jsonify({"error": "email is required for TABLET, DESKTOP, or BOTH access"}), 400
-
-        if access_method == "DESKTOP" and role not in ("GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN", "ORG_ADMIN"):
-            return jsonify({
-                "error": "DESKTOP_ADMIN_ONLY",
-                "message": "Desktop-only access is reserved for ORG_ADMIN or Global Admin roles. "
-                           "Field users need a mobile or tablet to use Pallet Pro.",
-            }), 400
-
-        if access_status not in USER_ACCESS_STATUSES:
-            return jsonify({"error": "Invalid access_status", "allowed_statuses": sorted(USER_ACCESS_STATUSES)}), 400
-
-        if role in ("ORG_ADMIN", "USER", "TEMPORARY_USER") and not organisation_id:
-            return jsonify({"error": "organisation_id is required for organisation-scoped users"}), 400
-
-        if role == "TEMPORARY_USER" and not temporary_user_access_id:
-            return jsonify({"error": "temporary_user_access_id is required for TEMPORARY_USER"}), 400
+        body = request.get_json(silent=True) or {}
 
         conn = get_conn()
         ensure_user_access_tables(conn)
         ensure_subscription_guard_tables(conn)
         ensure_org_user_cap_column(conn)
 
-        if organisation_id:
-            org = conn.execute(
-                "SELECT * FROM organisations WHERE organisation_id = ?",
-                (organisation_id,)
-            ).fetchone()
-
-            if not org:
-                conn.close()
-                return jsonify({"error": "Organisation not found"}), 404
-
-            if role in ("ORG_ADMIN", "USER"):
-                sub = conn.execute(
-                    "SELECT selected_user_count FROM organisation_subscriptions WHERE organisation_id = ?",
-                    (organisation_id,)
-                ).fetchone()
-                cap = sub["selected_user_count"] if sub and sub["selected_user_count"] is not None else None
-                if cap is not None:
-                    active_count = count_active_permanent_users(conn, organisation_id)
-                    if active_count >= cap:
-                        conn.close()
-                        can_self_serve = cap < ORG_SELF_SERVE_USER_LIMIT
-                        return jsonify({
-                            "error": "USER_CAP_REACHED",
-                            "dialog": {
-                                "title": "User limit reached",
-                                "message": (
-                                    f"This organisation has {active_count} active user{'s' if active_count != 1 else ''} "
-                                    f"and is currently set to a limit of {cap}. "
-                                    + (
-                                        f"You can increase your user count up to {ORG_SELF_SERVE_USER_LIMIT} from your subscription page."
-                                        if can_self_serve else
-                                        "Your plan has a custom user limit set by Pallet Pro. Please contact Pallet Pro to increase it."
-                                    )
-                                ),
-                                "primary_action": {
-                                    "label": "Go to Subscription",
-                                    "route": f"/organisations/{organisation_id}/subscription-dashboard",
-                                    "action_type": "NAVIGATE",
-                                },
-                            },
-                            "current_active_users": active_count,
-                            "selected_user_count": cap,
-                            "self_serve_limit": ORG_SELF_SERVE_USER_LIMIT,
-                            "can_self_serve_increase": can_self_serve,
-                        }), 403
-
-        if temporary_user_access_id:
-            temp = conn.execute(
-                """
-                SELECT *
-                FROM temporary_user_access
-                WHERE temporary_user_access_id = ?
-                  AND organisation_id = ?
-                """,
-                (temporary_user_access_id, organisation_id)
-            ).fetchone()
-
-            if not temp:
-                conn.close()
-                return jsonify({"error": "Temporary user access record not found for this organisation"}), 404
-
-        from modules.password_auth import ensure_password_auth_columns, generate_setup_token
-        ensure_password_auth_columns(conn)
-
-        user_id = make_id("usr")
-        ts = now_iso()
-
-        conn.execute(
-            """
-            INSERT INTO user_accounts (
-                user_id,
-                organisation_id,
-                display_name,
-                email,
-                mobile_number,
-                role,
-                access_status,
-                temporary_user_access_id,
-                created_by_display_name,
-                default_depot_id,
-                created_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                organisation_id,
-                display_name,
-                email,
-                mobile_number,
-                role,
-                access_status,
-                temporary_user_access_id,
-                created_by_display_name,
-                default_depot_id,
-                ts,
-                ts,
-            )
-        )
-
-        setup_token = generate_setup_token(conn, user_id)
-
-        record_user_access_event(
+        payload, status = _build_user_create_payload(
             conn,
-            user_id=user_id,
-            organisation_id=organisation_id,
-            action="CREATE_USER",
-            summary=f"User {display_name} created with role {role}.",
-            changed_by_display_name=created_by_display_name,
+            body,
+            forced_organisation_id=organisation_id,
+            include_setup_token=False,
         )
-
-        audit_event(
-            conn,
-            entity_type="UserAccount",
-            entity_id=user_id,
-            action="CREATE",
-            summary=f"User account created with role {role}.",
-            organisation_id=organisation_id,
-        )
-
-        conn.commit()
-
-        user = get_user_account(conn, user_id)
-        policy = build_user_access_policy(conn, user)
-
         conn.close()
-
-        # ── Invite delivery ───────────────────────────────────────────────────
-        # SMS for MOBILE / BOTH; email for TABLET / DESKTOP / BOTH.
-        sms_sent = False
-        email_sent = False
-
-        if access_method in ("MOBILE", "BOTH") and mobile_number:
-            from modules.sms import send_invite_sms
-            sms_sent = send_invite_sms(
-                to=mobile_number,
-                setup_token=setup_token,
-                invited_by=created_by_display_name,
-            )
-
-        if access_method in ("TABLET", "DESKTOP", "BOTH") and email:
-            from modules.email import send_invite_email
-            email_sent = send_invite_email(
-                to=email,
-                setup_token=setup_token,
-                display_name=display_name,
-                invited_by=created_by_display_name,
-            )
-
-        delivery_parts = []
-        if sms_sent:
-            delivery_parts.append("SMS sent to mobile")
-        if email_sent:
-            delivery_parts.append("email sent")
-        delivery_note = (
-            " and ".join(delivery_parts).capitalize() + "."
-            if delivery_parts else
-            "No invite sent (credentials not configured). Share this setup token securely — "
-            "user must call POST /auth/set-password. Expires in 7 days."
-        )
-
-        return jsonify({
-            "user": dict(user),
-            "access_policy": policy,
-            "setup_token": setup_token,
-            "setup_token_note": delivery_note,
-            "sms_sent": sms_sent,
-            "email_sent": email_sent,
-            "rule": "User access is role-based and organisation-aware.",
-        }), 201
-
+        return jsonify(payload), status
 
     @app.get("/organisations/<organisation_id>/users")
     def list_organisation_users(organisation_id):

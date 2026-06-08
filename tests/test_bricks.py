@@ -99,6 +99,33 @@ class BrickSmokeTests(unittest.TestCase):
         client.environ_base["HTTP_AUTHORIZATION"] = f"Bearer {session_id}"
         return client, payload["user"]["user_id"]
 
+    def _create_login_user(self, role="USER", organisation_id=None):
+        self.__class__._email_counter += 1
+        email = f"login-user-{self.__class__._email_counter}@example.test"
+        password = "Password123!"
+        access_method = "DESKTOP" if role in ("ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN") else "TABLET"
+
+        user_create = self.client.post("/global-admin/users", json={
+            "organisation_id": organisation_id,
+            "display_name": f"Login User {self.__class__._email_counter}",
+            "email": email,
+            "role": role,
+            "access_status": "ACTIVE",
+            "access_method": access_method,
+            "created_by_display_name": "Test",
+            "confirmation_text": "CREATE USER",
+        })
+        self.assertEqual(user_create.status_code, 201)
+        payload = user_create.get_json()
+
+        set_pw = self.client.post("/auth/set-password", json={
+            "setup_token": payload["setup_token"],
+            "password": password,
+        })
+        self.assertEqual(set_pw.status_code, 200)
+
+        return payload["user"], email, password
+
     def _create_depot(self, organisation_id, name):
         r = self.client.post("/depots", json={"organisation_id": organisation_id, "name": name})
         self.assertEqual(r.status_code, 201)
@@ -224,6 +251,61 @@ class BrickSmokeTests(unittest.TestCase):
         other_org_id = self._create_org("Org Admin Other Org")
         client, _ = self._create_login_client("ORG_ADMIN", own_org_id)
         r = client.get(f"/organisations/{other_org_id}/users")
+        self.assertEqual(r.status_code, 403)
+
+    def test_org_admin_can_invite_user_to_own_org(self):
+        """ORG_ADMIN can create a new user in their own organisation."""
+        org_id = self._create_org("Org Admin Invite Own Org")
+        client, _ = self._create_login_client("ORG_ADMIN", org_id)
+
+        r = client.post(f"/organisations/{org_id}/users", json={
+            "display_name": "Invite Field User",
+            "role": "USER",
+            "access_status": "ACTIVE",
+            "access_method": "MOBILE",
+            "mobile_number": "0400000004",
+            "created_by_display_name": "Org Admin",
+            "confirmation_text": "CREATE USER",
+        })
+        self.assertEqual(r.status_code, 201)
+
+        payload = r.get_json()
+        self.assertIn("user", payload)
+        self.assertIn("user_id", payload["user"])
+        self.assertEqual(payload["user"]["organisation_id"], org_id)
+        self.assertNotIn("setup_token", payload)
+
+    def test_org_admin_cannot_invite_user_to_other_org(self):
+        """ORG_ADMIN cannot create users outside their own organisation."""
+        own_org_id = self._create_org("Org Admin Invite Own Org 2")
+        other_org_id = self._create_org("Org Admin Invite Other Org")
+        client, _ = self._create_login_client("ORG_ADMIN", own_org_id)
+
+        r = client.post(f"/organisations/{other_org_id}/users", json={
+            "display_name": "Blocked User",
+            "role": "USER",
+            "access_status": "ACTIVE",
+            "access_method": "MOBILE",
+            "mobile_number": "0400000005",
+            "created_by_display_name": "Org Admin",
+            "confirmation_text": "CREATE USER",
+        })
+        self.assertEqual(r.status_code, 403)
+
+    def test_user_cannot_invite_user(self):
+        """Basic USER cannot create users."""
+        org_id = self._create_org("Field User Invite Block Org")
+        client, _ = self._create_login_client("USER", org_id)
+
+        r = client.post(f"/organisations/{org_id}/users", json={
+            "display_name": "Field Invite Attempt",
+            "role": "USER",
+            "access_status": "ACTIVE",
+            "access_method": "MOBILE",
+            "mobile_number": "0400000006",
+            "created_by_display_name": "Field User",
+            "confirmation_text": "CREATE USER",
+        })
         self.assertEqual(r.status_code, 403)
 
     def test_org_operational_insights_empty_org_is_clear(self):
@@ -522,6 +604,70 @@ class BrickSmokeTests(unittest.TestCase):
         payload = r.get_json()
         self.assertIn("expired_temporary_access_count", payload)
 
+    def test_sessions_login_options_includes_local_origin(self):
+        """OPTIONS /sessions/login returns Access-Control-Allow-Origin for local frontend."""
+        origin = "http://127.0.0.1:3001"
+        r = self.client.options("/sessions/login", headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "Content-Type, Authorization",
+        })
+        self.assertEqual(r.status_code, 204)
+        self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), origin)
+
+    def test_sessions_login_post_includes_local_origin(self):
+        """Successful login responses should not include password hashes or tokens."""
+        organisation_id = self._create_org("Login CORS & Safe Payload Org")
+        _, email, password = self._create_login_user(organisation_id=organisation_id)
+        origin = "http://127.0.0.1:3001"
+        r = self.client.post("/sessions/login", headers={"Origin": origin}, environ_overrides={
+            "REMOTE_ADDR": "127.0.0.2",
+        }, json={
+            "email": email,
+            "password": password,
+            "device_id": "test-device-cors-safe",
+            "device_label": "Local Browser",
+        })
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), origin)
+
+        payload = r.get_json()
+        user = payload["user"]
+        forbidden_fields = [
+            "password_hash",
+            "setup_token",
+            "password_reset_token",
+            "password_reset_expires_at",
+            "reset_token",
+            "credential_material",
+            "raw_auth_secret",
+            "webauthn_credential_id",
+            "webauthn_public_key",
+            "webauthn_counter",
+            "webauthn_device_type",
+            "raw_encrypted_secret",
+            "stripe_customer_id",
+            "stripe_subscription_id",
+            "billing_customer_id",
+            "internal_control_flag",
+            "admin_control_level",
+            "env",
+        ]
+        for key in forbidden_fields:
+            self.assertNotIn(key, user)
+
+        for key in [
+            "user_id",
+            "organisation_id",
+            "display_name",
+            "email",
+            "mobile_number",
+            "role",
+            "access_status",
+            "default_nav_app",
+            "default_depot_id",
+        ]:
+            self.assertIn(key, user)
     def test_login_integrity_dashboard(self):
         """GET /global-admin/login-integrity-dashboard returns dashboard shape."""
         r = self.client.get("/global-admin/login-integrity-dashboard")
