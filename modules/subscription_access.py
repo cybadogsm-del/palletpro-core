@@ -167,7 +167,7 @@ def ensure_subscription_guard_tables(conn):
             ("plan_single_operation", "Single truck/forklift operation", "SINGLE_OPERATION", 1, 1, None, 2050, 0, 10, "For single truck and/or forklift operations."),
             ("plan_self_service_users", "2 to 25 users", "SELF_SERVICE_PER_USER", 2, 25, 2950, None, 0, 20, "Operations with 2 to 25 users can self-service subscribe at $29.50 per user per month."),
             ("plan_tailored_26_plus", "26+ Tailored Package", "CUSTOM", 26, None, None, None, 1, 30, "For 26 or more users, contact Pallet Pro for a tailored package to suit your operation."),
-            ("plan_additional_org_admin", "Additional Org Admin", "ADDITIONAL_ORG_ADMIN_FEE", None, None, None, None, 1, 40, "One Org Admin is included. Additional active Org Admins are paid upgrades; price is set by Pallet Pro."),
+            ("plan_additional_org_admin", "Additional Org Admin", "ADDITIONAL_ORG_ADMIN_FEE", None, None, None, 625, 0, 40, "One Org Admin is included. Additional active Org Admins are $6.25/month each ex-GST to cover extra portal, reporting, search, and admin data usage."),
             ("plan_temp_user_access", "Temporary User Access Fee", "TEMPORARY_ACCESS_FEE", None, None, None, 2790, 0, 999, "Temporary users receive 28 days of access from the day after registration. Fee is charged on the organisation's next billing cycle."),
         ]
 
@@ -213,7 +213,7 @@ def ensure_subscription_guard_tables(conn):
         ("plan_single_operation", "Single truck/forklift operation", "SINGLE_OPERATION", 1, 1, None, 2050, 0, 10, "For single truck and/or forklift operations."),
         ("plan_self_service_users", "2 to 25 users", "SELF_SERVICE_PER_USER", 2, 25, 2950, None, 0, 20, "Operations with 2 to 25 users can self-service subscribe at $29.50 per user per month."),
         ("plan_tailored_26_plus", "26+ Tailored Package", "CUSTOM", 26, None, None, None, 1, 30, "For 26 or more users, contact Pallet Pro for a tailored package to suit your operation."),
-        ("plan_additional_org_admin", "Additional Org Admin", "ADDITIONAL_ORG_ADMIN_FEE", None, None, None, None, 1, 40, "One Org Admin is included. Additional active Org Admins are paid upgrades; price is set by Pallet Pro."),
+        ("plan_additional_org_admin", "Additional Org Admin", "ADDITIONAL_ORG_ADMIN_FEE", None, None, None, 625, 0, 40, "One Org Admin is included. Additional active Org Admins are $6.25/month each ex-GST to cover extra portal, reporting, search, and admin data usage."),
         ("plan_temp_user_access", "Temporary User Access Fee", "TEMPORARY_ACCESS_FEE", None, None, None, 2790, 0, 999, "Temporary users receive 28 days of access from the day after registration. Fee is charged on the organisation's next billing cycle."),
     ]
 
@@ -278,11 +278,29 @@ def ensure_subscription_guard_tables(conn):
             None,
             None,
             None,
-            None,
-            1,
+            625,
+            0,
             40,
-            "One Org Admin is included. Additional active Org Admins are paid upgrades; price is set by Pallet Pro.",
+            "One Org Admin is included. Additional active Org Admins are $6.25/month each ex-GST to cover extra portal, reporting, search, and admin data usage.",
             ts,
+            ts,
+        ),
+    )
+
+    conn.execute(
+        """
+        UPDATE pricing_plans
+        SET package_price_cents = ?,
+            requires_custom_pricing = ?,
+            notes = ?,
+            updated_at = ?
+        WHERE pricing_plan_id = 'plan_additional_org_admin'
+          AND (package_price_cents IS NULL OR package_price_cents = 0)
+        """,
+        (
+            625,
+            0,
+            "One Org Admin is included. Additional active Org Admins are $6.25/month each ex-GST to cover extra portal, reporting, search, and admin data usage.",
             ts,
         ),
     )

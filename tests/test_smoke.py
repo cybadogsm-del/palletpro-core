@@ -89,6 +89,7 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertIn("plan_self_service_users", plans_by_id)
         self.assertIn("plan_tailored_26_plus", plans_by_id)
         self.assertIn("plan_temp_user_access", plans_by_id)
+        self.assertIn("plan_additional_org_admin", plans_by_id)
         self.assertNotIn("plan_starter", plans_by_id)
         self.assertNotIn("plan_small", plans_by_id)
         self.assertNotIn("plan_medium", plans_by_id)
@@ -99,6 +100,8 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(plans_by_id["plan_self_service_users"]["max_permanent_users"], 25)
         self.assertEqual(plans_by_id["plan_tailored_26_plus"]["min_permanent_users"], 26)
         self.assertEqual(plans_by_id["plan_tailored_26_plus"]["requires_custom_pricing"], 1)
+        self.assertEqual(plans_by_id["plan_additional_org_admin"]["package_price_cents"], 625)
+        self.assertEqual(plans_by_id["plan_additional_org_admin"]["requires_custom_pricing"], 0)
         self.assertEqual(plans_by_id["plan_temp_user_access"]["package_price_cents"], 2790)
 
     def test_global_admin_pricing_dashboard_route_is_registered(self):
@@ -135,7 +138,9 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(billing["included_org_admin_count"], 1)
         self.assertEqual(billing["active_org_admin_count"], 2)
         self.assertEqual(billing["billable_additional_org_admin_count"], 1)
-        self.assertEqual(billing["billing_status"], "PRICE_NOT_SET")
+        self.assertEqual(billing["additional_org_admin_price_cents"], 625)
+        self.assertEqual(billing["additional_org_admin_subtotal_cents"], 625)
+        self.assertEqual(billing["billing_status"], "BILLABLE")
 
     def test_temporary_user_list_route_is_registered(self):
         organisation_id = self.create_organisation("Temporary User Org")
