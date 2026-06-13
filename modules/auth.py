@@ -15,6 +15,7 @@ _EXEMPT_PATHS = {
     "/pricing-table",
     "/pricing-philosophy",
     "/auth/bootstrap",
+    "/auth/login",
     "/sessions/login",
     "/auth/set-password",
     "/auth/setup-token-info",
