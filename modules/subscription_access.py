@@ -259,7 +259,7 @@ def ensure_subscription_guard_tables(conn):
             temporary_access_days = ?,
             updated_at = ?
         WHERE pricing_settings_id = 'pricing_settings_default'
-          AND temporary_user_access_fee_cents = 1000
+          AND temporary_user_access_fee_cents IN (1000, 1500)
           AND temporary_access_days = 28
         """,
         (2790, 28, ts),

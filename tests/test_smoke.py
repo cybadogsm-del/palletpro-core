@@ -81,6 +81,26 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertIn("items", payload)
         self.assertGreater(len(payload["items"]), 0)
 
+        self.assertEqual(payload["settings"]["temporary_user_access_fee_cents"], 2790)
+        self.assertEqual(payload["settings"]["temporary_access_days"], 28)
+
+        plans_by_id = {item["pricing_plan_id"]: item for item in payload["items"]}
+        self.assertIn("plan_single_operation", plans_by_id)
+        self.assertIn("plan_self_service_users", plans_by_id)
+        self.assertIn("plan_tailored_26_plus", plans_by_id)
+        self.assertIn("plan_temp_user_access", plans_by_id)
+        self.assertNotIn("plan_starter", plans_by_id)
+        self.assertNotIn("plan_small", plans_by_id)
+        self.assertNotIn("plan_medium", plans_by_id)
+        self.assertNotIn("plan_large", plans_by_id)
+
+        self.assertEqual(plans_by_id["plan_single_operation"]["package_price_cents"], 2050)
+        self.assertEqual(plans_by_id["plan_self_service_users"]["price_per_user_cents"], 2950)
+        self.assertEqual(plans_by_id["plan_self_service_users"]["max_permanent_users"], 25)
+        self.assertEqual(plans_by_id["plan_tailored_26_plus"]["min_permanent_users"], 26)
+        self.assertEqual(plans_by_id["plan_tailored_26_plus"]["requires_custom_pricing"], 1)
+        self.assertEqual(plans_by_id["plan_temp_user_access"]["package_price_cents"], 2790)
+
     def test_global_admin_pricing_dashboard_route_is_registered(self):
         response = self.client.get("/global-admin/pricing-dashboard")
 
