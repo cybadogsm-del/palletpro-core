@@ -826,6 +826,167 @@ def register_subscription_routes(app):
             ],
         }), 200
 
+    @app.get("/global-admin/organisations/<organisation_id>/org-admin-subscription-preview")
+    def get_sga_org_admin_subscription_preview(organisation_id):
+        """SUPER_GLOBAL_ADMIN preview of the Org Admin subscription dashboard."""
+        from flask import g
+
+        if g.current_user.get("role") != "SUPER_GLOBAL_ADMIN":
+            return jsonify({
+                "error": "INSUFFICIENT_ROLE",
+                "message": "Super Global Admin only.",
+            }), 403
+
+        conn = get_conn()
+        ensure_subscription_guard_tables(conn)
+        ensure_temporary_user_billing_columns(conn)
+        conn.commit()
+
+        org = conn.execute(
+            "SELECT * FROM organisations WHERE organisation_id = ?",
+            (organisation_id,),
+        ).fetchone()
+
+        if not org:
+            conn.close()
+            return jsonify({"error": "Organisation not found"}), 404
+
+        sub = get_or_create_subscription(conn, organisation_id)
+        access = get_org_access_status_payload(conn, organisation_id)
+        org_admin_billing = get_org_admin_billing_summary(conn, organisation_id)
+
+        settings = conn.execute(
+            "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+
+        temp_users = conn.execute(
+            """
+            SELECT *
+            FROM temporary_user_access
+            WHERE organisation_id = ?
+            ORDER BY created_at DESC
+            """,
+            (organisation_id,),
+        ).fetchall()
+
+        scheduled_jobs = conn.execute(
+            """
+            SELECT *
+            FROM data_retention_jobs
+            WHERE organisation_id = ?
+            ORDER BY scheduled_for ASC
+            """,
+            (organisation_id,),
+        ).fetchall()
+
+        unbilled_temp_fee_cents = 0
+        active_temp_user_count = 0
+
+        for row in temp_users:
+            if row["access_status"] == "ACTIVE":
+                active_temp_user_count += 1
+            if row["charged_on_next_billing_cycle"] == 1 and row["billed_at"] is None:
+                unbilled_temp_fee_cents += int(row["fee_cents"])
+
+        dashboard_actions = []
+
+        if access["access_state"] == "ACTIVE":
+            dashboard_actions.append({
+                "action_key": "unsubscribe",
+                "label": "Unsubscribe",
+                "route": f"/organisations/{organisation_id}/unsubscribe",
+                "method": "POST",
+                "requires_confirmation": True,
+                "confirmation_guidance": "Unsubscribing stops future billing and starts the 7-day operating data retention window.",
+            })
+
+        if access["exit_only_access_allowed"]:
+            dashboard_actions.extend([
+                {
+                    "action_key": "export_operating_data",
+                    "label": "Export operating data",
+                    "route": f"/organisations/{organisation_id}/operating-data-export",
+                    "method": "GET",
+                    "requires_confirmation": False,
+                },
+                {
+                    "action_key": "reactivate",
+                    "label": "Reactivate subscription",
+                    "route": f"/organisations/{organisation_id}/reactivate",
+                    "method": "POST",
+                    "requires_confirmation": True,
+                    "confirmation_guidance": "Reactivation is available during the 7-day retention window before operating data deletion.",
+                },
+            ])
+
+        viewer = g.current_user
+
+        audit_event(
+            conn,
+            entity_type="OrganisationSubscription",
+            entity_id=organisation_id,
+            action="SGA_PREVIEW_ORG_ADMIN_SUBSCRIPTION_DASHBOARD",
+            summary=f"Super Global Admin {viewer.get('display_name', 'Unknown')} previewed Org Admin subscription dashboard for {org['name']}.",
+            organisation_id=organisation_id,
+        )
+
+        conn.commit()
+
+        payload = {
+            "dashboard_type": "SGA_ORG_ADMIN_SUBSCRIPTION_PREVIEW",
+            "preview_mode": {
+                "enabled": True,
+                "viewer_role": viewer.get("role"),
+                "viewer_display_name": viewer.get("display_name"),
+                "previewing_as": "ORG_ADMIN",
+                "rule": "This is a read-only Super Global Admin preview of what an Org Admin will see.",
+            },
+            "org_admin_dashboard": {
+                "dashboard_type": "ORG_ADMIN_SUBSCRIPTION_DASHBOARD",
+                "organisation_id": organisation_id,
+                "organisation_name": org["name"],
+                "subscription": dict(sub),
+                "access_status": access,
+                "billing": {
+                    "billing_status": sub["billing_status"],
+                    "do_not_bill": sub["do_not_bill"],
+                    "billing_anniversary_day": sub["billing_anniversary_day"],
+                    "unbilled_temporary_user_fee_cents": unbilled_temp_fee_cents,
+                    "currency": settings["currency"] if settings else "AUD",
+                    "temporary_user_access_fee_cents": settings["temporary_user_access_fee_cents"] if settings else None,
+                    "temporary_access_days": settings["temporary_access_days"] if settings else None,
+                },
+                "temporary_users": {
+                    "active_count": active_temp_user_count,
+                    "total_count": len(temp_users),
+                    "items": [dict(row) for row in temp_users],
+                    "rules": [
+                        "Temporary access starts on the day after registration.",
+                        "If a Temporary User is converted to a Permanent User during the temporary access period, the Temporary User fee is waived.",
+                        "Billing for the new Permanent User starts on the subscriber’s next billing cycle.",
+                        "If not converted, the Temporary User fee is charged on the organisation’s next billing cycle.",
+                    ],
+                },
+                "org_admin_billing": org_admin_billing,
+                "data_retention": {
+                    "operating_data_delete_after": sub["operating_data_delete_after"],
+                    "historical_data_delete_after": sub["historical_data_delete_after"],
+                    "scheduled_jobs": [dict(row) for row in scheduled_jobs],
+                },
+                "dashboard_actions": dashboard_actions,
+                "rules": [
+                    "This preview shows the Org Admin subscription dashboard payload.",
+                    "One Org Admin is included. Additional active Org Admins are paid upgrades.",
+                    "Temporary User billing rules must be visible before billing disputes happen.",
+                    "SGA preview does not impersonate the Org Admin and must remain auditable.",
+                ],
+            },
+        }
+
+        conn.close()
+
+        return jsonify(payload), 200
+
     @app.post("/organisations/<organisation_id>/temporary-users")
     def create_temporary_user_access(organisation_id):
         body = request.get_json(silent=True) or {}

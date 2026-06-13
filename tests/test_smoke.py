@@ -142,6 +142,31 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(billing["additional_org_admin_subtotal_cents"], 625)
         self.assertEqual(billing["billing_status"], "BILLABLE")
 
+    def test_sga_can_preview_org_admin_subscription_dashboard(self):
+        organisation_id = self.create_organisation("SGA Preview Org")
+        self._create_user(organisation_id, "Preview Admin", role="ORG_ADMIN")
+        self._create_user(organisation_id, "Preview Extra Admin", role="ORG_ADMIN")
+
+        response = self.client.get(f"/global-admin/organisations/{organisation_id}/org-admin-subscription-preview")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["dashboard_type"], "SGA_ORG_ADMIN_SUBSCRIPTION_PREVIEW")
+        self.assertTrue(payload["preview_mode"]["enabled"])
+        self.assertEqual(payload["preview_mode"]["previewing_as"], "ORG_ADMIN")
+
+        org_view = payload["org_admin_dashboard"]
+        self.assertEqual(org_view["dashboard_type"], "ORG_ADMIN_SUBSCRIPTION_DASHBOARD")
+        self.assertEqual(org_view["organisation_id"], organisation_id)
+        self.assertEqual(org_view["org_admin_billing"]["included_org_admin_count"], 1)
+        self.assertEqual(org_view["org_admin_billing"]["active_org_admin_count"], 2)
+        self.assertEqual(org_view["org_admin_billing"]["billable_additional_org_admin_count"], 1)
+        self.assertEqual(org_view["org_admin_billing"]["additional_org_admin_price_cents"], 625)
+
+        rules_text = " ".join(org_view["temporary_users"]["rules"])
+        self.assertIn("Temporary User fee is waived", rules_text)
+        self.assertIn("subscriber’s next billing cycle", rules_text)
+
     def test_temporary_user_list_route_is_registered(self):
         organisation_id = self.create_organisation("Temporary User Org")
 
