@@ -121,6 +121,22 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(payload["organisation_id"], organisation_id)
         self.assertEqual(payload["access_status"]["access_state"], "ACTIVE")
 
+    def test_subscription_dashboard_reports_additional_org_admins(self):
+        organisation_id = self.create_organisation("Additional Admin Org")
+        self._create_user(organisation_id, "Included Admin", role="ORG_ADMIN")
+        self._create_user(organisation_id, "Billable Admin", role="ORG_ADMIN")
+
+        response = self.client.get(f"/organisations/{organisation_id}/subscription-dashboard")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        billing = payload["org_admin_billing"]
+        self.assertEqual(billing["pricing_plan_id"], "plan_additional_org_admin")
+        self.assertEqual(billing["included_org_admin_count"], 1)
+        self.assertEqual(billing["active_org_admin_count"], 2)
+        self.assertEqual(billing["billable_additional_org_admin_count"], 1)
+        self.assertEqual(billing["billing_status"], "PRICE_NOT_SET")
+
     def test_temporary_user_list_route_is_registered(self):
         organisation_id = self.create_organisation("Temporary User Org")
 

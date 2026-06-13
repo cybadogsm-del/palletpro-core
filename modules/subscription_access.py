@@ -167,6 +167,7 @@ def ensure_subscription_guard_tables(conn):
             ("plan_single_operation", "Single truck/forklift operation", "SINGLE_OPERATION", 1, 1, None, 2050, 0, 10, "For single truck and/or forklift operations."),
             ("plan_self_service_users", "2 to 25 users", "SELF_SERVICE_PER_USER", 2, 25, 2950, None, 0, 20, "Operations with 2 to 25 users can self-service subscribe at $29.50 per user per month."),
             ("plan_tailored_26_plus", "26+ Tailored Package", "CUSTOM", 26, None, None, None, 1, 30, "For 26 or more users, contact Pallet Pro for a tailored package to suit your operation."),
+            ("plan_additional_org_admin", "Additional Org Admin", "ADDITIONAL_ORG_ADMIN_FEE", None, None, None, None, 1, 40, "One Org Admin is included. Additional active Org Admins are paid upgrades; price is set by Pallet Pro."),
             ("plan_temp_user_access", "Temporary User Access Fee", "TEMPORARY_ACCESS_FEE", None, None, None, 2790, 0, 999, "Temporary users receive 28 days of access from the day after registration. Fee is charged on the organisation's next billing cycle."),
         ]
 
@@ -212,6 +213,7 @@ def ensure_subscription_guard_tables(conn):
         ("plan_single_operation", "Single truck/forklift operation", "SINGLE_OPERATION", 1, 1, None, 2050, 0, 10, "For single truck and/or forklift operations."),
         ("plan_self_service_users", "2 to 25 users", "SELF_SERVICE_PER_USER", 2, 25, 2950, None, 0, 20, "Operations with 2 to 25 users can self-service subscribe at $29.50 per user per month."),
         ("plan_tailored_26_plus", "26+ Tailored Package", "CUSTOM", 26, None, None, None, 1, 30, "For 26 or more users, contact Pallet Pro for a tailored package to suit your operation."),
+        ("plan_additional_org_admin", "Additional Org Admin", "ADDITIONAL_ORG_ADMIN_FEE", None, None, None, None, 1, 40, "One Org Admin is included. Additional active Org Admins are paid upgrades; price is set by Pallet Pro."),
         ("plan_temp_user_access", "Temporary User Access Fee", "TEMPORARY_ACCESS_FEE", None, None, None, 2790, 0, 999, "Temporary users receive 28 days of access from the day after registration. Fee is charged on the organisation's next billing cycle."),
     ]
 
@@ -251,6 +253,39 @@ def ensure_subscription_guard_tables(conn):
             """,
             [row + (row[0], ts, ts) for row in current_default_plans],
         )
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO pricing_plans (
+            pricing_plan_id,
+            plan_name,
+            plan_type,
+            min_permanent_users,
+            max_permanent_users,
+            price_per_user_cents,
+            package_price_cents,
+            requires_custom_pricing,
+            sort_order,
+            notes,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "plan_additional_org_admin",
+            "Additional Org Admin",
+            "ADDITIONAL_ORG_ADMIN_FEE",
+            None,
+            None,
+            None,
+            None,
+            1,
+            40,
+            "One Org Admin is included. Additional active Org Admins are paid upgrades; price is set by Pallet Pro.",
+            ts,
+            ts,
+        ),
+    )
 
     conn.execute(
         """
@@ -345,6 +380,57 @@ def ensure_org_user_cap_column(conn):
 
 
 ORG_SELF_SERVE_USER_LIMIT = 25
+INCLUDED_ORG_ADMIN_COUNT = 1
+ADDITIONAL_ORG_ADMIN_PLAN_ID = "plan_additional_org_admin"
+
+
+def count_active_org_admins(conn, organisation_id):
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM user_accounts
+        WHERE organisation_id = ?
+          AND access_status = 'ACTIVE'
+          AND role = 'ORG_ADMIN'
+        """,
+        (organisation_id,),
+    ).fetchone()
+    return int(row["c"]) if row else 0
+
+
+def get_additional_org_admin_plan(conn):
+    ensure_subscription_guard_tables(conn)
+    return conn.execute(
+        "SELECT * FROM pricing_plans WHERE pricing_plan_id = ?",
+        (ADDITIONAL_ORG_ADMIN_PLAN_ID,),
+    ).fetchone()
+
+
+def get_org_admin_billing_summary(conn, organisation_id):
+    active_org_admin_count = count_active_org_admins(conn, organisation_id)
+    billable_additional_count = max(0, active_org_admin_count - INCLUDED_ORG_ADMIN_COUNT)
+
+    plan = get_additional_org_admin_plan(conn)
+    price_cents = plan["package_price_cents"] if plan else None
+    subtotal_cents = billable_additional_count * int(price_cents or 0)
+
+    if billable_additional_count == 0:
+        billing_status = "NO_ADDITIONAL_ORG_ADMINS"
+    elif price_cents is None:
+        billing_status = "PRICE_NOT_SET"
+    else:
+        billing_status = "BILLABLE"
+
+    return {
+        "pricing_plan_id": ADDITIONAL_ORG_ADMIN_PLAN_ID,
+        "included_org_admin_count": INCLUDED_ORG_ADMIN_COUNT,
+        "active_org_admin_count": active_org_admin_count,
+        "billable_additional_org_admin_count": billable_additional_count,
+        "additional_org_admin_price_cents": price_cents,
+        "additional_org_admin_subtotal_cents": subtotal_cents,
+        "billing_status": billing_status,
+        "rule": "One Org Admin is included. Additional active Org Admins are paid upgrades.",
+    }
 
 
 def count_active_permanent_users(conn, organisation_id):
@@ -593,8 +679,9 @@ def register_subscription_routes(app):
             "temporary_user_access_summary": [dict(row) for row in temp_summary],
             "recent_billing_export_runs": [dict(row) for row in export_runs],
             "rules": [
-                "Temporary User Access Fee is the final pricing-table line item.",
-                "Distribution centres and warehousing operations require custom pricing.",
+                "Temporary User Access Fee is shown as a pricing extra.",
+                "One Org Admin is included. Additional active Org Admins are paid upgrades.",
+                "Operations with 26 or more users require Pallet Pro review and a tailored package.",
                 "Free, Beta Tester, Quoted, Suspended, and Cancelled organisations are do-not-bill unless explicitly changed.",
                 "Unsubscribed organisations must not be included in billing exports.",
             ],
@@ -618,6 +705,7 @@ def register_subscription_routes(app):
 
         sub = get_or_create_subscription(conn, organisation_id)
         access = get_org_access_status_payload(conn, organisation_id)
+        org_admin_billing = get_org_admin_billing_summary(conn, organisation_id)
 
         settings = conn.execute(
             "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
@@ -705,6 +793,7 @@ def register_subscription_routes(app):
                 "total_count": len(temp_users),
                 "items": [dict(row) for row in temp_users],
             },
+            "org_admin_billing": org_admin_billing,
             "data_retention": {
                 "operating_data_delete_after": sub["operating_data_delete_after"],
                 "historical_data_delete_after": sub["historical_data_delete_after"],

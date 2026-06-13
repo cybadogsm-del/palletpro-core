@@ -22,6 +22,7 @@ from db import get_conn, make_id, now_iso
 from modules.subscription_access import (
     ensure_subscription_guard_tables,
     ensure_temporary_user_billing_columns,
+    get_org_admin_billing_summary,
     get_or_create_subscription,
     get_org_access_status_payload,
 )
@@ -120,8 +121,11 @@ def register_billing_routes(app):
 
             temporary_user_count = len(temp_rows)
             temporary_user_fee_cents = sum(int(r["fee_cents"]) for r in temp_rows)
+            org_admin_billing = get_org_admin_billing_summary(conn, d["organisation_id"])
+            additional_org_admin_count = org_admin_billing["billable_additional_org_admin_count"]
+            additional_org_admin_fee_cents = org_admin_billing["additional_org_admin_subtotal_cents"]
             subscription_subtotal_cents = 0
-            subtotal_cents = subscription_subtotal_cents + temporary_user_fee_cents
+            subtotal_cents = subscription_subtotal_cents + temporary_user_fee_cents + additional_org_admin_fee_cents
             gst_cents = int(round(subtotal_cents * (gst_rate_percent / 100.0)))
             total_cents = subtotal_cents + gst_cents
 
@@ -138,6 +142,9 @@ def register_billing_routes(app):
                 "subscription_subtotal_cents": subscription_subtotal_cents,
                 "temporary_user_count": temporary_user_count,
                 "temporary_user_fee_cents": temporary_user_fee_cents,
+                "additional_org_admin_count": additional_org_admin_count,
+                "additional_org_admin_fee_cents": additional_org_admin_fee_cents,
+                "org_admin_billing": org_admin_billing,
                 "subtotal_cents": subtotal_cents,
                 "gst_rate_percent": gst_rate_percent,
                 "gst_cents": gst_cents,
@@ -262,8 +269,11 @@ def register_billing_routes(app):
 
             temporary_user_count = len(temp_rows)
             temporary_user_fee_cents = sum(int(r["fee_cents"]) for r in temp_rows)
+            org_admin_billing = get_org_admin_billing_summary(conn, d["organisation_id"])
+            additional_org_admin_count = org_admin_billing["billable_additional_org_admin_count"]
+            additional_org_admin_fee_cents = org_admin_billing["additional_org_admin_subtotal_cents"]
             subscription_subtotal_cents = 0
-            subtotal_cents = subscription_subtotal_cents + temporary_user_fee_cents
+            subtotal_cents = subscription_subtotal_cents + temporary_user_fee_cents + additional_org_admin_fee_cents
             gst_cents = int(round(subtotal_cents * (gst_rate_percent / 100.0)))
             total_cents = subtotal_cents + gst_cents
             temp_ids = [r["temporary_user_access_id"] for r in temp_rows]
@@ -282,6 +292,9 @@ def register_billing_routes(app):
                 "subscription_subtotal_cents": subscription_subtotal_cents,
                 "temporary_user_count": temporary_user_count,
                 "temporary_user_fee_cents": temporary_user_fee_cents,
+                "additional_org_admin_count": additional_org_admin_count,
+                "additional_org_admin_fee_cents": additional_org_admin_fee_cents,
+                "org_admin_billing": org_admin_billing,
                 "subtotal_cents": subtotal_cents,
                 "gst_rate_percent": gst_rate_percent,
                 "gst_cents": gst_cents,
@@ -529,6 +542,12 @@ def register_billing_routes(app):
                         "quantity": row["temporary_user_count"],
                         "amount_cents": row["temporary_user_fee_cents"],
                         "temporary_user_access_ids": line.get("temporary_user_access_ids", []),
+                    },
+                    {
+                        "description": "Additional Org Admin upgrades",
+                        "quantity": line.get("additional_org_admin_count", 0),
+                        "amount_cents": line.get("additional_org_admin_fee_cents", 0),
+                        "rule": "One Org Admin is included. Additional active Org Admins are paid upgrades.",
                     },
                     {
                         "description": "GST",
