@@ -2159,10 +2159,10 @@ class PalletProSmokeTests(unittest.TestCase):
     def test_user_cap_self_serve_and_enforcement(self):
         org_id = self.create_organisation("CapTestOrg")
 
-        # 76+ must be rejected for self-serve
+        # 26+ must be rejected for self-serve
         r = self.client.post(
             f"/organisations/{org_id}/subscription/select-users",
-            json={"selected_user_count": 76, "changed_by_display_name": "Admin"},
+            json={"selected_user_count": 26, "changed_by_display_name": "Admin"},
         )
         self.assertEqual(r.status_code, 400)
         self.assertIn("self_serve_limit", r.get_json())
@@ -2214,7 +2214,7 @@ class PalletProSmokeTests(unittest.TestCase):
         self.assertEqual(payload["error"], "USER_CAP_REACHED")
         self.assertIn("dialog", payload)
 
-    def test_global_admin_can_set_user_count_above_75(self):
+    def test_global_admin_can_set_user_count_above_25(self):
         org_id = self.create_organisation("LargeCapOrg")
 
         r = self.client.post(

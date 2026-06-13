@@ -13,9 +13,9 @@ PRICING_PHILOSOPHY_STATEMENT = {
         "To protect that philosophy and the integrity of customer data, each user should have their own login.",
         "Shared logins weaken the audit trail because Pallet Pro depends on knowing who, where, and when.",
         "If multiple people use one login, the who is no longer provable.",
-        "Distribution centres and warehousing operations, including those operated by transport companies, require custom pricing.",
-        "Temporary users receive 28 days of access from the day after activation.",
-        "Temporary user fees are charged on the customer’s next billing cycle, while the access period is calculated from the temporary user’s activation date.",
+        "Operations with 26 or more users require Pallet Pro review and a tailored package.",
+        "Temporary users receive 28 days of access from the day after registration.",
+        "Temporary user fees are charged on the organisation’s next billing cycle, while the access period is calculated from the temporary user’s registration date.",
         "Pallet Pro must be easy to unsubscribe from, and unsubscribed organisations must not be included in future billing exports.",
     ],
 }
@@ -149,7 +149,7 @@ def ensure_subscription_guard_tables(conn):
             """,
             (
                 "pricing_settings_default",
-                1000,
+                2790,
                 28,
                 10.0,
                 "AUD",
@@ -164,12 +164,10 @@ def ensure_subscription_guard_tables(conn):
 
     if existing_plans == 0:
         default_plans = [
-            ("plan_starter", "Starter", "STANDARD_PACKAGE", 1, 3, None, None, 0, 10, "Entry SME package."),
-            ("plan_small", "Small", "STANDARD_PACKAGE", 4, 10, None, None, 0, 20, "Growing SME package."),
-            ("plan_medium", "Medium", "STANDARD_PACKAGE", 11, 25, None, None, 0, 30, "Active SME operations."),
-            ("plan_large", "Large", "STANDARD_PACKAGE", 26, 50, None, None, 0, 40, "Larger SME operations."),
-            ("plan_custom_warehouse", "Distribution Centre / Warehousing Custom Pricing", "CUSTOM", None, None, None, None, 1, 90, "Distribution centres and warehousing operations, including those operated by transport companies, require custom pricing."),
-            ("plan_temp_user_access", "Temporary User Access Fee", "TEMPORARY_ACCESS_FEE", None, None, None, 1000, 0, 999, "Temporary users receive 28 days of access from the day after activation. Fee is charged on the customer's next billing cycle."),
+            ("plan_single_operation", "Single truck/forklift operation", "SINGLE_OPERATION", 1, 1, None, 2050, 0, 10, "For single truck and/or forklift operations."),
+            ("plan_self_service_users", "2 to 25 users", "SELF_SERVICE_PER_USER", 2, 25, 2950, None, 0, 20, "Operations with 2 to 25 users can self-service subscribe at $29.50 per user per month."),
+            ("plan_tailored_26_plus", "26+ Tailored Package", "CUSTOM", 26, None, None, None, 1, 30, "For 26 or more users, contact Pallet Pro for a tailored package to suit your operation."),
+            ("plan_temp_user_access", "Temporary User Access Fee", "TEMPORARY_ACCESS_FEE", None, None, None, 2790, 0, 999, "Temporary users receive 28 days of access from the day after registration. Fee is charged on the organisation's next billing cycle."),
         ]
 
         conn.executemany(
@@ -191,6 +189,97 @@ def ensure_subscription_guard_tables(conn):
             """,
             [row + (ts, ts) for row in default_plans]
         )
+
+    # Pricing Alignment v0.1 baseline upgrade.
+    #
+    # This keeps older dev/test databases from continuing to show the old
+    # Starter/Small/Medium/Large defaults after the code baseline changes.
+    # It only switches to the new simplified defaults when the new plan IDs
+    # do not already exist.
+    new_plan_count = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM pricing_plans
+        WHERE pricing_plan_id IN (
+            'plan_single_operation',
+            'plan_self_service_users',
+            'plan_tailored_26_plus'
+        )
+        """
+    ).fetchone()["c"]
+
+    current_default_plans = [
+        ("plan_single_operation", "Single truck/forklift operation", "SINGLE_OPERATION", 1, 1, None, 2050, 0, 10, "For single truck and/or forklift operations."),
+        ("plan_self_service_users", "2 to 25 users", "SELF_SERVICE_PER_USER", 2, 25, 2950, None, 0, 20, "Operations with 2 to 25 users can self-service subscribe at $29.50 per user per month."),
+        ("plan_tailored_26_plus", "26+ Tailored Package", "CUSTOM", 26, None, None, None, 1, 30, "For 26 or more users, contact Pallet Pro for a tailored package to suit your operation."),
+        ("plan_temp_user_access", "Temporary User Access Fee", "TEMPORARY_ACCESS_FEE", None, None, None, 2790, 0, 999, "Temporary users receive 28 days of access from the day after registration. Fee is charged on the organisation's next billing cycle."),
+    ]
+
+    if new_plan_count == 0:
+        conn.execute(
+            """
+            UPDATE pricing_plans
+            SET is_active = 0,
+                updated_at = ?
+            WHERE pricing_plan_id IN (
+                'plan_starter',
+                'plan_small',
+                'plan_medium',
+                'plan_large',
+                'plan_custom_warehouse'
+            )
+            """,
+            (ts,),
+        )
+
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO pricing_plans (
+                pricing_plan_id,
+                plan_name,
+                plan_type,
+                min_permanent_users,
+                max_permanent_users,
+                price_per_user_cents,
+                package_price_cents,
+                requires_custom_pricing,
+                sort_order,
+                notes,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM pricing_plans WHERE pricing_plan_id = ?), ?), ?)
+            """,
+            [row + (row[0], ts, ts) for row in current_default_plans],
+        )
+
+    conn.execute(
+        """
+        UPDATE pricing_settings
+        SET temporary_user_access_fee_cents = ?,
+            temporary_access_days = ?,
+            updated_at = ?
+        WHERE pricing_settings_id = 'pricing_settings_default'
+          AND temporary_user_access_fee_cents = 1000
+          AND temporary_access_days = 28
+        """,
+        (2790, 28, ts),
+    )
+
+    conn.execute(
+        """
+        UPDATE pricing_plans
+        SET package_price_cents = ?,
+            notes = ?,
+            updated_at = ?
+        WHERE pricing_plan_id = 'plan_temp_user_access'
+          AND package_price_cents = 1000
+        """,
+        (
+            2790,
+            "Temporary users receive 28 days of access from the day after registration. Fee is charged on the organisation's next billing cycle.",
+            ts,
+        ),
+    )
 
 
 def get_or_create_subscription(conn, organisation_id):
@@ -255,7 +344,7 @@ def ensure_org_user_cap_column(conn):
         conn.execute("ALTER TABLE organisation_subscriptions ADD COLUMN selected_user_count INTEGER")
 
 
-ORG_SELF_SERVE_USER_LIMIT = 75
+ORG_SELF_SERVE_USER_LIMIT = 25
 
 
 def count_active_permanent_users(conn, organisation_id):
@@ -727,8 +816,8 @@ def register_subscription_routes(app):
 
         return jsonify({
             "temporary_user_access": dict(row),
-            "pricing_rule": "Temporary users receive 28 days of access from the day after activation.",
-            "billing_rule": "Temporary user fee is charged on the customer’s next billing cycle.",
+            "pricing_rule": "Temporary users receive 28 days of access from the day after registration.",
+            "billing_rule": "Temporary user fee is charged on the organisation’s next billing cycle.",
             "created_by_display_name": created_by_display_name,
         }), 201
 
