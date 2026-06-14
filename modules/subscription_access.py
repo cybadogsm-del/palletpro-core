@@ -422,6 +422,46 @@ def ensure_org_commercial_settings_columns(conn):
             "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_custom_price_cents INTEGER"
         )
 
+    if "commercial_package_name" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_package_name TEXT"
+        )
+
+    if "commercial_package_description" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_package_description TEXT"
+        )
+
+    if "commercial_package_details" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_package_details TEXT"
+        )
+
+    if "commercial_approved_user_limit" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_approved_user_limit INTEGER"
+        )
+
+    if "commercial_top_user_limit" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_top_user_limit INTEGER"
+        )
+
+    if "commercial_review_threshold" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_review_threshold INTEGER"
+        )
+
+    if "commercial_settings_effective_from" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_settings_effective_from TEXT"
+        )
+
+    if "commercial_settings_effective_to" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_settings_effective_to TEXT"
+        )
+
 
 ORG_SELF_SERVE_USER_LIMIT = 25
 INCLUDED_ORG_ADMIN_COUNT = 1
@@ -1038,6 +1078,14 @@ def register_subscription_routes(app):
             "commercial_beta_tester",
             "commercial_discount_percent",
             "commercial_custom_price_cents",
+            "commercial_package_name",
+            "commercial_package_description",
+            "commercial_package_details",
+            "commercial_approved_user_limit",
+            "commercial_top_user_limit",
+            "commercial_review_threshold",
+            "commercial_settings_effective_from",
+            "commercial_settings_effective_to",
             "audit_reason",
         }
 
@@ -1114,6 +1162,163 @@ def register_subscription_routes(app):
                 }), 400
             updates["commercial_custom_price_cents"] = value
 
+        if "commercial_package_name" in body:
+            value = body["commercial_package_name"]
+            if value is None:
+                updates["commercial_package_name"] = None
+            elif not isinstance(value, str):
+                return jsonify({
+                    "error": "commercial_package_name must be text or null",
+                    "field": "commercial_package_name",
+                }), 400
+            else:
+                trimmed = value.strip()
+                updates["commercial_package_name"] = trimmed if trimmed else None
+
+        if "commercial_package_description" in body:
+            value = body["commercial_package_description"]
+            if value is None:
+                updates["commercial_package_description"] = None
+            elif not isinstance(value, str):
+                return jsonify({
+                    "error": "commercial_package_description must be text or null",
+                    "field": "commercial_package_description",
+                }), 400
+            else:
+                trimmed = value.strip()
+                updates["commercial_package_description"] = trimmed if trimmed else None
+
+        if "commercial_package_details" in body:
+            value = body["commercial_package_details"]
+            if value is None:
+                updates["commercial_package_details"] = None
+            elif not isinstance(value, str):
+                return jsonify({
+                    "error": "commercial_package_details must be text or null",
+                    "field": "commercial_package_details",
+                }), 400
+            else:
+                trimmed = value.strip()
+                updates["commercial_package_details"] = trimmed if trimmed else None
+
+        if "commercial_approved_user_limit" in body:
+            value = body["commercial_approved_user_limit"]
+            if value is None:
+                updates["commercial_approved_user_limit"] = None
+            elif isinstance(value, bool) or not isinstance(value, int):
+                return jsonify({
+                    "error": "commercial_approved_user_limit must be an integer >= 0 or null",
+                    "field": "commercial_approved_user_limit",
+                }), 400
+            elif value < 0:
+                return jsonify({
+                    "error": "commercial_approved_user_limit must be an integer >= 0 or null",
+                    "field": "commercial_approved_user_limit",
+                }), 400
+            updates["commercial_approved_user_limit"] = value
+
+        if "commercial_top_user_limit" in body:
+            value = body["commercial_top_user_limit"]
+            if value is None:
+                updates["commercial_top_user_limit"] = None
+            elif isinstance(value, bool) or not isinstance(value, int):
+                return jsonify({
+                    "error": "commercial_top_user_limit must be an integer >= 0 or null",
+                    "field": "commercial_top_user_limit",
+                }), 400
+            elif value < 0:
+                return jsonify({
+                    "error": "commercial_top_user_limit must be an integer >= 0 or null",
+                    "field": "commercial_top_user_limit",
+                }), 400
+            updates["commercial_top_user_limit"] = value
+
+            if (
+                "commercial_approved_user_limit" in body
+                and value is not None
+                and body.get("commercial_approved_user_limit") is not None
+                and value < body["commercial_approved_user_limit"]
+            ):
+                return jsonify({
+                    "error": "commercial_top_user_limit must be greater than or equal to commercial_approved_user_limit",
+                    "field": "commercial_top_user_limit",
+                }), 400
+
+        if "commercial_review_threshold" in body:
+            value = body["commercial_review_threshold"]
+            if value is None:
+                updates["commercial_review_threshold"] = None
+            elif isinstance(value, bool) or not isinstance(value, int):
+                return jsonify({
+                    "error": "commercial_review_threshold must be a whole number from 0 to 100",
+                    "field": "commercial_review_threshold",
+                }), 400
+            elif value < 0 or value > 100:
+                return jsonify({
+                    "error": "commercial_review_threshold must be a whole number from 0 to 100",
+                    "field": "commercial_review_threshold",
+                }), 400
+            updates["commercial_review_threshold"] = value
+
+        if "commercial_settings_effective_from" in body:
+            value = body["commercial_settings_effective_from"]
+            if value is None:
+                updates["commercial_settings_effective_from"] = None
+            else:
+                if not isinstance(value, str):
+                    return jsonify({
+                        "error": "commercial_settings_effective_from must be a date in YYYY-MM-DD format or null",
+                        "field": "commercial_settings_effective_from",
+                    }), 400
+                value = value.strip()
+                if value == "":
+                    updates["commercial_settings_effective_from"] = None
+                else:
+                    try:
+                        datetime.strptime(value, "%Y-%m-%d")
+                    except Exception:
+                        return jsonify({
+                            "error": "commercial_settings_effective_from must be a date in YYYY-MM-DD format",
+                            "field": "commercial_settings_effective_from",
+                        }), 400
+                    updates["commercial_settings_effective_from"] = value
+
+        if "commercial_settings_effective_to" in body:
+            value = body["commercial_settings_effective_to"]
+            if value is None:
+                updates["commercial_settings_effective_to"] = None
+            else:
+                if not isinstance(value, str):
+                    return jsonify({
+                        "error": "commercial_settings_effective_to must be a date in YYYY-MM-DD format or null",
+                        "field": "commercial_settings_effective_to",
+                    }), 400
+                value = value.strip()
+                if value == "":
+                    updates["commercial_settings_effective_to"] = None
+                else:
+                    try:
+                        datetime.strptime(value, "%Y-%m-%d")
+                    except Exception:
+                        return jsonify({
+                            "error": "commercial_settings_effective_to must be a date in YYYY-MM-DD format",
+                            "field": "commercial_settings_effective_to",
+                        }), 400
+                    updates["commercial_settings_effective_to"] = value
+
+        if (
+            "commercial_settings_effective_from" in body
+            and "commercial_settings_effective_to" in body
+        ):
+            effective_from = updates.get("commercial_settings_effective_from")
+            effective_to = updates.get("commercial_settings_effective_to")
+            if effective_from is not None and effective_to is not None:
+                if datetime.strptime(effective_from, "%Y-%m-%d") > datetime.strptime(effective_to, "%Y-%m-%d"):
+                    return jsonify({
+                        "error": "commercial_settings_effective_to must not be earlier than commercial_settings_effective_from",
+                        "field": "commercial_settings_effective_to",
+                    }), 400
+
         if not updates:
             return jsonify({
                 "error": "No updateable commercial fields provided",
@@ -1144,6 +1349,14 @@ def register_subscription_routes(app):
             "commercial_beta_tester": current["commercial_beta_tester"],
             "commercial_discount_percent": current["commercial_discount_percent"],
             "commercial_custom_price_cents": current["commercial_custom_price_cents"],
+            "commercial_package_name": current["commercial_package_name"],
+            "commercial_package_description": current["commercial_package_description"],
+            "commercial_package_details": current["commercial_package_details"],
+            "commercial_approved_user_limit": current["commercial_approved_user_limit"],
+            "commercial_top_user_limit": current["commercial_top_user_limit"],
+            "commercial_review_threshold": current["commercial_review_threshold"],
+            "commercial_settings_effective_from": current["commercial_settings_effective_from"],
+            "commercial_settings_effective_to": current["commercial_settings_effective_to"],
         }
 
         set_clause = ", ".join([f"{field} = ?" for field in updates])
@@ -1157,6 +1370,14 @@ def register_subscription_routes(app):
             "commercial_beta_tester": current["commercial_beta_tester"] if "commercial_beta_tester" not in updates else updates["commercial_beta_tester"],
             "commercial_discount_percent": current["commercial_discount_percent"] if "commercial_discount_percent" not in updates else updates["commercial_discount_percent"],
             "commercial_custom_price_cents": current["commercial_custom_price_cents"] if "commercial_custom_price_cents" not in updates else updates["commercial_custom_price_cents"],
+            "commercial_package_name": current["commercial_package_name"] if "commercial_package_name" not in updates else updates["commercial_package_name"],
+            "commercial_package_description": current["commercial_package_description"] if "commercial_package_description" not in updates else updates["commercial_package_description"],
+            "commercial_package_details": current["commercial_package_details"] if "commercial_package_details" not in updates else updates["commercial_package_details"],
+            "commercial_approved_user_limit": current["commercial_approved_user_limit"] if "commercial_approved_user_limit" not in updates else updates["commercial_approved_user_limit"],
+            "commercial_top_user_limit": current["commercial_top_user_limit"] if "commercial_top_user_limit" not in updates else updates["commercial_top_user_limit"],
+            "commercial_review_threshold": current["commercial_review_threshold"] if "commercial_review_threshold" not in updates else updates["commercial_review_threshold"],
+            "commercial_settings_effective_from": current["commercial_settings_effective_from"] if "commercial_settings_effective_from" not in updates else updates["commercial_settings_effective_from"],
+            "commercial_settings_effective_to": current["commercial_settings_effective_to"] if "commercial_settings_effective_to" not in updates else updates["commercial_settings_effective_to"],
         }
 
         audit_event(
@@ -1189,6 +1410,14 @@ def register_subscription_routes(app):
                 "commercial_beta_tester": updated["commercial_beta_tester"],
                 "commercial_discount_percent": updated["commercial_discount_percent"],
                 "commercial_custom_price_cents": updated["commercial_custom_price_cents"],
+                "commercial_package_name": updated["commercial_package_name"],
+                "commercial_package_description": updated["commercial_package_description"],
+                "commercial_package_details": updated["commercial_package_details"],
+                "commercial_approved_user_limit": updated["commercial_approved_user_limit"],
+                "commercial_top_user_limit": updated["commercial_top_user_limit"],
+                "commercial_review_threshold": updated["commercial_review_threshold"],
+                "commercial_settings_effective_from": updated["commercial_settings_effective_from"],
+                "commercial_settings_effective_to": updated["commercial_settings_effective_to"],
             },
             "audit_reason": audit_reason,
             "rule": "Only Super Global Admin can edit commercial settings that change billing totals.",
@@ -1338,6 +1567,13 @@ def register_subscription_routes(app):
             return jsonify({"error": "INSUFFICIENT_ROLE", "message": "Super Global Admin only."}), 403
 
         body = request.get_json(silent=True) or {}
+        audit_reason = (body.get("audit_reason") or "").strip()
+        if not audit_reason:
+            return jsonify({
+                "error": "Missing audit reason",
+                "required_field": "audit_reason",
+            }), 400
+
         conn = get_conn()
         ensure_subscription_guard_tables(conn)
 

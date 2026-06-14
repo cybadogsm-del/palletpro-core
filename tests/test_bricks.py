@@ -185,6 +185,14 @@ class BrickSmokeTests(unittest.TestCase):
         beta_tester=None,
         discount_percent=None,
         custom_price_cents=None,
+        package_name=None,
+        package_description=None,
+        package_details=None,
+        approved_user_limit=None,
+        top_user_limit=None,
+        review_threshold=None,
+        effective_from=None,
+        effective_to=None,
     ):
         self._ensure_org_subscription(organisation_id)
 
@@ -197,6 +205,22 @@ class BrickSmokeTests(unittest.TestCase):
             updates["commercial_discount_percent"] = discount_percent
         if custom_price_cents is not None:
             updates["commercial_custom_price_cents"] = custom_price_cents
+        if package_name is not None:
+            updates["commercial_package_name"] = package_name
+        if package_description is not None:
+            updates["commercial_package_description"] = package_description
+        if package_details is not None:
+            updates["commercial_package_details"] = package_details
+        if approved_user_limit is not None:
+            updates["commercial_approved_user_limit"] = approved_user_limit
+        if top_user_limit is not None:
+            updates["commercial_top_user_limit"] = top_user_limit
+        if review_threshold is not None:
+            updates["commercial_review_threshold"] = review_threshold
+        if effective_from is not None:
+            updates["commercial_settings_effective_from"] = effective_from
+        if effective_to is not None:
+            updates["commercial_settings_effective_to"] = effective_to
 
         if not updates:
             return
@@ -220,6 +244,14 @@ class BrickSmokeTests(unittest.TestCase):
         payload,
     ):
         return client.patch(f"/global-admin/organisations/{organisation_id}/commercial-settings", json=payload)
+
+    def _patch_pricing_plan(
+        self,
+        client,
+        pricing_plan_id,
+        payload,
+    ):
+        return client.patch(f"/global-admin/pricing-plans/{pricing_plan_id}", json=payload)
 
     def _run_billing_export(self, organisation_id, endpoint):
         response = self.client.post(endpoint, json={
@@ -819,9 +851,38 @@ class BrickSmokeTests(unittest.TestCase):
             "commercial_beta_tester",
             "commercial_discount_percent",
             "commercial_custom_price_cents",
+            "commercial_package_name",
+            "commercial_package_description",
+            "commercial_package_details",
+            "commercial_approved_user_limit",
+            "commercial_top_user_limit",
+            "commercial_review_threshold",
+            "commercial_settings_effective_from",
+            "commercial_settings_effective_to",
         }
         for col in required_columns:
             self.assertIn(col, cols)
+
+    def test_pricing_dashboard_includes_new_commercial_fields(self):
+        """Pricing dashboard subscription rows include v0.2 commercial settings fields."""
+        org_id = self._create_billing_org("Pricing Dashboard Commercial Fields")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+
+        patch = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_package_name": "Dashboard package",
+            "commercial_approved_user_limit": 12,
+            "audit_reason": "Dashboard coverage",
+        })
+        self.assertEqual(patch.status_code, 200)
+
+        response = self.client.get("/global-admin/pricing-dashboard")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        rows = [item for item in payload["subscriptions"] if item["organisation_id"] == org_id]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["commercial_package_name"], "Dashboard package")
+        self.assertEqual(row["commercial_approved_user_limit"], 12)
 
     def test_billing_export_preview_respects_free_period(self):
         """Free Period commercial setting changes billing totals."""
@@ -880,6 +941,14 @@ class BrickSmokeTests(unittest.TestCase):
             "commercial_beta_tester": True,
             "commercial_discount_percent": 25,
             "commercial_custom_price_cents": 3000,
+            "commercial_package_name": "Regional rollout package",
+            "commercial_package_description": "Priority support + temporary waiver",
+            "commercial_package_details": "Custom reporting and audit trail",
+            "commercial_approved_user_limit": 20,
+            "commercial_top_user_limit": 30,
+            "commercial_review_threshold": 80,
+            "commercial_settings_effective_from": "2026-06-15",
+            "commercial_settings_effective_to": "2026-12-31",
             "audit_reason": "Quarterly commercial adjustment",
         })
         self.assertEqual(response.status_code, 200)
@@ -889,6 +958,14 @@ class BrickSmokeTests(unittest.TestCase):
         self.assertEqual(payload["commercial_settings"]["commercial_beta_tester"], 1)
         self.assertEqual(payload["commercial_settings"]["commercial_discount_percent"], 25)
         self.assertEqual(payload["commercial_settings"]["commercial_custom_price_cents"], 3000)
+        self.assertEqual(payload["commercial_settings"]["commercial_package_name"], "Regional rollout package")
+        self.assertEqual(payload["commercial_settings"]["commercial_package_description"], "Priority support + temporary waiver")
+        self.assertEqual(payload["commercial_settings"]["commercial_package_details"], "Custom reporting and audit trail")
+        self.assertEqual(payload["commercial_settings"]["commercial_approved_user_limit"], 20)
+        self.assertEqual(payload["commercial_settings"]["commercial_top_user_limit"], 30)
+        self.assertEqual(payload["commercial_settings"]["commercial_review_threshold"], 80)
+        self.assertEqual(payload["commercial_settings"]["commercial_settings_effective_from"], "2026-06-15")
+        self.assertEqual(payload["commercial_settings"]["commercial_settings_effective_to"], "2026-12-31")
 
     def test_non_sga_cannot_update_org_commercial_settings(self):
         """PATCH /global-admin/organisations/<id>/commercial-settings is SGA-only."""
@@ -949,6 +1026,65 @@ class BrickSmokeTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 400)
 
+    def test_org_commercial_settings_update_rejects_invalid_user_limits(self):
+        """PATCH /global-admin/organisations/<id>/commercial-settings validates user limits."""
+        org_id = self._create_billing_org("Billing Org Invalid User Limits")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_approved_user_limit": -5,
+            "audit_reason": "Negative approved limit",
+        })
+        self.assertEqual(response.status_code, 400)
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_top_user_limit": -1,
+            "audit_reason": "Negative top limit",
+        })
+        self.assertEqual(response.status_code, 400)
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_approved_user_limit": 25,
+            "commercial_top_user_limit": 10,
+            "audit_reason": "Invalid limit order",
+        })
+        self.assertEqual(response.status_code, 400)
+
+    def test_org_commercial_settings_update_rejects_invalid_review_threshold(self):
+        """PATCH /global-admin/organisations/<id>/commercial-settings validates review threshold."""
+        org_id = self._create_billing_org("Billing Org Invalid Review Threshold")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_review_threshold": 120,
+            "audit_reason": "Invalid review threshold",
+        })
+        self.assertEqual(response.status_code, 400)
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_review_threshold": -1,
+            "audit_reason": "Invalid review threshold",
+        })
+        self.assertEqual(response.status_code, 400)
+
+    def test_org_commercial_settings_update_rejects_invalid_effective_dates(self):
+        """PATCH /global-admin/organisations/<id>/commercial-settings validates effective date ordering."""
+        org_id = self._create_billing_org("Billing Org Invalid Effective Dates")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_settings_effective_from": "2026-06-15",
+            "commercial_settings_effective_to": "2026-06-14",
+            "audit_reason": "Invalid date ordering",
+        })
+        self.assertEqual(response.status_code, 400)
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_settings_effective_from": "2026-13-01",
+            "audit_reason": "Invalid date format",
+        })
+        self.assertEqual(response.status_code, 400)
+
     def test_org_commercial_settings_update_reflected_in_sga_preview(self):
         """Updated commercial settings appear in Org Admin subscription preview for SGA."""
         org_id = self._create_billing_org("Billing Org Preview Reflect")
@@ -959,6 +1095,14 @@ class BrickSmokeTests(unittest.TestCase):
             "commercial_beta_tester": True,
             "commercial_discount_percent": 10,
             "commercial_custom_price_cents": 4000,
+            "commercial_package_name": "Tier A package",
+            "commercial_package_description": "Priority onboarding",
+            "commercial_package_details": "Includes audit and review",
+            "commercial_approved_user_limit": 5,
+            "commercial_top_user_limit": 15,
+            "commercial_review_threshold": 90,
+            "commercial_settings_effective_from": "2026-06-01",
+            "commercial_settings_effective_to": "2026-12-31",
             "audit_reason": "Preview validation",
         })
         self.assertEqual(patch.status_code, 200)
@@ -971,6 +1115,14 @@ class BrickSmokeTests(unittest.TestCase):
         self.assertEqual(subscription["commercial_beta_tester"], 1)
         self.assertEqual(subscription["commercial_discount_percent"], 10)
         self.assertEqual(subscription["commercial_custom_price_cents"], 4000)
+        self.assertEqual(subscription["commercial_package_name"], "Tier A package")
+        self.assertEqual(subscription["commercial_package_description"], "Priority onboarding")
+        self.assertEqual(subscription["commercial_package_details"], "Includes audit and review")
+        self.assertEqual(subscription["commercial_approved_user_limit"], 5)
+        self.assertEqual(subscription["commercial_top_user_limit"], 15)
+        self.assertEqual(subscription["commercial_review_threshold"], 90)
+        self.assertEqual(subscription["commercial_settings_effective_from"], "2026-06-01")
+        self.assertEqual(subscription["commercial_settings_effective_to"], "2026-12-31")
 
     def test_org_commercial_settings_update_affects_billing_export_preview_totals(self):
         """PATCH changes affect billing export preview totals using shared resolver."""
@@ -1008,6 +1160,64 @@ class BrickSmokeTests(unittest.TestCase):
         self.assertEqual(preview_item["subtotal_cents"], final_item["subtotal_cents"])
         self.assertEqual(preview_item["gst_cents"], final_item["gst_cents"])
         self.assertEqual(preview_item["total_cents"], final_item["total_cents"])
+
+    def test_org_commercial_settings_update_reflected_in_billing_export_items(self):
+        """Updated v0.2 commercial fields appear in billing export preview and finalise items."""
+        org_id = self._create_billing_org("Billing Org Export V0.2 Metadata")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+
+        self._patch_org_commercial_settings(client, org_id, {
+            "commercial_package_name": "Custom 30 users",
+            "commercial_package_description": "Priority support and quarterly review",
+            "commercial_package_details": "Includes reporting and admin training",
+            "commercial_approved_user_limit": 10,
+            "commercial_top_user_limit": 30,
+            "commercial_review_threshold": 85,
+            "commercial_settings_effective_from": "2026-06-01",
+            "commercial_settings_effective_to": "2026-12-31",
+            "audit_reason": "Export metadata",
+        })
+
+        _, preview_item = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+        _, final_item = self._run_billing_export(org_id, "/global-admin/billing-export-finalise")
+
+        self.assertEqual(preview_item["commercial_package_name"], "Custom 30 users")
+        self.assertEqual(preview_item["commercial_package_description"], "Priority support and quarterly review")
+        self.assertEqual(preview_item["commercial_package_details"], "Includes reporting and admin training")
+        self.assertEqual(preview_item["commercial_approved_user_limit"], 10)
+        self.assertEqual(preview_item["commercial_top_user_limit"], 30)
+        self.assertEqual(preview_item["commercial_review_threshold"], 85)
+        self.assertEqual(preview_item["commercial_settings_effective_from"], "2026-06-01")
+        self.assertEqual(preview_item["commercial_settings_effective_to"], "2026-12-31")
+
+        self.assertEqual(final_item["commercial_package_name"], "Custom 30 users")
+        self.assertEqual(final_item["commercial_package_description"], "Priority support and quarterly review")
+        self.assertEqual(final_item["commercial_package_details"], "Includes reporting and admin training")
+        self.assertEqual(final_item["commercial_approved_user_limit"], 10)
+        self.assertEqual(final_item["commercial_top_user_limit"], 30)
+        self.assertEqual(final_item["commercial_review_threshold"], 85)
+        self.assertEqual(final_item["commercial_settings_effective_from"], "2026-06-01")
+        self.assertEqual(final_item["commercial_settings_effective_to"], "2026-12-31")
+
+    def test_pricing_plan_patch_updates_requires_audit_reason(self):
+        """PATCH /global-admin/pricing-plans/<id> requires audit_reason."""
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+
+        response = self._patch_pricing_plan(client, "plan_self_service_users", {
+            "price_per_user_cents": 2990,
+        })
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertIn("required_field", payload)
+        self.assertEqual(payload["required_field"], "audit_reason")
+
+        response = self._patch_pricing_plan(client, "plan_self_service_users", {
+            "price_per_user_cents": 2990,
+            "audit_reason": "Pricing table adjustment",
+        })
+        self.assertEqual(response.status_code, 200)
+        updated = response.get_json()
+        self.assertEqual(updated["price_per_user_cents"], 2990)
 
     def test_billing_export_preview_and_finalise_are_consistent(self):
         """Preview and finalise produce the same line-item total for the same period."""
