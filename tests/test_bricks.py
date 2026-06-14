@@ -159,6 +159,89 @@ class BrickSmokeTests(unittest.TestCase):
         self.assertEqual(approve.status_code, 200)
         return approve.get_json()["category_id"]
 
+    def _ensure_org_subscription(self, organisation_id):
+        conn = self.core.get_conn()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO organisation_subscriptions (
+                organisation_id,
+                subscription_mode,
+                subscription_status,
+                billing_status,
+                do_not_bill,
+                created_at,
+                updated_at
+            ) VALUES (?, 'STANDARD', 'ACTIVE', 'BILLABLE', 0, ?, ?)
+            """,
+            (organisation_id, self.core.now_iso(), self.core.now_iso()),
+        )
+        conn.commit()
+        conn.close()
+
+    def _set_org_commercial_settings(
+        self,
+        organisation_id,
+        free_period_days=None,
+        beta_tester=None,
+        discount_percent=None,
+        custom_price_cents=None,
+    ):
+        self._ensure_org_subscription(organisation_id)
+
+        updates = {}
+        if free_period_days is not None:
+            updates["commercial_free_period_days"] = free_period_days
+        if beta_tester is not None:
+            updates["commercial_beta_tester"] = 1 if beta_tester else 0
+        if discount_percent is not None:
+            updates["commercial_discount_percent"] = discount_percent
+        if custom_price_cents is not None:
+            updates["commercial_custom_price_cents"] = custom_price_cents
+
+        if not updates:
+            return
+
+        values = [updates[key] for key in sorted(updates.keys())]
+        set_clause = ", ".join([f"{key} = ?" for key in sorted(updates.keys())])
+        values.append(organisation_id)
+
+        conn = self.core.get_conn()
+        conn.execute(
+            f"UPDATE organisation_subscriptions SET {set_clause} WHERE organisation_id = ?",
+            values,
+        )
+        conn.commit()
+        conn.close()
+
+    def _run_billing_export(self, organisation_id, endpoint):
+        response = self.client.post(endpoint, json={
+            "billing_period_start": "2026-01-01",
+            "billing_period_end": "2026-01-31",
+            "created_by_display_name": "Test",
+        })
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+
+        item = next(
+            (
+                row
+                for row in payload["items"]
+                if row["organisation_id"] == organisation_id
+            ),
+            None,
+        )
+        self.assertIsNotNone(item, f"Organisation {organisation_id} not found in {endpoint}")
+        return payload, item
+
+    def _create_billing_org(self, name="Billing Org"):
+        org_id = self._create_org(name)
+
+        self._create_user(org_id, "Included Admin", role="ORG_ADMIN")
+        self._create_user(org_id, "Billable Admin", role="ORG_ADMIN")
+
+        self._ensure_org_subscription(org_id)
+        return org_id
+
     # ─── organisations brick ──────────────────────────────────────────────────
 
     def test_organisations_global_admin_list(self):
@@ -716,6 +799,81 @@ class BrickSmokeTests(unittest.TestCase):
         self.assertEqual(payload["export_type"], "THIRD_PARTY_BILLER")
         self.assertEqual(payload["export_status"], "PREVIEW")
         self.assertIn("items", payload)
+
+    def test_org_subscription_has_commercial_settings_storage_columns(self):
+        """organisation_subscriptions has commercial settings storage columns."""
+        conn = self.core.get_conn()
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(organisation_subscriptions)").fetchall()}
+        conn.close()
+
+        required_columns = {
+            "commercial_free_period_days",
+            "commercial_beta_tester",
+            "commercial_discount_percent",
+            "commercial_custom_price_cents",
+        }
+        for col in required_columns:
+            self.assertIn(col, cols)
+
+    def test_billing_export_preview_respects_free_period(self):
+        """Free Period commercial setting changes billing totals."""
+        org_id = self._create_billing_org("Billing Org Free Period")
+
+        _, base = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+
+        self._set_org_commercial_settings(org_id, free_period_days=30)
+        _, discounted = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+
+        self.assertGreater(base["total_cents"], 0)
+        self.assertEqual(discounted["total_cents"], 0)
+
+    def test_billing_export_preview_respects_beta_tester(self):
+        """Beta Tester commercial setting changes billing totals."""
+        org_id = self._create_billing_org("Billing Org Beta Tester")
+
+        _, base = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+
+        self._set_org_commercial_settings(org_id, beta_tester=True)
+        _, discounted = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+
+        self.assertGreater(base["total_cents"], discounted["total_cents"])
+        self.assertGreater(discounted["total_cents"], 0)
+
+    def test_billing_export_preview_respects_discount(self):
+        """Discount commercial setting changes billing totals."""
+        org_id = self._create_billing_org("Billing Org Discount")
+
+        _, base = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+
+        self._set_org_commercial_settings(org_id, discount_percent=50)
+        _, discounted = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+
+        self.assertGreater(base["total_cents"], discounted["total_cents"])
+        self.assertEqual(discounted["commercial_discount_percent"], 50)
+
+    def test_billing_export_preview_respects_custom_price(self):
+        """Custom Price commercial setting changes billing totals."""
+        org_id = self._create_billing_org("Billing Org Custom Price")
+
+        _, base = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+
+        self._set_org_commercial_settings(org_id, custom_price_cents=2500)
+        _, updated = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+
+        self.assertGreater(updated["total_cents"], base["total_cents"])
+        self.assertEqual(updated["commercial_custom_price_cents"], 2500)
+
+    def test_billing_export_preview_and_finalise_are_consistent(self):
+        """Preview and finalise produce the same line-item total for the same period."""
+        org_id = self._create_billing_org("Billing Org Export Parity")
+        self._set_org_commercial_settings(org_id, discount_percent=25)
+
+        _, preview_item = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+        _, finalise_item = self._run_billing_export(org_id, "/global-admin/billing-export-finalise")
+
+        self.assertEqual(preview_item["subtotal_cents"], finalise_item["subtotal_cents"])
+        self.assertEqual(preview_item["gst_cents"], finalise_item["gst_cents"])
+        self.assertEqual(preview_item["total_cents"], finalise_item["total_cents"])
 
     def test_billing_subscription_mode_update(self):
         """POST /global-admin/organisations/<id>/subscription-mode sets mode."""

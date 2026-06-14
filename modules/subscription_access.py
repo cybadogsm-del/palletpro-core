@@ -71,6 +71,8 @@ def ensure_subscription_guard_tables(conn):
     )
     """)
 
+    ensure_org_commercial_settings_columns(conn)
+
     conn.execute("""
     CREATE TABLE IF NOT EXISTS temporary_user_access (
         temporary_user_access_id TEXT PRIMARY KEY,
@@ -395,6 +397,30 @@ def ensure_org_user_cap_column(conn):
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(organisation_subscriptions)").fetchall()}
     if "selected_user_count" not in cols:
         conn.execute("ALTER TABLE organisation_subscriptions ADD COLUMN selected_user_count INTEGER")
+
+
+def ensure_org_commercial_settings_columns(conn):
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(organisation_subscriptions)").fetchall()}
+
+    if "commercial_free_period_days" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_free_period_days INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "commercial_beta_tester" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_beta_tester INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "commercial_discount_percent" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_discount_percent INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "commercial_custom_price_cents" not in cols:
+        conn.execute(
+            "ALTER TABLE organisation_subscriptions ADD COLUMN commercial_custom_price_cents INTEGER"
+        )
 
 
 ORG_SELF_SERVE_USER_LIMIT = 25

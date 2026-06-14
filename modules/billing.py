@@ -21,6 +21,7 @@ from audit import audit_event
 from db import get_conn, make_id, now_iso
 from modules.subscription_access import (
     ensure_subscription_guard_tables,
+    ensure_org_commercial_settings_columns,
     ensure_temporary_user_billing_columns,
     get_org_admin_billing_summary,
     get_or_create_subscription,
@@ -53,6 +54,105 @@ def ensure_billing_export_snapshot_tables(conn):
     """)
 
 
+def _to_int_or_default(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def resolve_organisation_billing_for_export(
+    conn,
+    org_row,
+    pricing_settings,
+    billing_period_start,
+    billing_period_end,
+    billing_instruction,
+):
+    d = dict(org_row)
+
+    temp_rows = conn.execute(
+        """
+        SELECT *
+        FROM temporary_user_access
+        WHERE organisation_id = ?
+          AND charged_on_next_billing_cycle = 1
+          AND billed_at IS NULL
+          AND access_status = 'ACTIVE'
+        ORDER BY created_at ASC
+        """,
+        (d["organisation_id"],)
+    ).fetchall()
+
+    temporary_user_count = len(temp_rows)
+    temporary_user_fee_cents = sum(int(r["fee_cents"]) for r in temp_rows)
+
+    org_admin_billing = get_org_admin_billing_summary(conn, d["organisation_id"])
+    additional_org_admin_count = org_admin_billing["billable_additional_org_admin_count"]
+    additional_org_admin_fee_cents = org_admin_billing["additional_org_admin_subtotal_cents"]
+
+    base_subscription_subtotal_cents = _to_int_or_default(d["commercial_custom_price_cents"], 0)
+
+    subtotal_cents = (
+        base_subscription_subtotal_cents
+        + temporary_user_fee_cents
+        + additional_org_admin_fee_cents
+    )
+
+    free_period_days = _to_int_or_default(d["commercial_free_period_days"], 0)
+    beta_tester = _to_int_or_default(d["commercial_beta_tester"], 0) == 1
+    discount_percent = _to_int_or_default(d["commercial_discount_percent"], 0)
+
+    if discount_percent < 0:
+        discount_percent = 0
+    if discount_percent > 100:
+        discount_percent = 100
+
+    if free_period_days > 0:
+        subtotal_cents = 0
+    else:
+        if beta_tester:
+            subtotal_cents = int(round(subtotal_cents * 0.5))
+
+        if discount_percent > 0:
+            subtotal_cents = int(round(subtotal_cents * (100 - discount_percent) / 100))
+
+    gst_rate_percent = pricing_settings["gst_rate_percent"] if pricing_settings else 10.0
+    gst_cents = int(round(subtotal_cents * (gst_rate_percent / 100.0)))
+    total_cents = subtotal_cents + gst_cents
+
+    return {
+        "item": {
+            "organisation_id": d["organisation_id"],
+            "organisation_name": d["organisation_name"],
+            "subscription_mode": d["subscription_mode"],
+            "subscription_status": d["subscription_status"],
+            "billing_status": d["billing_status"],
+            "pricing_plan_id": d["pricing_plan_id"],
+            "billing_period_start": billing_period_start,
+            "billing_period_end": billing_period_end,
+            "currency": "AUD",
+            "subscription_subtotal_cents": base_subscription_subtotal_cents,
+            "temporary_user_count": temporary_user_count,
+            "temporary_user_fee_cents": temporary_user_fee_cents,
+            "additional_org_admin_count": additional_org_admin_count,
+            "additional_org_admin_fee_cents": additional_org_admin_fee_cents,
+            "org_admin_billing": org_admin_billing,
+            "subtotal_cents": subtotal_cents,
+            "gst_rate_percent": gst_rate_percent,
+            "gst_cents": gst_cents,
+            "total_cents": total_cents,
+            "amount_cents": total_cents,
+            "commercial_free_period_days": free_period_days,
+            "commercial_beta_tester": 1 if beta_tester else 0,
+            "commercial_discount_percent": discount_percent,
+            "commercial_custom_price_cents": base_subscription_subtotal_cents,
+            "temporary_user_access_ids": [r["temporary_user_access_id"] for r in temp_rows],
+            "billing_instruction": billing_instruction,
+        }
+    }
+
+
 # ── Route registration ─────────────────────────────────────────────────────────
 
 def register_billing_routes(app):
@@ -67,6 +167,7 @@ def register_billing_routes(app):
         conn = get_conn()
         ensure_subscription_guard_tables(conn)
         ensure_temporary_user_billing_columns(conn)
+        ensure_org_commercial_settings_columns(conn)
 
         settings = conn.execute(
             "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
@@ -83,6 +184,10 @@ def register_billing_routes(app):
                 COALESCE(s.subscription_status, 'ACTIVE') AS subscription_status,
                 COALESCE(s.billing_status, 'BILLABLE') AS billing_status,
                 COALESCE(s.do_not_bill, 0) AS do_not_bill,
+                COALESCE(s.commercial_free_period_days, 0) AS commercial_free_period_days,
+                COALESCE(s.commercial_beta_tester, 0) AS commercial_beta_tester,
+                COALESCE(s.commercial_discount_percent, 0) AS commercial_discount_percent,
+                s.commercial_custom_price_cents,
                 s.unsubscribed_at,
                 s.pricing_plan_id
             FROM organisations o
@@ -105,54 +210,15 @@ def register_billing_routes(app):
                     "reason": "Organisation is marked do-not-bill / unsubscribed.",
                 })
                 continue
-
-            temp_rows = conn.execute(
-                """
-                SELECT *
-                FROM temporary_user_access
-                WHERE organisation_id = ?
-                  AND charged_on_next_billing_cycle = 1
-                  AND billed_at IS NULL
-                  AND access_status = 'ACTIVE'
-                ORDER BY created_at ASC
-                """,
-                (d["organisation_id"],)
-            ).fetchall()
-
-            temporary_user_count = len(temp_rows)
-            temporary_user_fee_cents = sum(int(r["fee_cents"]) for r in temp_rows)
-            org_admin_billing = get_org_admin_billing_summary(conn, d["organisation_id"])
-            additional_org_admin_count = org_admin_billing["billable_additional_org_admin_count"]
-            additional_org_admin_fee_cents = org_admin_billing["additional_org_admin_subtotal_cents"]
-            subscription_subtotal_cents = 0
-            subtotal_cents = subscription_subtotal_cents + temporary_user_fee_cents + additional_org_admin_fee_cents
-            gst_cents = int(round(subtotal_cents * (gst_rate_percent / 100.0)))
-            total_cents = subtotal_cents + gst_cents
-
-            export_items.append({
-                "organisation_id": d["organisation_id"],
-                "organisation_name": d["organisation_name"],
-                "subscription_mode": d["subscription_mode"],
-                "subscription_status": d["subscription_status"],
-                "billing_status": d["billing_status"],
-                "pricing_plan_id": d["pricing_plan_id"],
-                "billing_period_start": billing_period_start,
-                "billing_period_end": billing_period_end,
-                "currency": "AUD",
-                "subscription_subtotal_cents": subscription_subtotal_cents,
-                "temporary_user_count": temporary_user_count,
-                "temporary_user_fee_cents": temporary_user_fee_cents,
-                "additional_org_admin_count": additional_org_admin_count,
-                "additional_org_admin_fee_cents": additional_org_admin_fee_cents,
-                "org_admin_billing": org_admin_billing,
-                "subtotal_cents": subtotal_cents,
-                "gst_rate_percent": gst_rate_percent,
-                "gst_cents": gst_cents,
-                "total_cents": total_cents,
-                "amount_cents": total_cents,
-                "temporary_user_access_ids": [r["temporary_user_access_id"] for r in temp_rows],
-                "billing_instruction": "PREVIEW_ONLY",
-            })
+            resolved = resolve_organisation_billing_for_export(
+                conn=conn,
+                org_row=d,
+                pricing_settings=settings,
+                billing_period_start=billing_period_start,
+                billing_period_end=billing_period_end,
+                billing_instruction="PREVIEW_ONLY",
+            )
+            export_items.append(resolved["item"])
 
         run_id = make_id("bexp")
         ts = now_iso()
@@ -211,6 +277,7 @@ def register_billing_routes(app):
         ensure_subscription_guard_tables(conn)
         ensure_temporary_user_billing_columns(conn)
         ensure_billing_export_snapshot_tables(conn)
+        ensure_org_commercial_settings_columns(conn)
 
         settings = conn.execute(
             "SELECT * FROM pricing_settings ORDER BY created_at ASC LIMIT 1"
@@ -227,6 +294,10 @@ def register_billing_routes(app):
                 COALESCE(s.subscription_status, 'ACTIVE') AS subscription_status,
                 COALESCE(s.billing_status, 'BILLABLE') AS billing_status,
                 COALESCE(s.do_not_bill, 0) AS do_not_bill,
+                COALESCE(s.commercial_free_period_days, 0) AS commercial_free_period_days,
+                COALESCE(s.commercial_beta_tester, 0) AS commercial_beta_tester,
+                COALESCE(s.commercial_discount_percent, 0) AS commercial_discount_percent,
+                s.commercial_custom_price_cents,
                 s.unsubscribed_at,
                 s.pricing_plan_id
             FROM organisations o
@@ -253,58 +324,17 @@ def register_billing_routes(app):
                     "reason": "Organisation is marked do-not-bill / unsubscribed.",
                 })
                 continue
-
-            temp_rows = conn.execute(
-                """
-                SELECT *
-                FROM temporary_user_access
-                WHERE organisation_id = ?
-                  AND charged_on_next_billing_cycle = 1
-                  AND billed_at IS NULL
-                  AND access_status = 'ACTIVE'
-                ORDER BY created_at ASC
-                """,
-                (d["organisation_id"],)
-            ).fetchall()
-
-            temporary_user_count = len(temp_rows)
-            temporary_user_fee_cents = sum(int(r["fee_cents"]) for r in temp_rows)
-            org_admin_billing = get_org_admin_billing_summary(conn, d["organisation_id"])
-            additional_org_admin_count = org_admin_billing["billable_additional_org_admin_count"]
-            additional_org_admin_fee_cents = org_admin_billing["additional_org_admin_subtotal_cents"]
-            subscription_subtotal_cents = 0
-            subtotal_cents = subscription_subtotal_cents + temporary_user_fee_cents + additional_org_admin_fee_cents
-            gst_cents = int(round(subtotal_cents * (gst_rate_percent / 100.0)))
-            total_cents = subtotal_cents + gst_cents
-            temp_ids = [r["temporary_user_access_id"] for r in temp_rows]
-            temp_ids_to_mark.extend(temp_ids)
-
-            item = {
-                "organisation_id": d["organisation_id"],
-                "organisation_name": d["organisation_name"],
-                "subscription_mode": d["subscription_mode"],
-                "subscription_status": d["subscription_status"],
-                "billing_status": d["billing_status"],
-                "pricing_plan_id": d["pricing_plan_id"],
-                "billing_period_start": billing_period_start,
-                "billing_period_end": billing_period_end,
-                "currency": "AUD",
-                "subscription_subtotal_cents": subscription_subtotal_cents,
-                "temporary_user_count": temporary_user_count,
-                "temporary_user_fee_cents": temporary_user_fee_cents,
-                "additional_org_admin_count": additional_org_admin_count,
-                "additional_org_admin_fee_cents": additional_org_admin_fee_cents,
-                "org_admin_billing": org_admin_billing,
-                "subtotal_cents": subtotal_cents,
-                "gst_rate_percent": gst_rate_percent,
-                "gst_cents": gst_cents,
-                "total_cents": total_cents,
-                "amount_cents": total_cents,
-                "temporary_user_access_ids": temp_ids,
-                "billing_instruction": "FINALISE_FOR_THIRD_PARTY_BILLER",
-            }
-
+            resolved = resolve_organisation_billing_for_export(
+                conn=conn,
+                org_row=d,
+                pricing_settings=settings,
+                billing_period_start=billing_period_start,
+                billing_period_end=billing_period_end,
+                billing_instruction="FINALISE_FOR_THIRD_PARTY_BILLER",
+            )
+            item = resolved["item"]
             export_items.append(item)
+            temp_ids_to_mark.extend(item["temporary_user_access_ids"])
 
         conn.execute(
             """
