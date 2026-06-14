@@ -1013,6 +1013,187 @@ def register_subscription_routes(app):
 
         return jsonify(payload), 200
 
+    @app.patch("/global-admin/organisations/<organisation_id>/commercial-settings")
+    def update_org_commercial_settings(organisation_id):
+        """SUPER_GLOBAL_ADMIN only — update commercial settings for billing calculations."""
+        from flask import g
+
+        if g.current_user.get("role") != "SUPER_GLOBAL_ADMIN":
+            return jsonify({
+                "error": "INSUFFICIENT_ROLE",
+                "message": "Super Global Admin only.",
+            }), 403
+
+        body = request.get_json(silent=True) or {}
+
+        audit_reason = (body.get("audit_reason") or "").strip()
+        if not audit_reason:
+            return jsonify({
+                "error": "Missing audit reason",
+                "required_field": "audit_reason",
+            }), 400
+
+        allowed_fields = {
+            "commercial_free_period_days",
+            "commercial_beta_tester",
+            "commercial_discount_percent",
+            "commercial_custom_price_cents",
+            "audit_reason",
+        }
+
+        unknown_fields = [k for k in body.keys() if k not in allowed_fields]
+        if unknown_fields:
+            return jsonify({
+                "error": "Unknown fields provided",
+                "unknown_fields": unknown_fields,
+                "allowed_fields": sorted(list(allowed_fields - {"audit_reason"})),
+            }), 400
+
+        updates = {}
+
+        if "commercial_free_period_days" in body:
+            value = body["commercial_free_period_days"]
+            if value is None:
+                value = 0
+            elif isinstance(value, bool) or not isinstance(value, int):
+                return jsonify({
+                    "error": "commercial_free_period_days must be an integer >= 0 or null",
+                    "field": "commercial_free_period_days",
+                }), 400
+            elif value < 0:
+                return jsonify({
+                    "error": "commercial_free_period_days must be an integer >= 0",
+                    "field": "commercial_free_period_days",
+                }), 400
+            updates["commercial_free_period_days"] = value
+
+        if "commercial_beta_tester" in body:
+            value = body["commercial_beta_tester"]
+            if not isinstance(value, bool):
+                return jsonify({
+                    "error": "commercial_beta_tester must be true or false",
+                    "field": "commercial_beta_tester",
+                }), 400
+            updates["commercial_beta_tester"] = 1 if value else 0
+
+        if "commercial_discount_percent" in body:
+            value = body["commercial_discount_percent"]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return jsonify({
+                    "error": "commercial_discount_percent must be a number from 0 to 100",
+                    "field": "commercial_discount_percent",
+                }), 400
+
+            if int(value) != value:
+                return jsonify({
+                    "error": "commercial_discount_percent must be a whole number from 0 to 100",
+                    "field": "commercial_discount_percent",
+                }), 400
+
+            value = int(value)
+            if value < 0 or value > 100:
+                return jsonify({
+                    "error": "commercial_discount_percent must be between 0 and 100",
+                    "field": "commercial_discount_percent",
+                }), 400
+            updates["commercial_discount_percent"] = value
+
+        if "commercial_custom_price_cents" in body:
+            value = body["commercial_custom_price_cents"]
+            if value is None:
+                updates["commercial_custom_price_cents"] = None
+            elif isinstance(value, bool) or not isinstance(value, int):
+                return jsonify({
+                    "error": "commercial_custom_price_cents must be an integer >= 0 or null",
+                    "field": "commercial_custom_price_cents",
+                }), 400
+            elif value < 0:
+                return jsonify({
+                    "error": "commercial_custom_price_cents must be an integer >= 0",
+                    "field": "commercial_custom_price_cents",
+                }), 400
+            updates["commercial_custom_price_cents"] = value
+
+        if not updates:
+            return jsonify({
+                "error": "No updateable commercial fields provided",
+                "allowed_fields": sorted(list(allowed_fields - {"audit_reason"})),
+            }), 400
+
+        conn = get_conn()
+        ensure_subscription_guard_tables(conn)
+
+        org = conn.execute(
+            "SELECT * FROM organisations WHERE organisation_id = ?",
+            (organisation_id,),
+        ).fetchone()
+
+        if not org:
+            conn.close()
+            return jsonify({"error": "Organisation not found"}), 404
+
+        get_or_create_subscription(conn, organisation_id)
+
+        current = conn.execute(
+            "SELECT * FROM organisation_subscriptions WHERE organisation_id = ?",
+            (organisation_id,)
+        ).fetchone()
+
+        old_values = {
+            "commercial_free_period_days": current["commercial_free_period_days"],
+            "commercial_beta_tester": current["commercial_beta_tester"],
+            "commercial_discount_percent": current["commercial_discount_percent"],
+            "commercial_custom_price_cents": current["commercial_custom_price_cents"],
+        }
+
+        set_clause = ", ".join([f"{field} = ?" for field in updates])
+        conn.execute(
+            f"UPDATE organisation_subscriptions SET {set_clause}, updated_at = ? WHERE organisation_id = ?",
+            [*updates.values(), now_iso(), organisation_id],
+        )
+
+        new_values = {
+            "commercial_free_period_days": current["commercial_free_period_days"] if "commercial_free_period_days" not in updates else updates["commercial_free_period_days"],
+            "commercial_beta_tester": current["commercial_beta_tester"] if "commercial_beta_tester" not in updates else updates["commercial_beta_tester"],
+            "commercial_discount_percent": current["commercial_discount_percent"] if "commercial_discount_percent" not in updates else updates["commercial_discount_percent"],
+            "commercial_custom_price_cents": current["commercial_custom_price_cents"] if "commercial_custom_price_cents" not in updates else updates["commercial_custom_price_cents"],
+        }
+
+        audit_event(
+            conn,
+            entity_type="OrganisationSubscription",
+            entity_id=organisation_id,
+            action="UPDATE_ORG_COMMERCIAL_SETTINGS",
+            summary=(
+                f"Super Global Admin updated commercial settings for {org['name']} (reason: {audit_reason}). "
+                f"Old: {old_values}, New: {new_values}"
+            ),
+            organisation_id=organisation_id,
+        )
+
+        conn.commit()
+
+        updated = conn.execute(
+            "SELECT * FROM organisation_subscriptions WHERE organisation_id = ?",
+            (organisation_id,),
+        ).fetchone()
+
+        conn.close()
+
+        return jsonify({
+            "organisation_id": organisation_id,
+            "organisation_name": org["name"],
+            "subscription": dict(updated),
+            "commercial_settings": {
+                "commercial_free_period_days": updated["commercial_free_period_days"],
+                "commercial_beta_tester": updated["commercial_beta_tester"],
+                "commercial_discount_percent": updated["commercial_discount_percent"],
+                "commercial_custom_price_cents": updated["commercial_custom_price_cents"],
+            },
+            "audit_reason": audit_reason,
+            "rule": "Only Super Global Admin can edit commercial settings that change billing totals.",
+        }), 200
+
     @app.post("/organisations/<organisation_id>/temporary-users")
     def create_temporary_user_access(organisation_id):
         body = request.get_json(silent=True) or {}

@@ -213,6 +213,14 @@ class BrickSmokeTests(unittest.TestCase):
         conn.commit()
         conn.close()
 
+    def _patch_org_commercial_settings(
+        self,
+        client,
+        organisation_id,
+        payload,
+    ):
+        return client.patch(f"/global-admin/organisations/{organisation_id}/commercial-settings", json=payload)
+
     def _run_billing_export(self, organisation_id, endpoint):
         response = self.client.post(endpoint, json={
             "billing_period_start": "2026-01-01",
@@ -862,6 +870,144 @@ class BrickSmokeTests(unittest.TestCase):
 
         self.assertGreater(updated["total_cents"], base["total_cents"])
         self.assertEqual(updated["commercial_custom_price_cents"], 2500)
+
+    def test_sga_can_update_org_commercial_settings(self):
+        """PATCH /global-admin/organisations/<id>/commercial-settings updates all commercial fields."""
+        org_id = self._create_billing_org("Billing Org Commercial Settings Update")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_free_period_days": 30,
+            "commercial_beta_tester": True,
+            "commercial_discount_percent": 25,
+            "commercial_custom_price_cents": 3000,
+            "audit_reason": "Quarterly commercial adjustment",
+        })
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["organisation_id"], org_id)
+        self.assertEqual(payload["commercial_settings"]["commercial_free_period_days"], 30)
+        self.assertEqual(payload["commercial_settings"]["commercial_beta_tester"], 1)
+        self.assertEqual(payload["commercial_settings"]["commercial_discount_percent"], 25)
+        self.assertEqual(payload["commercial_settings"]["commercial_custom_price_cents"], 3000)
+
+    def test_non_sga_cannot_update_org_commercial_settings(self):
+        """PATCH /global-admin/organisations/<id>/commercial-settings is SGA-only."""
+        org_id = self._create_billing_org("Billing Org Commercial Settings Forbidden")
+        client, _ = self._create_login_client("GLOBAL_ADMIN")
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_beta_tester": True,
+            "audit_reason": "Attempted global admin change",
+        })
+        self.assertEqual(response.status_code, 403)
+
+    def test_org_commercial_settings_update_rejects_missing_audit_reason(self):
+        """PATCH /global-admin/organisations/<id>/commercial-settings requires audit_reason."""
+        org_id = self._create_billing_org("Billing Org Missing Audit Reason")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_beta_tester": False,
+        })
+        self.assertEqual(response.status_code, 400)
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_beta_tester": False,
+            "audit_reason": "   ",
+        })
+        self.assertEqual(response.status_code, 400)
+
+    def test_org_commercial_settings_update_rejects_invalid_values(self):
+        """PATCH /global-admin/organisations/<id>/commercial-settings validates fields."""
+        org_id = self._create_billing_org("Billing Org Invalid Settings")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_free_period_days": -1,
+            "audit_reason": "Invalid free period",
+        })
+        self.assertEqual(response.status_code, 400)
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_beta_tester": "true",
+            "audit_reason": "Invalid beta flag",
+        })
+        self.assertEqual(response.status_code, 400)
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_discount_percent": 120,
+            "audit_reason": "Invalid discount",
+        })
+        self.assertEqual(response.status_code, 400)
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_discount_percent": 12.5,
+            "audit_reason": "Non-integer discount",
+        })
+        self.assertEqual(response.status_code, 400)
+
+        response = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_custom_price_cents": -1,
+            "audit_reason": "Invalid custom price",
+        })
+        self.assertEqual(response.status_code, 400)
+
+    def test_org_commercial_settings_update_reflected_in_sga_preview(self):
+        """Updated commercial settings appear in Org Admin subscription preview for SGA."""
+        org_id = self._create_billing_org("Billing Org Preview Reflect")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+
+        patch = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_free_period_days": 7,
+            "commercial_beta_tester": True,
+            "commercial_discount_percent": 10,
+            "commercial_custom_price_cents": 4000,
+            "audit_reason": "Preview validation",
+        })
+        self.assertEqual(patch.status_code, 200)
+
+        preview = self.client.get(f"/global-admin/organisations/{org_id}/org-admin-subscription-preview")
+        self.assertEqual(preview.status_code, 200)
+        payload = preview.get_json()
+        subscription = payload["org_admin_dashboard"]["subscription"]
+        self.assertEqual(subscription["commercial_free_period_days"], 7)
+        self.assertEqual(subscription["commercial_beta_tester"], 1)
+        self.assertEqual(subscription["commercial_discount_percent"], 10)
+        self.assertEqual(subscription["commercial_custom_price_cents"], 4000)
+
+    def test_org_commercial_settings_update_affects_billing_export_preview_totals(self):
+        """PATCH changes affect billing export preview totals using shared resolver."""
+        org_id = self._create_billing_org("Billing Org Preview Resolver")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+
+        _, base = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+        patch = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_free_period_days": 30,
+            "audit_reason": "Free period override",
+        })
+        self.assertEqual(patch.status_code, 200)
+
+        _, updated = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+        self.assertGreater(base["total_cents"], 0)
+        self.assertEqual(updated["total_cents"], 0)
+        self.assertEqual(updated["commercial_free_period_days"], 30)
+
+    def test_org_commercial_settings_update_affects_billing_export_finalise_totals(self):
+        """PATCH changes affect billing export finalise totals using shared resolver."""
+        org_id = self._create_billing_org("Billing Org Finalise Resolver")
+        client, _ = self._create_login_client("SUPER_GLOBAL_ADMIN")
+
+        _, base = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+        patch = self._patch_org_commercial_settings(client, org_id, {
+            "commercial_discount_percent": 33,
+            "audit_reason": "Discount rollout",
+        })
+        self.assertEqual(patch.status_code, 200)
+
+        _, preview_item = self._run_billing_export(org_id, "/global-admin/billing-export-preview")
+        _, final_item = self._run_billing_export(org_id, "/global-admin/billing-export-finalise")
+
+        self.assertLess(preview_item["total_cents"], base["total_cents"])
+        self.assertEqual(preview_item["subtotal_cents"], final_item["subtotal_cents"])
+        self.assertEqual(preview_item["gst_cents"], final_item["gst_cents"])
+        self.assertEqual(preview_item["total_cents"], final_item["total_cents"])
 
     def test_billing_export_preview_and_finalise_are_consistent(self):
         """Preview and finalise produce the same line-item total for the same period."""
