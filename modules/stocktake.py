@@ -192,7 +192,7 @@ def register_stocktake_routes(
                    r.name AS resource_name,
                    r.resource_type,
                    r.unit_type,
-                   COALESCE(bp.current_quantity, 0) AS current_quantity
+                   COALESCE(SUM(bp.current_quantity), 0) AS current_quantity
             FROM resources r
             LEFT JOIN balance_projection bp
                 ON bp.resource_id = r.resource_id
@@ -200,6 +200,7 @@ def register_stocktake_routes(
                AND bp.depot_id = ?
             WHERE r.organisation_id = ?
               AND r.is_active = 1
+            GROUP BY r.resource_id, r.name, r.resource_type, r.unit_type
             ORDER BY r.resource_type ASC, r.name ASC
             """,
             (organisation_id, depot_id, organisation_id),

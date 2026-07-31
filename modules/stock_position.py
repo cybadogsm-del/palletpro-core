@@ -4,6 +4,65 @@ from flask import jsonify
 
 from db import get_conn as _get_conn, now_iso
 
+_NO_OPERATIONAL_UNIT = "__NO_OPERATIONAL_UNIT__"
+
+
+def _unit_breakdown_rows(conn, organisation_id, depot_id=None, resource_id=None):
+    where = [
+        "bp.organisation_id = ?",
+        "bp.operational_unit_id IS NOT NULL",
+        "bp.operational_unit_id <> ?",
+        "bp.current_quantity <> 0",
+    ]
+    params = [organisation_id, _NO_OPERATIONAL_UNIT]
+    if depot_id:
+        where.append("bp.depot_id = ?")
+        params.append(depot_id)
+    if resource_id:
+        where.append("bp.resource_id = ?")
+        params.append(resource_id)
+
+    return conn.execute(
+        f"""
+        SELECT bp.depot_id,
+               bp.resource_id,
+               bp.operational_unit_id,
+               bp.current_quantity AS quantity,
+               bp.updated_at,
+               ou.unit_kind AS operational_unit_kind_snapshot,
+               ou.unit_number AS operational_unit_number_snapshot,
+               ou.display_name AS operational_unit_display_snapshot
+        FROM balance_projection bp
+        LEFT JOIN operational_units ou
+          ON ou.operational_unit_id = bp.operational_unit_id
+        WHERE {' AND '.join(where)}
+        ORDER BY ou.unit_kind ASC, ou.display_name ASC, ou.unit_number ASC, bp.operational_unit_id ASC
+        """,
+        params,
+    ).fetchall()
+
+
+def _build_unit_breakdown_map(rows):
+    breakdown = defaultdict(list)
+    for row in rows:
+        key = (row["depot_id"], row["resource_id"])
+        breakdown[key].append({
+            "operational_unit_id": row["operational_unit_id"],
+            "operational_unit_kind_snapshot": row["operational_unit_kind_snapshot"],
+            "operational_unit_number_snapshot": row["operational_unit_number_snapshot"],
+            "operational_unit_display_snapshot": row["operational_unit_display_snapshot"] or row["operational_unit_id"],
+            "quantity": row["quantity"],
+            "updated_at": row["updated_at"],
+        })
+    return breakdown
+
+
+def _resource_depot_totals(rows):
+    totals = defaultdict(int)
+    for row in rows:
+        totals[(row["depot_id"], row["resource_id"])] += row["quantity"]
+    return totals
+
 
 def register_stock_position_routes(app):
 
@@ -25,19 +84,25 @@ def register_stock_position_routes(app):
 
         rows = conn.execute(
             """
-            SELECT bp.resource_id, bp.depot_id, bp.current_quantity,
+            SELECT bp.resource_id, bp.depot_id, bp.operational_unit_id, bp.current_quantity,
                    r.name AS resource_name, r.resource_type, r.unit_type
             FROM balance_projection bp
             JOIN resources r ON r.resource_id = bp.resource_id
-            WHERE bp.organisation_id = ? AND bp.current_quantity > 0 AND r.is_active = 1
+            WHERE bp.organisation_id = ? AND r.is_active = 1
             ORDER BY r.resource_type ASC, r.name ASC, bp.depot_id ASC
             """,
             (organisation_id,)
         ).fetchall()
+        unit_rows = _unit_breakdown_rows(conn, organisation_id)
+        unit_breakdown = _build_unit_breakdown_map(unit_rows)
         conn.close()
 
         resource_index = {}
+        depot_index = {}
         for row in rows:
+            key = (row["depot_id"], row["resource_id"])
+            quantity = row["current_quantity"]
+
             rid = row["resource_id"]
             if rid not in resource_index:
                 resource_index[rid] = {
@@ -48,14 +113,22 @@ def register_stock_position_routes(app):
                     "total_quantity": 0,
                     "depots": [],
                 }
-            resource_index[rid]["total_quantity"] += row["current_quantity"]
-            resource_index[rid]["depots"].append({
-                "depot_id": row["depot_id"],
-                "depot_name": depot_map.get(row["depot_id"], row["depot_id"]),
-                "quantity": row["current_quantity"],
-            })
+            depot_key = (rid, row["depot_id"])
+            if depot_key not in depot_index:
+                depot_index[depot_key] = {
+                    "depot_id": row["depot_id"],
+                    "depot_name": depot_map.get(row["depot_id"], row["depot_id"]),
+                    "quantity": 0,
+                    "operational_units": unit_breakdown.get(key, []),
+                }
+                resource_index[rid]["depots"].append(depot_index[depot_key])
+            depot_index[depot_key]["quantity"] += quantity
+            resource_index[rid]["total_quantity"] += quantity
 
-        items = sorted(resource_index.values(), key=lambda r: (r["resource_type"], r["resource_name"]))
+        items = sorted(
+            (item for item in resource_index.values() if item["total_quantity"] > 0),
+            key=lambda r: (r["resource_type"], r["resource_name"]),
+        )
         by_type = defaultdict(list)
         for item in items:
             by_type[item["resource_type"]].append(item)
@@ -68,6 +141,12 @@ def register_stock_position_routes(app):
             "summary": {
                 "total_resources_with_stock": len(items),
                 "total_depots": len(depots),
+                "total_quantity": sum(item["total_quantity"] for item in items),
+                "total_operational_unit_lines": sum(
+                    len(depot.get("operational_units", []))
+                    for item in items
+                    for depot in item["depots"]
+                ),
             },
             "by_resource_type": dict(by_type),
             "items": items,
@@ -94,18 +173,43 @@ def register_stock_position_routes(app):
         rows = conn.execute(
             """
             SELECT r.resource_id, r.name AS resource_name, r.resource_type, r.unit_type,
-                   bp.current_quantity AS quantity, bp.updated_at
+                   bp.operational_unit_id, bp.current_quantity AS quantity, bp.updated_at
             FROM balance_projection bp
             JOIN resources r ON r.resource_id = bp.resource_id
             WHERE bp.organisation_id = ? AND bp.depot_id = ?
-              AND bp.current_quantity > 0 AND r.is_active = 1
+              AND r.is_active = 1
             ORDER BY r.resource_type ASC, r.name ASC
             """,
             (organisation_id, depot_id)
         ).fetchall()
+        unit_rows = _unit_breakdown_rows(conn, organisation_id, depot_id=depot_id)
+        unit_breakdown = _build_unit_breakdown_map(unit_rows)
         conn.close()
 
-        items = [dict(r) for r in rows]
+        item_index = {}
+        for row in rows:
+            quantity = row["quantity"]
+            rid = row["resource_id"]
+            if rid not in item_index:
+                item_index[rid] = {
+                    "resource_id": row["resource_id"],
+                    "resource_name": row["resource_name"],
+                    "resource_type": row["resource_type"],
+                    "unit_type": row["unit_type"],
+                    "current_quantity": 0,
+                    "quantity": 0,
+                    "updated_at": row["updated_at"],
+                    "operational_units": unit_breakdown.get((depot_id, row["resource_id"]), []),
+                }
+            item_index[rid]["current_quantity"] += quantity
+            item_index[rid]["quantity"] += quantity
+            if row["updated_at"] and row["updated_at"] > (item_index[rid]["updated_at"] or ""):
+                item_index[rid]["updated_at"] = row["updated_at"]
+
+        items = sorted(
+            (item for item in item_index.values() if item["current_quantity"] > 0),
+            key=lambda r: (r["resource_type"], r["resource_name"]),
+        )
         by_type = defaultdict(list)
         for item in items:
             by_type[item["resource_type"]].append(item)
@@ -116,7 +220,11 @@ def register_stock_position_routes(app):
             "depot_id": depot_id,
             "depot_name": depot["name"],
             "generated_at": now_iso(),
-            "summary": {"total_resources_with_stock": len(items)},
+            "summary": {
+                "total_resources_with_stock": len(items),
+                "total_quantity": sum(item["current_quantity"] for item in items),
+                "total_operational_unit_lines": sum(len(item.get("operational_units", [])) for item in items),
+            },
             "by_resource_type": dict(by_type),
             "items": items,
         }), 200
@@ -124,6 +232,18 @@ def register_stock_position_routes(app):
     @app.get("/organisations/<organisation_id>/depots/<depot_id>/resources/<resource_id>/ledger")
     def depot_resource_ledger(organisation_id, depot_id, resource_id):
         conn = _get_conn()
+        from modules.transactions import (
+            ensure_ledger_balance_operational_unit_columns,
+            ensure_transaction_numbering_tables,
+            ensure_transaction_operational_unit_columns,
+            ensure_transaction_reference_columns,
+            ensure_transaction_user_attribution_columns,
+        )
+        ensure_transaction_user_attribution_columns(conn)
+        ensure_transaction_numbering_tables(conn)
+        ensure_transaction_reference_columns(conn)
+        ensure_transaction_operational_unit_columns(conn)
+        ensure_ledger_balance_operational_unit_columns(conn)
         org = conn.execute(
             "SELECT * FROM organisations WHERE organisation_id = ?", (organisation_id,)
         ).fetchone()
@@ -151,8 +271,13 @@ def register_stock_position_routes(app):
             """
             SELECT le.ledger_entry_id, le.transaction_id, le.quantity_delta,
                    le.created_at AS ledger_at,
+                   le.operational_unit_id,
+                   le.operational_unit_kind_snapshot,
+                   le.operational_unit_number_snapshot,
+                   le.operational_unit_display_snapshot,
                    t.transaction_type, t.direction, t.quantity,
-                   t.reference_number, t.submitted_by_display_name, t.posted_at
+                   t.reference_number, t.submitted_by_user_id,
+                   t.submitted_by_display_name, t.posted_at
             FROM ledger_entries le
             JOIN transactions t ON t.transaction_id = le.transaction_id
             WHERE le.organisation_id = ? AND le.depot_id = ? AND le.resource_id = ?
@@ -161,10 +286,15 @@ def register_stock_position_routes(app):
             (organisation_id, depot_id, resource_id)
         ).fetchall()
 
-        bal = conn.execute(
-            "SELECT current_quantity FROM balance_projection WHERE organisation_id = ? AND depot_id = ? AND resource_id = ?",
+        balances = conn.execute(
+            """
+            SELECT operational_unit_id, current_quantity
+            FROM balance_projection
+            WHERE organisation_id = ? AND depot_id = ? AND resource_id = ?
+            """,
             (organisation_id, depot_id, resource_id)
-        ).fetchone()
+        ).fetchall()
+        current_balance = sum(row["current_quantity"] for row in balances)
         conn.close()
 
         running = 0
@@ -180,6 +310,11 @@ def register_stock_position_routes(app):
                 "quantity": row["quantity"],
                 "quantity_delta": row["quantity_delta"],
                 "running_balance": running,
+                "operational_unit_id": row["operational_unit_id"],
+                "operational_unit_kind_snapshot": row["operational_unit_kind_snapshot"],
+                "operational_unit_number_snapshot": row["operational_unit_number_snapshot"],
+                "operational_unit_display_snapshot": row["operational_unit_display_snapshot"],
+                "submitted_by_user_id": row["submitted_by_user_id"],
                 "submitted_by_display_name": row["submitted_by_display_name"],
                 "posted_at": row["posted_at"],
                 "ledger_at": row["ledger_at"],
@@ -194,7 +329,7 @@ def register_stock_position_routes(app):
             "resource_name": resource["name"],
             "resource_type": resource["resource_type"],
             "unit_type": resource["unit_type"],
-            "current_balance": bal["current_quantity"] if bal else 0,
+            "current_balance": current_balance,
             "generated_at": now_iso(),
             "entry_count": len(entries),
             "entries": entries,
@@ -203,6 +338,10 @@ def register_stock_position_routes(app):
     @app.get("/organisations/<organisation_id>/resources/<resource_id>/ledger")
     def org_resource_ledger(organisation_id, resource_id):
         conn = _get_conn()
+        from modules.transactions import ensure_transaction_numbering_tables, ensure_transaction_reference_columns, ensure_transaction_user_attribution_columns
+        ensure_transaction_user_attribution_columns(conn)
+        ensure_transaction_numbering_tables(conn)
+        ensure_transaction_reference_columns(conn)
         org = conn.execute(
             "SELECT * FROM organisations WHERE organisation_id = ?", (organisation_id,)
         ).fetchone()
@@ -235,7 +374,11 @@ def register_stock_position_routes(app):
         ).fetchall()
 
         balances = conn.execute(
-            "SELECT depot_id, current_quantity FROM balance_projection WHERE organisation_id = ? AND resource_id = ?",
+            """SELECT bp.depot_id, d.name AS depot_name, SUM(bp.current_quantity) AS current_quantity
+               FROM balance_projection bp
+               JOIN depots d ON d.depot_id = bp.depot_id AND d.organisation_id = bp.organisation_id
+               WHERE bp.organisation_id = ? AND bp.resource_id = ?
+               GROUP BY bp.depot_id, d.name""",
             (organisation_id, resource_id)
         ).fetchall()
         balance_map = {b["depot_id"]: b["current_quantity"] for b in balances}
@@ -259,6 +402,11 @@ def register_stock_position_routes(app):
                 "posted_at": row["posted_at"],
                 "ledger_at": row["ledger_at"],
             })
+
+        for balance in balances:
+            sec = depot_sections[balance["depot_id"]]
+            if not sec["depot_name"]:
+                sec["depot_name"] = balance["depot_name"]
 
         by_depot = [
             {

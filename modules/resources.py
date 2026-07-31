@@ -16,6 +16,10 @@ from flask import g, jsonify, request
 
 from audit import audit_event
 from db import get_conn, make_id, now_iso
+from modules.transactions import (
+    ensure_ledger_balance_operational_unit_columns,
+    ensure_transaction_user_attribution_columns,
+)
 
 _ORG_ADMIN_ROLES = {"ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
 _GLOBAL_ADMIN_ROLES = {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}
@@ -1528,16 +1532,21 @@ def register_resource_routes(app, create_pending_entry, generate_transaction_ref
             conn.close()
             return jsonify({"error": "Resource not found"}), 404
 
+        if g.current_user.get("role") not in {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"} and g.current_user.get("user_org_id") != row["organisation_id"]:
+            conn.close()
+            return jsonify({"error": "ORG_ACCESS_DENIED", "message": "You do not have access to this organisation."}), 403
+
         stock_rows = conn.execute(
             """
             SELECT
                 bp.depot_id,
                 d.name AS depot_name,
-                bp.current_quantity,
-                bp.updated_at
+                SUM(bp.current_quantity) AS current_quantity,
+                MAX(bp.updated_at) AS updated_at
             FROM balance_projection bp
             LEFT JOIN depots d ON d.depot_id = bp.depot_id
             WHERE bp.resource_id = ?
+            GROUP BY bp.depot_id, d.name
             ORDER BY d.name
             """,
             (resource_id,)
@@ -2004,6 +2013,8 @@ def register_resource_routes(app, create_pending_entry, generate_transaction_ref
 
         conn = get_conn()
         ensure_transaction_numbering_tables(conn)
+        ensure_transaction_user_attribution_columns(conn)
+        ensure_ledger_balance_operational_unit_columns(conn)
 
         depot = conn.execute(
             "SELECT * FROM depots WHERE depot_id = ? AND organisation_id = ?",
@@ -2114,17 +2125,19 @@ def register_resource_routes(app, create_pending_entry, generate_transaction_ref
                 balance_projection_id,
                 organisation_id,
                 depot_id,
+                operational_unit_id,
                 resource_id,
                 current_quantity,
                 updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(organisation_id, depot_id, resource_id)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(organisation_id, depot_id, operational_unit_id, resource_id)
             DO UPDATE SET current_quantity = excluded.current_quantity, updated_at = excluded.updated_at
             """,
             (
                 make_id("bal"),
                 organisation_id,
                 depot_id,
+                "__NO_OPERATIONAL_UNIT__",
                 resource_id,
                 quantity,
                 created_at

@@ -31,6 +31,7 @@ from modules.transactions import (
     ensure_transaction_partner_columns,
     ensure_transaction_user_attribution_columns,
     ensure_transaction_numbering_tables,
+    ensure_ledger_balance_operational_unit_columns,
     generate_transaction_reference,
     post_transaction_to_ledger,
     register_transaction_routes,
@@ -51,6 +52,7 @@ from modules.sessions import register_session_routes
 from modules.billing import register_billing_routes
 from modules.access_operations import register_access_operations_routes
 from modules.org_subscription import register_org_subscription_routes
+from modules.operational_units import ensure_operational_unit_tables, register_operational_unit_routes
 
 app = Flask(__name__)
 
@@ -351,7 +353,11 @@ def init_db():
         depot_id TEXT NOT NULL,
         resource_id TEXT NOT NULL,
         quantity_delta INTEGER NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        operational_unit_id TEXT,
+        operational_unit_kind_snapshot TEXT,
+        operational_unit_number_snapshot TEXT,
+        operational_unit_display_snapshot TEXT
     )
     """)
 
@@ -360,10 +366,11 @@ def init_db():
         balance_projection_id TEXT PRIMARY KEY,
         organisation_id TEXT NOT NULL,
         depot_id TEXT NOT NULL,
+        operational_unit_id TEXT NOT NULL DEFAULT '__NO_OPERATIONAL_UNIT__',
         resource_id TEXT NOT NULL,
         current_quantity INTEGER NOT NULL,
         updated_at TEXT NOT NULL,
-        UNIQUE (organisation_id, depot_id, resource_id)
+        UNIQUE (organisation_id, depot_id, operational_unit_id, resource_id)
     )
     """)
 
@@ -434,6 +441,11 @@ def init_db():
 
     _safe_add_column("transactions", "unresolved_entity_note")
     _safe_add_column("transactions", "unresolved_entity_type")
+    _safe_add_column("transactions", "operational_unit_id")
+    _safe_add_column("transactions", "operational_unit_kind_snapshot")
+    _safe_add_column("transactions", "operational_unit_number_snapshot")
+    _safe_add_column("transactions", "operational_unit_display_snapshot")
+    _safe_add_column("transactions", "operational_unit_missing", "INTEGER DEFAULT 0")
 
     ensure_subscription_guard_tables(conn)
     ensure_api_key_tables(conn)
@@ -441,6 +453,8 @@ def init_db():
     ensure_admin_handover_tables(conn)
     ensure_stocktake_tables(conn)
     ensure_org_user_cap_column(conn)
+    ensure_operational_unit_tables(conn)
+    ensure_ledger_balance_operational_unit_columns(conn)
 
     conn.commit()
     conn.close()
@@ -551,6 +565,7 @@ register_session_routes(app, is_rate_limited=_is_rate_limited)
 register_billing_routes(app)
 register_access_operations_routes(app)
 register_org_subscription_routes(app)
+register_operational_unit_routes(app)
 
 
 

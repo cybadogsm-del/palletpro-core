@@ -164,6 +164,10 @@ def register_depot_routes(app):
             conn.close()
             return jsonify({"error": "Depot not found"}), 404
 
+        if g.current_user.get("role") not in {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"} and g.current_user.get("user_org_id") != depot["organisation_id"]:
+            conn.close()
+            return jsonify({"error": "ORG_ACCESS_DENIED", "message": "You do not have access to this organisation."}), 403
+
         stock_rows = conn.execute(
             """
             SELECT
@@ -171,11 +175,12 @@ def register_depot_routes(app):
                 r.name AS resource_name,
                 r.resource_type,
                 r.unit_type,
-                bp.current_quantity,
-                bp.updated_at
+                SUM(bp.current_quantity) AS current_quantity,
+                MAX(bp.updated_at) AS updated_at
             FROM balance_projection bp
             LEFT JOIN resources r ON r.resource_id = bp.resource_id
             WHERE bp.depot_id = ?
+            GROUP BY bp.resource_id, r.name, r.resource_type, r.unit_type
             ORDER BY r.name
             """,
             (depot_id,)

@@ -18,6 +18,8 @@ from flask import g, jsonify, request
 
 from audit import audit_event
 from db import get_conn, make_id, now_iso
+from modules.transactions import ensure_transaction_operational_unit_columns
+from modules.operational_units import user_can_operate_unit
 
 _SUPPORTED_TYPES = {"transaction", "resource_loss"}
 _LOSS_TYPES = {"DAMAGED", "STOLEN", "LOST", "DESTROYED", "OTHER"}
@@ -56,6 +58,101 @@ def _offline_log_context(current_user, payload):
     return organisation_id, current_user.get("user_id")
 
 
+def _create_offline_operational_unit_conflict_entry(conn, create_pending_entry, txn, unit_display_name):
+    existing = conn.execute(
+        """
+        SELECT pending_entry_id FROM pending_approval_entries
+        WHERE source_record_id = ? AND reason_code = 'OFFLINE_OPERATIONAL_UNIT_CONFLICT'
+        LIMIT 1
+        """,
+        (txn["transaction_id"],),
+    ).fetchone()
+    if existing:
+        return existing["pending_entry_id"]
+
+    reason = (
+        f"Offline Fleet/Unit conflict for {unit_display_name or txn['operational_unit_id']}. "
+        "Another user submitted offline work against the same Fleet/Unit before sync."
+    )
+    return create_pending_entry(
+        conn=conn,
+        organisation_id=txn["organisation_id"],
+        entry_type="Transaction",
+        source_record_id=txn["transaction_id"],
+        source_module="OfflineBatch",
+        submitted_by_display_name=txn["submitted_by_display_name"],
+        related_entity_type="OperationalUnit",
+        related_entity_id=txn["operational_unit_id"],
+        related_entity_name=unit_display_name,
+        reason_code="OFFLINE_OPERATIONAL_UNIT_CONFLICT",
+        reason_text=reason,
+        direct_action_type="ResolveOperationalUnitConflict",
+        direct_action_target_id=txn["transaction_id"],
+        direct_action_label="Review Fleet/Unit Conflict",
+        can_approve_now=False,
+        can_reject_now=True,
+        resource_id=txn["resource_id"],
+        resource_name=None,
+        status="PENDING_APPROVAL",
+    )
+
+
+def _route_offline_operational_unit_conflict(conn, create_pending_entry, txn, unit_display_name):
+    conn.execute(
+        """
+        UPDATE transactions
+        SET status = 'PENDING_APPROVAL',
+            approval_reason_code = 'OFFLINE_OPERATIONAL_UNIT_CONFLICT',
+            approval_reason_text = ?
+        WHERE transaction_id = ?
+        """,
+        (
+            f"Offline Fleet/Unit conflict for {unit_display_name or txn['operational_unit_id']}",
+            txn["transaction_id"],
+        ),
+    )
+    refreshed = conn.execute(
+        "SELECT * FROM transactions WHERE transaction_id = ?",
+        (txn["transaction_id"],),
+    ).fetchone()
+    _create_offline_operational_unit_conflict_entry(conn, create_pending_entry, refreshed, unit_display_name)
+    audit_event(
+        conn,
+        entity_type="Transaction",
+        entity_id=txn["transaction_id"],
+        action="OFFLINE_CONFLICT_ROUTED",
+        summary=f"Transaction routed to Pending Approval for Fleet/Unit conflict: {unit_display_name or txn['operational_unit_id']}.",
+        organisation_id=txn["organisation_id"],
+    )
+
+
+def _find_conflicting_offline_operational_unit_transaction(
+    conn, organisation_id, depot_id, operational_unit_id, submitted_by_user_id, queued_at
+):
+    if not operational_unit_id or not submitted_by_user_id or not queued_at:
+        return None
+    return conn.execute(
+        """
+        SELECT t.*
+        FROM transactions t
+        JOIN offline_batch_log obl
+          ON obl.server_id = t.transaction_id
+         AND obl.item_type = 'transaction'
+         AND obl.status = 'success'
+        WHERE t.organisation_id = ?
+          AND t.depot_id = ?
+          AND t.operational_unit_id = ?
+          AND COALESCE(t.submitted_by_user_id, '') <> ?
+          AND t.status IN ('DRAFT', 'PENDING_APPROVAL')
+          AND (t.approval_reason_code IS NULL OR t.approval_reason_code = 'OFFLINE_OPERATIONAL_UNIT_CONFLICT')
+          AND ABS((julianday(t.created_at) - julianday(?)) * 86400) <= 43200
+        ORDER BY t.created_at DESC
+        LIMIT 1
+        """,
+        (organisation_id, depot_id, operational_unit_id, submitted_by_user_id, queued_at),
+    ).fetchone()
+
+
 def _ensure_offline_transaction_schema(
     conn,
     ensure_transaction_numbering_tables,
@@ -67,6 +164,7 @@ def _ensure_offline_transaction_schema(
     ensure_partner_address_tables(conn)
     ensure_transaction_user_attribution_columns(conn)
     ensure_transaction_numbering_tables(conn)
+    ensure_transaction_operational_unit_columns(conn)
 
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(transactions)")}
     if "transaction_note" not in cols:
@@ -136,6 +234,19 @@ def _process_transaction_item(
     transaction_note = (payload.get("transaction_note") or "").strip() or None
     unresolved_entity_note = (payload.get("unresolved_entity_note") or "").strip() or None
     unresolved_entity_type = (payload.get("unresolved_entity_type") or "").strip().upper() or None
+    operational_unit_id = (payload.get("operational_unit_id") or "").strip() or None
+    operational_unit_missing = bool(payload.get("operational_unit_missing"))
+    operational_unit_missing_note = (payload.get("operational_unit_missing_note") or "").strip() or None
+    operational_unit = None
+    operational_unit_kind_snapshot = None
+    operational_unit_number_snapshot = None
+    operational_unit_display_snapshot = None
+
+    if operational_unit_missing:
+        if resource_id == "UNRESOLVED" and unresolved_entity_type not in (None, "OPERATIONAL_UNIT"):
+            raise ValueError("Resolve the missing entity before marking Fleet/Unit missing")
+        unresolved_entity_note = operational_unit_missing_note or unresolved_entity_note or "@missing fleet/unit"
+        unresolved_entity_type = "OPERATIONAL_UNIT"
 
     if not organisation_id:
         raise ValueError("organisation_id is required")
@@ -159,6 +270,7 @@ def _process_transaction_item(
     ensure_partner_address_tables(conn)
     ensure_transaction_user_attribution_columns(conn)
     ensure_transaction_numbering_tables(conn)
+    ensure_transaction_operational_unit_columns(conn)
 
     org = conn.execute(
         "SELECT * FROM organisations WHERE organisation_id = ?", (organisation_id,)
@@ -173,20 +285,49 @@ def _process_transaction_item(
     if not depot:
         raise ValueError("Depot not found")
 
+    if operational_unit_id:
+        operational_unit = conn.execute(
+            """
+            SELECT * FROM operational_units
+            WHERE operational_unit_id = ?
+              AND organisation_id = ?
+              AND status = 'ACTIVE'
+            """,
+            (operational_unit_id, organisation_id),
+        ).fetchone()
+        if not operational_unit:
+            raise ValueError("Fleet/Unit not found or inactive")
+        if operational_unit["depot_id"] != depot_id:
+            raise ValueError("Fleet/Unit is not assigned to the transaction location")
+        if current_user.get("role") not in {"ORG_ADMIN", "GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"} and not user_can_operate_unit(
+            conn, organisation_id, submitted_by_user_id, operational_unit_id
+        ):
+            raise PermissionError("OPERATE permission is required for this Fleet/Unit")
+        operational_unit_kind_snapshot = operational_unit["unit_kind"]
+        operational_unit_number_snapshot = operational_unit["unit_number"]
+        operational_unit_display_snapshot = operational_unit["display_name"]
+
     resource = None
-    if resource_id:
+    if unresolved_entity_type and not unresolved_entity_note:
+        raise ValueError("unresolved_entity_note is required when unresolved_entity_type is set")
+    if unresolved_entity_note and unresolved_entity_type not in {"RESOURCE", "PARTNER", "OPERATIONAL_UNIT"}:
+        raise ValueError("unresolved_entity_type must be RESOURCE, PARTNER, or OPERATIONAL_UNIT")
+    resource_is_missing = bool(unresolved_entity_note and unresolved_entity_type == "RESOURCE")
+    if resource_id and not (resource_is_missing and resource_id == "UNRESOLVED"):
         resource = conn.execute(
             "SELECT * FROM resources WHERE resource_id = ? AND organisation_id = ? AND is_active = 1",
             (resource_id, organisation_id),
         ).fetchone()
-        if not resource and not unresolved_entity_note:
+        if not resource:
             raise ValueError("Resource not found or inactive")
 
-    if not resource_id and unresolved_entity_note:
+    if (not resource_id or resource_id == "UNRESOLVED") and resource_is_missing:
         resource_id = "UNRESOLVED"
+    elif not resource_id:
+        raise ValueError("resource_id is required")
 
     partner = None
-    if partner_id and not unresolved_entity_note:
+    if partner_id:
         partner = conn.execute(
             "SELECT * FROM partners WHERE partner_id = ? AND organisation_id = ? AND is_active = 1",
             (partner_id, organisation_id),
@@ -211,8 +352,11 @@ def _process_transaction_item(
             created_at, posted_at,
             reference_number, org_sequence_number,
             transaction_note,
-            unresolved_entity_note, unresolved_entity_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            unresolved_entity_note, unresolved_entity_type,
+            operational_unit_id, operational_unit_kind_snapshot,
+            operational_unit_number_snapshot, operational_unit_display_snapshot,
+            operational_unit_missing
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     # Ensure optional columns exist
@@ -225,18 +369,24 @@ def _process_transaction_item(
         conn.execute("ALTER TABLE transactions ADD COLUMN unresolved_entity_type TEXT")
 
     if unresolved_entity_note:
+        missing_reason_code = "MISSING_OPERATIONAL_UNIT" if operational_unit_missing else "MISSING_ENTITY"
+        missing_action_type = "ResolveOperationalUnit" if operational_unit_missing else "ResolveEntity"
+        missing_action_label = "Resolve Missing Fleet/Unit" if operational_unit_missing else "Resolve Missing Entity"
         conn.execute(
             insert_sql,
             (
                 transaction_id, organisation_id, depot_id, transaction_type,
                 resource_id, quantity, direction, "PENDING_APPROVAL",
-                "MISSING_ENTITY", unresolved_entity_note,
+                missing_reason_code, unresolved_entity_note,
                 partner_id, None,
                 submitted_by_user_id, submitted_by_display_name,
                 created_at, None,
                 reference_number, org_sequence_number,
                 transaction_note,
                 unresolved_entity_note, unresolved_entity_type,
+                operational_unit_id, operational_unit_kind_snapshot,
+                operational_unit_number_snapshot, operational_unit_display_snapshot,
+                1 if operational_unit_missing else 0,
             ),
         )
 
@@ -245,21 +395,21 @@ def _process_transaction_item(
             organisation_id=organisation_id,
             entry_type="Transaction",
             source_record_id=transaction_id,
-            source_module="Transactions",
+            source_module="OfflineBatch",
             submitted_by_display_name=submitted_by_display_name,
-            related_entity_type=unresolved_entity_type or "UNKNOWN",
+            related_entity_type="OperationalUnit" if operational_unit_missing else (unresolved_entity_type or "UNKNOWN"),
             related_entity_id=None,
             related_entity_name=None,
-            reason_code="MISSING_ENTITY",
+            reason_code=missing_reason_code,
             reason_text=unresolved_entity_note,
-            direct_action_type="ResolveEntity",
+            direct_action_type=missing_action_type,
             direct_action_target_id=transaction_id,
-            direct_action_label="Resolve Missing Entity",
+            direct_action_label=missing_action_label,
             can_approve_now=False,
             can_reject_now=True,
             resource_id=resource_id if resource_id != "UNRESOLVED" else None,
             resource_name=resource_name,
-            status="AWAITING_FIX",
+            status="PENDING_APPROVAL" if operational_unit_missing else "AWAITING_FIX",
         )
 
         audit_event(
@@ -267,7 +417,7 @@ def _process_transaction_item(
             action="OFFLINE_UPLOAD_PENDING",
             summary=(
                 f"Offline transaction uploaded by {submitted_by_display_name} — "
-                f"pending due to missing entity: {unresolved_entity_note}."
+                f"pending due to {missing_reason_code.lower()}: {unresolved_entity_note}."
             ),
             organisation_id=organisation_id,
         )
@@ -288,6 +438,9 @@ def _process_transaction_item(
                 reference_number, org_sequence_number,
                 transaction_note,
                 None, None,
+                operational_unit_id, operational_unit_kind_snapshot,
+                operational_unit_number_snapshot, operational_unit_display_snapshot,
+                0,
             ),
         )
 
@@ -322,33 +475,71 @@ def _process_transaction_item(
 
         status = "PENDING_APPROVAL"
     else:
+        conflicting_txn = _find_conflicting_offline_operational_unit_transaction(
+            conn,
+            organisation_id=organisation_id,
+            depot_id=depot_id,
+            operational_unit_id=operational_unit_id,
+            submitted_by_user_id=submitted_by_user_id,
+            queued_at=created_at,
+        )
+        conflict_reason = (
+            f"Offline Fleet/Unit conflict for {operational_unit_display_snapshot or operational_unit_id}"
+            if conflicting_txn else None
+        )
         conn.execute(
             insert_sql,
             (
                 transaction_id, organisation_id, depot_id, transaction_type,
-                resource_id, quantity, direction, "DRAFT",
-                None, None,
+                resource_id, quantity, direction, "PENDING_APPROVAL" if conflicting_txn else "DRAFT",
+                "OFFLINE_OPERATIONAL_UNIT_CONFLICT" if conflicting_txn else None, conflict_reason,
                 partner_id, partner_address_id,
                 submitted_by_user_id, submitted_by_display_name,
                 created_at, None,
                 reference_number, org_sequence_number,
                 transaction_note,
                 None, None,
+                operational_unit_id, operational_unit_kind_snapshot,
+                operational_unit_number_snapshot, operational_unit_display_snapshot,
+                0,
             ),
         )
 
-        audit_event(
-            conn, entity_type="Transaction", entity_id=transaction_id,
-            action="OFFLINE_UPLOAD",
-            summary=(
-                f"Offline transaction uploaded by {submitted_by_display_name}: "
-                f"{transaction_type} {quantity} {direction} "
-                f"{'for ' + partner['name'] if partner else ''}."
-            ),
-            organisation_id=organisation_id,
-        )
+        inserted_txn = conn.execute(
+            "SELECT * FROM transactions WHERE transaction_id = ?",
+            (transaction_id,),
+        ).fetchone()
 
-        status = "DRAFT"
+        if conflicting_txn:
+            _route_offline_operational_unit_conflict(
+                conn, create_pending_entry, conflicting_txn, operational_unit_display_snapshot
+            )
+            _route_offline_operational_unit_conflict(
+                conn, create_pending_entry, inserted_txn, operational_unit_display_snapshot
+            )
+            audit_event(
+                conn, entity_type="Transaction", entity_id=transaction_id,
+                action="OFFLINE_UPLOAD_CONFLICT",
+                summary=(
+                    f"Offline transaction uploaded by {submitted_by_display_name} — "
+                    f"Fleet/Unit conflict detected for {operational_unit_display_snapshot or operational_unit_id}."
+                ),
+                organisation_id=organisation_id,
+            )
+            status = "PENDING_APPROVAL"
+        else:
+            audit_event(
+                conn, entity_type="Transaction", entity_id=transaction_id,
+                action="OFFLINE_UPLOAD",
+                summary=(
+                    f"Offline transaction uploaded by {submitted_by_display_name}: "
+                    f"{transaction_type} {quantity} {direction} "
+                    f"{'for ' + partner['name'] if partner else ''}."
+                ),
+                organisation_id=organisation_id,
+            )
+
+            status = "DRAFT"
 
     return transaction_id, {
         "transaction_id": transaction_id,
@@ -365,6 +556,10 @@ def _process_transaction_item(
         "partner_id": partner_id,
         "partner_name": partner["name"] if partner else None,
         "unresolved_entity_note": unresolved_entity_note,
+        "operational_unit_id": operational_unit_id,
+        "operational_unit_kind_snapshot": operational_unit_kind_snapshot,
+        "operational_unit_number_snapshot": operational_unit_number_snapshot,
+        "operational_unit_display_snapshot": operational_unit_display_snapshot,
         "submitted_by_display_name": submitted_by_display_name,
         "created_at": created_at,
         "queued_offline": True,
@@ -559,7 +754,11 @@ def register_offline_batch_routes(
             local_id = (str(item.get("local_id") or "")).strip()
             item_type = (item.get("type") or "").strip().lower()
             queued_at = (item.get("queued_at") or "").strip() or None
-            payload = item.get("payload") or {}
+            payload = dict(item.get("payload") or {})
+            if current_user.get("role") not in {"GLOBAL_ADMIN", "SUPER_GLOBAL_ADMIN"}:
+                payload["organisation_id"] = current_user.get("user_org_id")
+                payload["submitted_by_user_id"] = current_user.get("user_id")
+                payload["submitted_by_display_name"] = current_user.get("display_name")
             organisation_id, submitted_by_user_id = _offline_log_context(current_user, payload)
 
             if not local_id:
